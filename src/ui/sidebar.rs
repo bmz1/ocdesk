@@ -31,7 +31,7 @@ pub struct Sidebar {
     store: Entity<Store>,
     controller: Entity<Controller>,
     focus: FocusHandle,
-    /// Show only sessions that need you or have news (Cmd/Ctrl+Shift+A).
+    /// Show only sessions that need you or have news (Cmd/Ctrl+Shift+U).
     activity: bool,
     /// Folders showing all their sessions.
     show_all: std::collections::HashSet<PathBuf>,
@@ -81,6 +81,18 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> Self {
         let subs = vec![cx.observe(&store, |_, _, cx| cx.notify())];
+        // Relative times ("5m") age without store changes.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(60))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
             store,
             controller,
@@ -838,6 +850,13 @@ impl Render for Sidebar {
                     .px_2()
                     .pt_3()
                     .pb_2()
+                    // Traffic lights (macOS) sit above the first row; the
+                    // band drags the window.
+                    .child(
+                        div()
+                            .h(px(super::app_view::TITLEBAR_INSET_H))
+                            .window_control_area(WindowControlArea::Drag),
+                    )
                     .child(
                         nav_row("new-session", Icon::new(IconName::Plus), "New session")
                             .child(shortcut(&super::keys::NewSession, window, cx))

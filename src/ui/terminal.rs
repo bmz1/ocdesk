@@ -665,6 +665,28 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn emulator_renders_output_and_answers_queries() {
+        let listener = Listener::default();
+        let mut term = Term::new(Config::default(), &TermSize::new(20, 4), listener.clone());
+        let mut parser: Processor = Processor::new();
+        // Text, a colour, a newline, and a cursor-position query (DSR).
+        parser.advance(&mut term, b"hi \x1b[31mred\x1b[0m\r\nok\x1b[6n");
+        let rows: Vec<String> = (0..2)
+            .map(|line| {
+                let row = &term.grid()[alacritty_terminal::index::Line(line)];
+                (0..20)
+                    .map(|c| row[alacritty_terminal::index::Column(c)].c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(rows, ["hi red", "ok"]);
+        let replies = listener.0.lock().unwrap().clone();
+        assert_eq!(replies, ["\x1b[2;3R"]);
+    }
+
+    #[::core::prelude::v1::test]
     fn keys_map_to_terminal_bytes() {
         assert_eq!(key_bytes(&ks("enter"), false), Some(b"\r".to_vec()));
         assert_eq!(key_bytes(&ks("ctrl-c"), false), Some(vec![3]));

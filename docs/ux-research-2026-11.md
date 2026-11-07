@@ -216,6 +216,32 @@ all day. P1 is navigation. P2 is review and panes.
 | D | 11, 12, 13 + macOS chrome | Review loop and native feel |
 | E | 14, Rune spike when it releases | Larger, external dependency |
 
+## 4b. Implementation status (2026-11-07)
+
+Implemented on `claude/amazing-brahmagupta-qb6r76`, checked with unit tests
+and demo-mode screenshots (Linux/Xvfb). Nothing was run against a real
+opencode server in this session (installing `@opencode/cli` was blocked), so
+items that depend on server behaviour are marked *unverified live*.
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Work log: ranking, two categories + "and N more", running call named, density (Normal / Verbose / Quiet), raw input toggle | Done |
+| 2 | Reasoning merged, "Thought for Ns", live preview | Done |
+| 3 | Turn footer (Copy, duration, model, tokens, cost, Fork), Undo from a prompt, Retry/Copy on errors | Done; Fork and Undo *unverified live* (`/fork`, `/revert/stage`+`/commit`) |
+| 4 | Approvals above the composer, primary Allow once, `$ command`, wildcard warning, subagent requests in parent, Enter/Esc/typed-reply | Done; reply `message` *unverified live* |
+| 5 | Header context ring, tokens, cost, Compact at 80 % | Done |
+| 6 | Command palette (sessions, folders, actions with shortcuts, `/` commands, view, models) | Done |
+| 7 | Sidebar status slot, pin, archive with Undo toast, date sections, Show more, Needs you view, search row, arrows/Enter/Delete/P, shortcut hints, 60 s time ticker | Done. Not done: hover peek of a hidden sidebar, typeahead, Shift+F10 row menu, Cmd+Z for the last Undo |
+| 8 | Find in conversation; matching work logs open | Done (row-level highlight, not in-text) |
+| 9 | Composer: quiet selects, permission named only off default, status strip, paste-as-text, picker shortcuts | Done (effort is Mod+Shift+R; Mod+Shift+E conflicts with text-field bindings) |
+| 10 | F6 focus areas, Ctrl+Tab | Done |
+| 11 | Right panel with Changes / Tasks / Terminal tabs, resizable, persisted | Done |
+| 12 | Diff: scopes, collapsible files with counts, line numbers, tinted rows, inline comments → one prompt | Done. Stage/revert hunk left out (git writes; owner's call) |
+| 13 | Plan bar with Implement (switches to build, then prompts) | Done |
+| 14 | Terminal tab on opencode's persistent PTY | Done; protocol tested against a mock server built from opencode's client source, *unverified live* |
+| — | macOS transparent title bar, traffic-light inset, drag region, menu bar, Dock reopen | Done; *unverified on a Mac* |
+| — | `ui/kit` components, opencode tokens, Inter / IBM Plex Mono, syntect highlighting | Done |
+
 ## 5. Not recommended
 
 - Porting to Rune today: pre-release, no PRs, weekly API churn, IME still the

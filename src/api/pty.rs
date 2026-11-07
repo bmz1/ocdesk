@@ -222,6 +222,84 @@ mod tests {
         assert_eq!(frame(300, 2, Some(b"ls")), vec![1, 1, 44, 0, 2, b'l', b's']);
     }
 
+    /// The client's half of the protocol against a local server: ticket
+    /// request, WebSocket query and auth, binary output, JSON control and
+    /// the framed input it sends.
+    #[tokio::test]
+    // The handshake callback's error type is tungstenite's, not ours.
+    #[allow(clippy::result_large_err)]
+    async fn connects_streams_and_frames_input() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio_tungstenite::tungstenite::Message as Ws;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            // 1. connect-token (plain HTTP).
+            let (mut http, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = http.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(req.starts_with("POST /api/experimental/persistent-pty/pty_1/connect-token"));
+            assert!(req.to_lowercase().contains("x-opencode-ticket: 1"));
+            let body = r#"{"data":{"ticket":"t123","expires_in":30}}"#;
+            http.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            drop(http);
+            // 2. the socket.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut uri = String::new();
+            let mut auth = String::new();
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |r: &tokio_tungstenite::tungstenite::handshake::server::Request, resp| {
+                    uri = r.uri().to_string();
+                    auth = r
+                        .headers()
+                        .get("authorization")
+                        .map(|v| v.to_str().unwrap().to_string())
+                        .unwrap_or_default();
+                    Ok(resp)
+                },
+            )
+            .await
+            .unwrap();
+            ws.send(Ws::Binary(b"hi".to_vec().into())).await.unwrap();
+            ws.send(Ws::Text(r#"{"type":"exited","exitCode":0}"#.into()))
+                .await
+                .unwrap();
+            let Some(Ok(Ws::Binary(frame_in))) = ws.next().await else {
+                panic!("expected an input frame")
+            };
+            (uri, auth, frame_in.to_vec())
+        });
+        let api = Api {
+            http: reqwest::Client::new(),
+            base: format!("http://127.0.0.1:{port}"),
+            password: "pw".into(),
+        };
+        let (tx, mut rx) = api.connect_pty("pty_1", 42, "att").await.unwrap();
+        assert!(matches!(rx.next().await, Some(PtyMsg::Output(b)) if b == b"hi"));
+        assert!(matches!(rx.next().await, Some(PtyMsg::Control(v)) if v["type"] == "exited"));
+        tx.unbounded_send(frame(80, 24, Some(b"ls\r"))).unwrap();
+        let (uri, auth, frame_in) = server.await.unwrap();
+        assert!(uri.contains("ticket=t123"), "{uri}");
+        assert!(
+            uri.contains("cursor=42") && uri.contains("input_protocol=1"),
+            "{uri}"
+        );
+        assert!(auth.starts_with("Basic "));
+        assert_eq!(frame_in, frame(80, 24, Some(b"ls\r")));
+    }
+
     #[test]
     fn info_parses_size_and_cursor() {
         let i = PtyInfo::from_json(

@@ -3,9 +3,35 @@
 State of ocdesk for whoever picks it up next. Read this first, then
 [README.md](README.md) and [docs/protocol-notes.md](docs/protocol-notes.md).
 
-_Last updated: 2026-11-07, desktop feature batch built on origin/master @ `9a2b04f`._
+_Last updated: 2026-11-07, UX batch on `claude/amazing-brahmagupta-qb6r76` (from master @ `13e9c59`)._
 
-## Current work: desktop feature batch
+## Current work: UX research batch
+
+The owner asked for a UX study of Codex, Claude desktop, T3 Code and Rune
+([docs/ux-research-2026-11.md](docs/ux-research-2026-11.md)) and then to
+implement all of it. Section 4b of that doc has the per-item status. Summary:
+transcript (work log, reasoning, turn footer, approvals, context meter),
+navigation (palette, sidebar, find, focus areas), right panel (Changes with
+inline comments, Tasks, Terminal on opencode's persistent PTYs), opencode
+theme + fonts + syntax highlighting, macOS chrome and menus.
+
+New dependencies: `alacritty_terminal` (emulator), `tokio-tungstenite`
+(PTY socket), `base64`; gpui-kit's `syntect` feature. Fonts are bundled
+under `assets/fonts/` (OFL) and the theme under `assets/themes/` (generated
+by `dev/gen-opencode-theme.py` from Rune's copy of the `@opencode/ui` tokens).
+
+Validation: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test` (**72 passed**) on Linux. Visual checks in demo mode under Xvfb;
+demo mode now seeds a work-log turn, a plan turn, a failed step, usage and a
+diff (`OCDESK_DEMO_APPROVAL=1` adds a pending approval). **Not run against a
+real opencode** in that session (npm install blocked), so live-check first:
+Fork, Undo (revert stage+commit), permission reply `message`, archive/restore,
+the Terminal tab, and approvals from subagents. macOS chrome is unverified.
+Shortcut defaults changed: density is Ctrl+O on macOS and Ctrl+Shift+O
+elsewhere (Ctrl+O is Add folder there), effort is Mod+Shift+R, Needs you is
+Mod+Shift+U; a unit test keeps defaults unique per platform.
+
+## Previous work: desktop feature batch
 
 Master now contains the M0–M7 work below. The owner requested design items 4–8
 and 10; **item 9 (commit/push/PR actions) is excluded**. This batch adds composer

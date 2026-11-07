@@ -3,7 +3,6 @@
 //! allows once and Esc denies (see `Composer`); typing a reply and pressing
 //! Enter denies with that text as feedback to the agent.
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
 };
@@ -242,9 +241,7 @@ pub fn render_permissions(store: &Store, controller: Entity<Controller>, cx: &Ap
                 .small()
                 .primary()
                 .disabled(disabled)
-                .when(first, |b| {
-                    b.child(Kbd::new(Keystroke::parse("enter").unwrap()).appearance(false))
-                })
+                .when(first, |b| b.child(div().text_xs().opacity(0.6).child("↵")))
                 .on_click(reply(PermissionDecision::Once)),
         );
         if !request.save.is_empty() {
@@ -265,7 +262,7 @@ pub fn render_permissions(store: &Store, controller: Entity<Controller>, cx: &Ap
                     .ghost()
                     .disabled(disabled)
                     .when(first, |b| {
-                        b.child(Kbd::new(Keystroke::parse("escape").unwrap()).appearance(false))
+                        b.child(div().text_xs().opacity(0.6).child("Esc"))
                     })
                     .on_click(reply(PermissionDecision::Reject)),
             )

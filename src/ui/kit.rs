@@ -147,9 +147,6 @@ pub fn toast(
 /// A muted section header (sidebar groups, palette-like lists).
 pub fn section_label(text: impl Into<SharedString>, cx: &App) -> Div {
     div()
-        .px_2()
-        .pt_2()
-        .pb_1()
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(cx.theme().muted_foreground)

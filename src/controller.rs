@@ -1380,6 +1380,9 @@ impl Controller {
     }
 
     pub fn refresh_diff(&mut self, sid: String, cx: &mut Context<Self>) {
+        if self.demo {
+            return;
+        }
         let Some(api) = self.api(cx) else { return };
         let generation = self.generation;
         let request = self.diff_requests.entry(sid.clone()).or_default();

@@ -1014,10 +1014,23 @@ impl Render for ConversationView {
                 })
                 .unwrap_or_else(|| "Changes".into())
         };
+        let sidebar_hidden = self.store.read(cx).preferences.sidebar_hidden;
         let header = h_flex()
+            .id("conversation-header")
             .h_11()
             .flex_none()
             .px_4()
+            .when(sidebar_hidden, |el| {
+                el.pl(px(16. + super::app_view::TITLEBAR_INSET_W))
+            })
+            // The header is the window's drag region (title bar), and a
+            // double-click zooms as the system title bar would.
+            .window_control_area(WindowControlArea::Drag)
+            .on_click(|e: &ClickEvent, window, _| {
+                if e.click_count() == 2 && cfg!(target_os = "macos") {
+                    window.titlebar_double_click();
+                }
+            })
             .items_center()
             .text_sm()
             .font_weight(FontWeight::MEDIUM)

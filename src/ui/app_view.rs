@@ -16,6 +16,12 @@ use crate::ui::sidebar::{SIDEBAR_MAX_W, SIDEBAR_MIN_W, SIDEBAR_W, Sidebar};
 /// Reverse-DNS id shared by the window class, `.desktop` file and `.app`.
 pub const APP_ID: &str = "io.github.bmz1.ocdesk";
 
+/// Room the macOS traffic lights take at the window's top-left with a
+/// transparent title bar: the sidebar's first row starts below it, and the
+/// conversation header indents by it while the sidebar is hidden.
+pub const TITLEBAR_INSET_H: f32 = if cfg!(target_os = "macos") { 30. } else { 0. };
+pub const TITLEBAR_INSET_W: f32 = if cfg!(target_os = "macos") { 72. } else { 0. };
+
 /// Drag payload of the sidebar's resize handle.
 struct SidebarResize;
 
@@ -67,9 +73,12 @@ pub fn window_options(settings: &Settings, cx: &App) -> WindowOptions {
         window_min_size: Some(size(px(WindowPlacement::MIN_W), px(WindowPlacement::MIN_H))),
         // Matches the desktop entry (StartupWMClass) and the macOS bundle id.
         app_id: Some(APP_ID.into()),
+        // macOS: content under a transparent title bar, traffic lights
+        // inset into the sidebar's top row (see `TITLEBAR_INSET`).
         titlebar: Some(TitlebarOptions {
             title: Some("ocdesk".into()),
-            ..Default::default()
+            appears_transparent: cfg!(target_os = "macos"),
+            traffic_light_position: cfg!(target_os = "macos").then(|| point(px(14.), px(15.))),
         }),
         ..Default::default()
     }
