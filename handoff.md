@@ -72,8 +72,13 @@ lists, tables, fenced code) streams in; code copy button and drag-select +
 Ctrl-C put the right text on the clipboard; reasoning rows start collapsed
 and expand in place. 500-message session: streaming a long reply 3–5 ms mean
 frame CPU time (p95 ≤12 ms); scrolling up through ~300 messages 5–6 ms mean,
-max <9 ms; peak RSS 180 MB idle, 210 MB after that scroll (see release number
-below if filled in). llvmpipe caps presentation at ~20–30 fps, so frame
+max <9 ms; peak RSS 180 MB idle, 210 MB after that scroll. Release build:
+streaming 2.6–3.9 ms mean, scrolling the whole 500-message history 4.6–5.5 ms
+mean (max 10.7 ms); peak RSS **175 MB idle, 207 MB after scrolling
+everything, slightly over the 200 MB target**. llvmpipe keeps GPU textures and
+buffers in process memory, so real-GPU RSS should be lower; measure on a Mac
+before optimizing (candidates: drop parsed states for rows far off-screen
+sooner than the 400-entry LRU cap, or lower the cap). llvmpipe caps presentation at ~20–30 fps, so frame
 *rate* here says nothing; the CPU time is the number to compare.
 
 Verified at the end of M1 (Linux/Xvfb, mock model, opencode 2.2.6): tool turn and
@@ -116,6 +121,7 @@ Data flow: view → `Controller` intent → `Api` on Tokio → result back via
 - Each prose block is its own `TextViewState`. Selecting within a block is
   verified; a drag across two messages was not tested (gpui-base's Copy
   handler reads a window-level `TextSelection`, so it may already work).
+- Memory: 207 MB peak in the sandbox (see above), just over target.
 - `ProseCache` is cleared on session switch, so switching back re-parses the
   visible rows (cheap: small replacements parse synchronously). It's capped
   at 400 states with LRU eviction.
