@@ -19,7 +19,7 @@ use crate::api::model::{FsEntry, ModelRef, PermissionDecision, PromptInput};
 use crate::api::{Api, Envelope, Event};
 use crate::settings::Settings;
 use crate::sidecar::{self, SidecarConfig};
-use crate::store::{Catalog, Connection, Store};
+use crate::store::{Catalog, Connection, Store, Tooling};
 
 /// Give up auto-restarting after this many crashes within [`CRASH_WINDOW`].
 const MAX_QUICK_RESTARTS: u32 = 3;
@@ -376,7 +376,9 @@ impl Controller {
                     }
                 });
             }
-            Event::CatalogChanged => self.schedule_catalog_refresh(cx),
+            Event::CatalogChanged | Event::ToolingChanged | Event::WorktreesChanged { .. } => {
+                self.schedule_catalog_refresh(cx)
+            }
             _ => {
                 let turn_over = match &env.event {
                     Event::ExecutionEnded { session_id, .. } => Some(session_id.clone()),
@@ -392,6 +394,19 @@ impl Controller {
 
     /// A turn finished (`session.execution.succeeded|failed|interrupted`).
     fn on_turn_over(&mut self, _session_id: String, cx: &mut Context<Self>) {
+        let reload = self
+            .store
+            .update(cx, |s, _| s.needs_reload.remove(&_session_id));
+        if reload
+            && self
+                .store
+                .read(cx)
+                .conversations
+                .get(&_session_id)
+                .is_some_and(|c| c.loaded)
+        {
+            self.load_messages(_session_id.clone(), cx);
+        }
         self.refresh_permissions(_session_id.clone(), cx);
         self.refresh_forms(_session_id.clone(), cx);
         if self.store.read(cx).diffs.contains_key(&_session_id) {
@@ -430,6 +445,8 @@ impl Controller {
         pending_sessions.extend(self.store.read(cx).forms.keys().cloned());
         if let Some(id) = selected {
             pending_sessions.insert(id.clone());
+            self.refresh_inbox(id.clone(), cx);
+            self.refresh_tasks(id.clone(), cx);
             self.load_messages(id.clone(), cx);
             if self.store.read(cx).diffs.contains_key(&id) {
                 self.refresh_diff(id, cx);
@@ -483,6 +500,7 @@ impl Controller {
 
     fn refresh_catalog(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
+        self.refresh_folder_info(folder.clone(), cx);
         let generation = self.generation;
         let dir = folder.clone();
         self.run(
@@ -511,6 +529,261 @@ impl Controller {
                         folder.display()
                     ),
                 }
+            },
+        );
+    }
+
+    /// The folder's `/` menu sources, branch, project and worktrees. Each
+    /// part fails on its own (e.g. a folder that isn't a git repository).
+    fn refresh_folder_info(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else { return };
+        let generation = self.generation;
+        let dir = folder.clone();
+        self.run(
+            cx,
+            async move {
+                let (commands, skills, mcp, vcs, project) = futures::join!(
+                    api.commands(&dir),
+                    api.skills(&dir),
+                    api.mcp_servers(&dir),
+                    api.vcs(&dir),
+                    api.project_id(&dir),
+                );
+                let worktrees = match &project {
+                    Ok(pid) => api.worktrees(pid).await.ok(),
+                    Err(_) => None,
+                };
+                // Branches of the worktrees too, for the sidebar.
+                let mut wt_vcs = Vec::new();
+                for w in worktrees.iter().flatten().filter(|w| **w != dir) {
+                    if let Ok(v) = api.vcs(w).await {
+                        wt_vcs.push((w.clone(), v));
+                    }
+                }
+                let warn = |what: &str, e: &anyhow::Error| {
+                    tracing::debug!("{what} for {}: {e:#}", dir.display())
+                };
+                let tooling = Tooling {
+                    commands: commands.unwrap_or_else(|e| {
+                        warn("no commands", &e);
+                        vec![]
+                    }),
+                    skills: skills.unwrap_or_else(|e| {
+                        warn("no skills", &e);
+                        vec![]
+                    }),
+                    mcp: mcp.unwrap_or_else(|e| {
+                        warn("no MCP servers", &e);
+                        vec![]
+                    }),
+                };
+                Ok((tooling, vcs.ok(), project.ok(), worktrees, wt_vcs))
+            },
+            move |this, res: Result<_>, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                let Ok((tooling, vcs, project, worktrees, wt_vcs)) = res else {
+                    return;
+                };
+                this.store.update(cx, |s, cx| {
+                    s.set_tooling(folder.clone(), tooling, cx);
+                    if let Some(v) = vcs {
+                        s.set_vcs(folder.clone(), v, cx);
+                    }
+                    for (w, v) in wt_vcs {
+                        s.set_vcs(w, v, cx);
+                    }
+                    if let (Some(pid), Some(wts)) = (project, worktrees) {
+                        s.set_worktrees(folder.clone(), pid, wts, cx);
+                    }
+                });
+            },
+        );
+    }
+
+    // ── git worktrees ───────────────────────────────────────────────────
+
+    /// Create a worktree of `folder`'s project and open a new session in it.
+    pub fn create_worktree(&mut self, folder: PathBuf, name: String, cx: &mut Context<Self>) {
+        let Some(project) = self.store.read(cx).projects.get(&folder).cloned() else {
+            self.notice(format!("{} is not a git repository", folder.display()), cx);
+            return;
+        };
+        let Some(api) = self.api(cx) else { return };
+        self.run(
+            cx,
+            async move {
+                let dir = api.create_worktree(&project, name.trim()).await?;
+                // Register the new checkout as a location before using it.
+                api.location(&dir).await?;
+                Ok(dir)
+            },
+            move |this, res, cx| match res {
+                Ok(dir) => {
+                    this.refresh_folder_info(folder, cx);
+                    this.new_session(Some(dir), cx);
+                }
+                Err(e) => this.notice(format!("Could not create the worktree: {e:#}"), cx),
+            },
+        );
+    }
+
+    /// Remove a worktree. Without `force`, a dirty checkout is refused;
+    /// `on_needs_force` is then called so the UI can ask.
+    pub fn remove_worktree(
+        &mut self,
+        folder: PathBuf,
+        dir: PathBuf,
+        force: bool,
+        on_needs_force: impl FnOnce(&mut gpui_kit::App) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.store.read(cx).projects.get(&folder).cloned() else {
+            return;
+        };
+        let Some(api) = self.api(cx) else { return };
+        let target = dir.clone();
+        self.run(
+            cx,
+            async move { api.remove_worktree(&project, &target, force).await },
+            move |this, res, cx| match res {
+                Ok(()) => {
+                    if this.store.read(cx).target_folder().as_ref() == Some(&dir) {
+                        this.new_session(Some(folder.clone()), cx);
+                    }
+                    this.refresh_folder_info(folder, cx);
+                }
+                Err(e) if !force && e.is::<crate::api::WorktreeDirty>() => on_needs_force(cx),
+                Err(e) => this.notice(format!("Could not remove the worktree: {e:#}"), cx),
+            },
+        );
+    }
+
+    /// Re-pin the selected session to another checkout of its project.
+    pub fn move_session(&mut self, sid: String, dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        let target = dir.clone();
+        self.run(
+            cx,
+            async move {
+                api.location(&target).await?;
+                api.move_session(&sid, &target).await
+            },
+            move |this, res, cx| match res {
+                // The server confirms with a session update; re-read the list.
+                Ok(()) => {
+                    this.store.update(cx, |s, cx| s.set_current_folder(dir, cx));
+                    this.refresh_sessions(cx);
+                }
+                Err(e) => this.notice(format!("Could not move the session: {e:#}"), cx),
+            },
+        );
+    }
+
+    // ── background tasks: subagents and shells ──────────────────────────
+
+    /// Re-read a session's subagent sessions and its folder's shells.
+    pub fn refresh_tasks(&mut self, sid: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else { return };
+        let dir = self
+            .store
+            .read(cx)
+            .session(&sid)
+            .map(|s| s.directory.clone());
+        let target = sid.clone();
+        self.run(
+            cx,
+            async move {
+                let kids = api.children(&sid).await?;
+                let shells = match dir {
+                    Some(d) => api.shells(&d).await.unwrap_or_default(),
+                    None => vec![],
+                };
+                Ok((kids, shells))
+            },
+            move |this, res, cx| match res {
+                Ok((kids, shells)) => this.store.update(cx, |s, cx| {
+                    s.set_children(&target, kids, cx);
+                    s.set_shells(shells, cx);
+                }),
+                Err(e) => tracing::warn!("could not read tasks of {target}: {e:#}"),
+            },
+        );
+    }
+
+    /// Load a subagent's transcript (it isn't in the sidebar, so nothing
+    /// else would); live events keep it current afterwards.
+    pub fn load_child(&mut self, child: String, cx: &mut Context<Self>) {
+        let loaded = self
+            .store
+            .read(cx)
+            .conversations
+            .get(&child)
+            .is_some_and(|c| c.loaded);
+        if !loaded {
+            self.load_messages(child, cx);
+        }
+    }
+
+    /// The tail of a shell's output. `None` when opencode isn't running.
+    pub fn shell_output(
+        &self,
+        dir: PathBuf,
+        shell_id: String,
+    ) -> Option<oneshot::Receiver<Result<String>>> {
+        let api = self.api.clone()?;
+        let (tx, rx) = oneshot::channel();
+        self.rt.spawn(async move {
+            let _ = tx.send(api.shell_output(&dir, &shell_id).await);
+        });
+        Some(rx)
+    }
+
+    pub fn kill_shell(&mut self, dir: PathBuf, shell_id: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        self.run(
+            cx,
+            async move { api.kill_shell(&dir, &shell_id).await },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    this.notice(format!("Could not stop the command: {e:#}"), cx);
+                }
+            },
+        );
+    }
+
+    /// Compact the selected session's context (`/compact`).
+    pub fn compact(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.store.read(cx).selected.clone() else {
+            self.notice("Open a session to compact it", cx);
+            return;
+        };
+        let Some(api) = self.api(cx) else { return };
+        self.run(
+            cx,
+            async move { api.compact(&sid).await },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    this.notice(format!("Could not compact: {e:#}"), cx);
+                }
+            },
+        );
+    }
+
+    /// Connect or disconnect an MCP server of the target folder.
+    pub fn set_mcp_connected(&mut self, server: String, connect: bool, cx: &mut Context<Self>) {
+        let Some(folder) = self.store.read(cx).target_folder() else {
+            return;
+        };
+        let Some(api) = self.api(cx) else { return };
+        let dir = folder.clone();
+        self.run(
+            cx,
+            async move { api.mcp_set_connected(&dir, &server, connect).await },
+            move |this, res, cx| match res {
+                Ok(()) => this.refresh_folder_info(folder, cx),
+                Err(e) => this.notice(format!("MCP: {e:#}"), cx),
             },
         );
     }
@@ -1056,6 +1329,8 @@ impl Controller {
         if let Some(id) = id {
             self.refresh_permissions(id.clone(), cx);
             self.refresh_forms(id.clone(), cx);
+            self.refresh_inbox(id.clone(), cx);
+            self.refresh_tasks(id.clone(), cx);
             self.load_messages(id, cx);
         }
     }
@@ -1179,8 +1454,35 @@ impl Controller {
         if input.text.trim().is_empty() {
             return;
         }
+        self.submit(Submission::Prompt(input), cx);
+    }
+
+    /// Run a server command (`/name args`) in the selected session, or in a
+    /// new one.
+    pub fn run_command(
+        &mut self,
+        name: String,
+        text: String,
+        delivery: Option<crate::api::model::Delivery>,
+        cx: &mut Context<Self>,
+    ) {
+        self.submit(
+            Submission::Command {
+                name,
+                text,
+                delivery,
+            },
+            cx,
+        );
+    }
+
+    fn submit(&mut self, what: Submission, cx: &mut Context<Self>) {
         if self.demo {
-            crate::demo::stream_reply(self.store.clone(), input.text, cx);
+            let text = match what {
+                Submission::Prompt(i) => i.text,
+                Submission::Command { name, text, .. } => format!("/{name} {text}"),
+            };
+            crate::demo::stream_reply(self.store.clone(), text, cx);
             return;
         }
         let Some(api) = self.api(cx) else { return };
@@ -1191,7 +1493,10 @@ impl Controller {
             self.notice("Add a folder first", cx);
             return;
         };
-        if let Some(sid) = &selected {
+        let was_busy = selected.as_ref().is_some_and(|sid| store.is_busy(sid));
+        if let Some(sid) = &selected
+            && !was_busy
+        {
             // Flip to busy right away so the composer shows Stop; the server
             // confirms with session.execution.started within milliseconds.
             self.store.update(cx, |s, cx| {
@@ -1217,10 +1522,17 @@ impl Controller {
                         (s.id.clone(), Some(s))
                     }
                 };
-                api.prompt(&sid, &input).await?;
+                match &what {
+                    Submission::Prompt(input) => api.prompt(&sid, input).await?,
+                    Submission::Command {
+                        name,
+                        text,
+                        delivery,
+                    } => api.run_command(&sid, name, text, *delivery).await?,
+                }
                 Ok((sid, created))
             },
-            |this, res, cx| match res {
+            move |this, res, cx| match res {
                 Ok((sid, Some(session))) => {
                     this.store.update(cx, |s, cx| {
                         s.apply(Envelope::bare(Event::SessionUpserted(session)), cx);
@@ -1230,10 +1542,61 @@ impl Controller {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    if let Some(sid) = this.store.read(cx).selected.clone() {
+                    // A steer/queue into a running turn leaves it running.
+                    if !was_busy && let Some(sid) = this.store.read(cx).selected.clone() {
                         this.store.update(cx, |s, cx| s.set_busy(&sid, false, cx));
                     }
                     this.notice(format!("Could not send prompt: {e:#}"), cx);
+                }
+            },
+        );
+    }
+
+    // ── inbox: queued and steering prompts ──────────────────────────────
+
+    /// Re-read a session's pending inbox (select, reconnect).
+    pub fn refresh_inbox(&mut self, sid: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else { return };
+        let target = sid.clone();
+        self.run(
+            cx,
+            async move { api.inbox(&sid).await },
+            move |this, res, cx| match res {
+                Ok(items) => this
+                    .store
+                    .update(cx, |s, cx| s.set_inbox(&target, items, cx)),
+                Err(e) => tracing::warn!("could not read inbox of {target}: {e:#}"),
+            },
+        );
+    }
+
+    /// Withdraw a queued/steering prompt that hasn't been delivered yet.
+    pub fn cancel_inbox(&mut self, sid: String, item_id: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        self.run(
+            cx,
+            async move { api.cancel_inbox(&sid, &item_id).await },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    // Most likely delivered in the meantime.
+                    this.notice(format!("Could not remove the queued prompt: {e:#}"), cx);
+                }
+            },
+        );
+    }
+
+    /// Turn a queued prompt into a steer (delivered at the next step).
+    pub fn steer_now(&mut self, sid: String, item_id: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        self.run(
+            cx,
+            async move {
+                api.set_inbox_delivery(&sid, &item_id, crate::api::model::Delivery::Steer)
+                    .await
+            },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    this.notice(format!("Could not steer: {e:#}"), cx);
                 }
             },
         );
@@ -1290,6 +1653,16 @@ impl Drop for Controller {
     fn drop(&mut self) {
         self.stop_pump();
     }
+}
+
+/// What the composer sends: a prompt or a server command.
+enum Submission {
+    Prompt(PromptInput),
+    Command {
+        name: String,
+        text: String,
+        delivery: Option<crate::api::model::Delivery>,
+    },
 }
 
 /// The folder to open at startup: `ocdesk <folder>`, else `OCDESK_DIR`.

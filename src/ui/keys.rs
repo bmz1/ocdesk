@@ -19,6 +19,7 @@ actions!(
         FocusComposer,
         StopTurn,
         ToggleChanges,
+        ToggleTasks,
         ShowShortcuts,
         Quit,
     ]
@@ -38,6 +39,11 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, &'static str)> {
             "secondary-shift-d",
             Box::new(ToggleChanges),
             "Toggle Changes / Conversation",
+        ),
+        (
+            "secondary-shift-t",
+            Box::new(ToggleTasks),
+            "Background tasks (subagents, shells)",
         ),
         ("secondary-/", Box::new(ShowShortcuts), "Keyboard shortcuts"),
         ("secondary-q", Box::new(Quit), "Quit"),

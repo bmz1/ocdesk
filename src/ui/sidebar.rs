@@ -2,7 +2,7 @@
 //! indicator. Each folder is an opencode location; sessions are grouped by
 //! the directory they are pinned to.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
@@ -281,13 +281,114 @@ impl Sidebar {
                 );
             }
             for (j, s) in sessions.iter().enumerate() {
-                col = col.child(self.render_session(ix * 10_000 + j, s, cx));
+                col = col.child(self.render_session(ix * 10_000 + j, s, false, cx));
+            }
+            // Worktrees of this repository, each with its own sessions.
+            let worktrees = self
+                .store
+                .read(cx)
+                .worktrees
+                .get(folder)
+                .cloned()
+                .unwrap_or_default();
+            for (w, dir) in worktrees.iter().enumerate() {
+                col = col.child(self.render_worktree(ix, w, folder, dir, cx));
+                let sessions: Vec<SessionInfo> =
+                    self.store.read(cx).sessions_in(dir).cloned().collect();
+                for (j, s) in sessions.iter().enumerate() {
+                    let key = ix * 10_000 + (w + 1) * 1_000 + j;
+                    col = col.child(self.render_session(key, s, true, cx));
+                }
             }
         }
         col.into_any_element()
     }
 
-    fn render_session(&self, key: usize, s: &SessionInfo, cx: &mut Context<Self>) -> AnyElement {
+    /// A worktree checkout under its repository: `⎇ feature-x · branch`,
+    /// with "+" (new session there) and Remove on hover.
+    fn render_worktree(
+        &self,
+        ix: usize,
+        w: usize,
+        folder: &Path,
+        dir: &Path,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let store = self.store.read(cx);
+        let label = crate::ui::git::checkout_label(store, dir);
+        let is_current = store.selected.is_none() && store.current_folder.as_deref() == Some(dir);
+        let group: SharedString = format!("worktree-{ix}-{w}").into();
+        let controller = self.controller.clone();
+        let (f_menu, d_menu, d_new) = (folder.to_path_buf(), dir.to_path_buf(), dir.to_path_buf());
+        h_flex()
+            .id(SharedString::from(format!("worktree-row-{ix}-{w}")))
+            .group(group.clone())
+            .flex_none()
+            .h_7()
+            .pl_6()
+            .pr_2()
+            .gap_1p5()
+            .rounded_lg()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .cursor_pointer()
+            .when(is_current, |el| el.bg(theme.sidebar_accent.opacity(0.6)))
+            .hover(|s| s.bg(theme.sidebar_accent.opacity(0.6)))
+            .tooltip({
+                let path: SharedString = dir.display().to_string().into();
+                move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(path.clone()).build(window, cx)
+                }
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let d = d_new.clone();
+                this.controller
+                    .update(cx, |c, cx| c.new_session(Some(d), cx));
+            }))
+            .child(crate::ui::icons::git_branch().xsmall())
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(
+                h_flex()
+                    .invisible()
+                    .group_hover(group, |s| s.visible())
+                    .child(crate::ui::git::new_session_button(
+                        SharedString::from(format!("worktree-new-{ix}-{w}")),
+                        controller.clone(),
+                        dir.to_path_buf(),
+                    ))
+                    .child(
+                        Button::new(SharedString::from(format!("worktree-menu-{ix}-{w}")))
+                            .icon(IconName::Ellipsis)
+                            .ghost()
+                            .xsmall()
+                            .dropdown_menu(move |menu, _, _| {
+                                let (c, f, d) =
+                                    (controller.clone(), f_menu.clone(), d_menu.clone());
+                                menu.item(PopupMenuItem::new("Remove worktree…").on_click(
+                                    move |_, window, cx| {
+                                        crate::ui::git::remove_worktree(
+                                            c.clone(),
+                                            f.clone(),
+                                            d.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                ))
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_session(
+        &self,
+        key: usize,
+        s: &SessionInfo,
+        nested: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
         let store = self.store.read(cx);
         let id = s.id.clone();
@@ -303,7 +404,8 @@ impl Sidebar {
             .group(group.clone())
             .flex_none()
             .h_8()
-            .pl_8()
+            .when(!nested, |el| el.pl_8())
+            .when(nested, |el| el.pl_12())
             .pr_2()
             .gap_2()
             .rounded_lg()

@@ -11,6 +11,102 @@ use crate::api::model::{ToolCall, ToolStatus};
 
 pub type ToggleTool = Rc<dyn Fn(String, &mut App)>;
 
+/// Subagent calls and backgrounded shells render as one quiet row that
+/// opens the background tasks drawer, instead of a tool card.
+fn task_row(
+    t: &ToolCall,
+    message_id: &str,
+    open_task: &super::tasks::OpenTask,
+    cx: &App,
+) -> Option<AnyElement> {
+    use super::tasks::{TaskView, background_shell, subagent_session};
+    let theme = cx.theme();
+    let (icon, title, detail, target) = if t.name == "subagent" {
+        let title = t
+            .input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Subagent")
+            .to_string();
+        let agent = t
+            .input
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("subagent");
+        let state = match t.status {
+            ToolStatus::Pending | ToolStatus::Running => "running",
+            ToolStatus::Completed => "done",
+            ToolStatus::Error => "failed",
+        };
+        (
+            super::icons::workflow(),
+            title,
+            format!("@{agent} · {state}"),
+            subagent_session(t).map(TaskView::Subagent),
+        )
+    } else {
+        let shell = background_shell(t)?;
+        // Only calls the server moved to the background.
+        if !t.output.contains("moved to the background") {
+            return None;
+        }
+        let cmd = t
+            .input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("command")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        (
+            super::icons::terminal(),
+            cmd,
+            "running in the background".to_string(),
+            Some(TaskView::Shell(shell)),
+        )
+    };
+    let running = matches!(t.status, ToolStatus::Pending | ToolStatus::Running);
+    let failed = t.status == ToolStatus::Error;
+    let open = open_task.clone();
+    Some(
+        h_flex()
+            .id(SharedString::from(format!(
+                "task-row-{message_id}-{}",
+                t.call_id
+            )))
+            .gap_2()
+            .text_sm()
+            .text_color(if failed {
+                theme.danger
+            } else {
+                theme.muted_foreground
+            })
+            .when(target.is_some(), |el| {
+                el.cursor_pointer()
+                    .hover(|s| s.text_color(theme.foreground))
+            })
+            .child(icon.small())
+            .child(div().min_w_0().truncate().child(title))
+            .child(div().flex_none().text_xs().child(detail))
+            .when(running, |el| {
+                el.child(
+                    gpui_kit::component::spinner::Spinner::new()
+                        .xsmall()
+                        .color(theme.muted_foreground),
+                )
+            })
+            .when_some(target, |el, target| {
+                el.child(
+                    gpui_kit::component::Icon::new(gpui_kit::component::IconName::ChevronRight)
+                        .xsmall(),
+                )
+                .on_click(move |_, _, cx| open(target.clone(), cx))
+            })
+            .into_any_element(),
+    )
+}
+
 pub fn key(message_id: &str, call_id: &str) -> String {
     format!("{message_id}/{call_id}")
 }
@@ -20,8 +116,12 @@ pub fn render_tool(
     message_id: &str,
     expanded: &HashSet<String>,
     toggle: ToggleTool,
+    open_task: &super::tasks::OpenTask,
     cx: &App,
 ) -> AnyElement {
+    if let Some(row) = task_row(t, message_id, open_task, cx) {
+        return row;
+    }
     let theme = cx.theme();
     let key = key(message_id, &t.call_id);
     let open = expanded.contains(&key);

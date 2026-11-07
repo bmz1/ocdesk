@@ -1,0 +1,5 @@
+# gpui-pre-macos 0.3.11 uses Option::map_or_default, unstable before this
+# release; Linux builds work with older toolchains, macOS builds don't.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

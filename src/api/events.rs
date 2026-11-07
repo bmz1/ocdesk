@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use super::model::{
-    BlockKind, FormRequest, ModelRef, PermissionRequest, SessionInfo, content_text, error_text,
-    str_at, u64_at,
+    BlockKind, Delivery, FormRequest, InboxItem, ModelRef, PermissionRequest, SessionInfo,
+    ShellInfo, content_text, error_text, str_at, u64_at,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -71,7 +71,57 @@ pub enum Event {
         session_id: String,
         outcome: Outcome,
     },
-    /// A user prompt entered the session (`session.inbox.enqueued`).
+    /// `session.inbox.enqueued`: a prompt (or compaction) is pending.
+    InboxEnqueued {
+        session_id: String,
+        item: InboxItem,
+    },
+    /// `session.inbox.delivered`: the item reached the transcript (a user
+    /// item becomes a user message with the same id).
+    InboxDelivered {
+        session_id: String,
+        inbox_id: String,
+    },
+    /// `session.inbox.cancelled`
+    InboxCancelled {
+        session_id: String,
+        inbox_id: String,
+    },
+    /// `session.inbox.delivery.changed`
+    InboxDeliveryChanged {
+        session_id: String,
+        inbox_id: String,
+        delivery: Delivery,
+    },
+    /// `shell.created`
+    ShellCreated(ShellInfo),
+    /// `shell.exited` (running → exited/timeout/killed)
+    ShellExited {
+        id: String,
+        status: String,
+        exit: Option<i64>,
+    },
+    /// `shell.deleted`
+    ShellDeleted {
+        id: String,
+    },
+    /// `vcs.branch.updated` for the envelope's location.
+    BranchChanged {
+        branch: Option<String>,
+    },
+    /// `worktree.updated`
+    WorktreesChanged {
+        project_id: String,
+    },
+    /// `session.skill.activated`: a skill entry joins the transcript.
+    SkillActivated {
+        session_id: String,
+    },
+    /// `command.updated`, `skill.updated`, `mcp.status.changed`: re-read
+    /// the folder's `/` menu sources.
+    ToolingChanged,
+    /// Insert a user message (a delivered inbox item; the demo uses it
+    /// directly).
     UserPrompt {
         session_id: String,
         message_id: String,
@@ -212,16 +262,20 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
     let ordinal = || u64_at(d, "/ordinal");
     Some(match ty {
         // `session.created` carries the location but no title or times.
-        "session.created" => Event::SessionUpserted(SessionInfo {
-            id: sid()?,
-            title: String::new(),
-            directory: PathBuf::from(d.pointer("/location/directory")?.as_str()?),
-            created,
-            updated: created,
-            parent_id: str_at(d, "/parentID"),
-            model: None,
-            agent: None,
-        }),
+        "session.created" => Event::SessionUpserted(
+            SessionInfo {
+                id: sid()?,
+                title: String::new(),
+                directory: PathBuf::from(d.pointer("/location/directory")?.as_str()?),
+                created,
+                updated: created,
+                parent_id: str_at(d, "/parentID"),
+                model: None,
+                // Subagent sessions are created with their description and agent.
+                agent: str_at(d, "/agent"),
+            }
+            .with_title(str_at(d, "/title")),
+        ),
         "session.model.selected" => Event::ModelSelected {
             session_id: sid()?,
             model: ModelRef::from_json(d.get("model")?)?,
@@ -254,15 +308,43 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
                 error: error_text(d.get("error")).unwrap_or_else(|| "failed".into()),
             },
         },
-        "session.inbox.enqueued"
-            if d.pointer("/item/type").and_then(Value::as_str) == Some("user") =>
-        {
-            Event::UserPrompt {
+        "session.inbox.enqueued" => {
+            let id = str_at(d, "/inboxID")?;
+            Event::InboxEnqueued {
                 session_id: sid()?,
-                message_id: str_at(d, "/inboxID")?,
-                text: str_at(d, "/item/payload/text").unwrap_or_default(),
+                item: InboxItem::from_json(Some(&id), d.get("item")?)?,
             }
         }
+        "session.inbox.delivered" => Event::InboxDelivered {
+            session_id: sid()?,
+            inbox_id: str_at(d, "/inboxID")?,
+        },
+        "session.inbox.cancelled" => Event::InboxCancelled {
+            session_id: sid()?,
+            inbox_id: str_at(d, "/inboxID")?,
+        },
+        "session.inbox.delivery.changed" => Event::InboxDeliveryChanged {
+            session_id: sid()?,
+            inbox_id: str_at(d, "/inboxID")?,
+            delivery: Delivery::parse(&str_at(d, "/delivery")?)?,
+        },
+        "shell.created" => Event::ShellCreated(ShellInfo::from_json(d.get("info")?)?),
+        "shell.exited" => Event::ShellExited {
+            id: str_at(d, "/id")?,
+            status: str_at(d, "/status").unwrap_or_else(|| "exited".into()),
+            exit: d.get("exit").and_then(Value::as_f64).map(|e| e as i64),
+        },
+        "shell.deleted" => Event::ShellDeleted {
+            id: str_at(d, "/id")?,
+        },
+        "vcs.branch.updated" => Event::BranchChanged {
+            branch: str_at(d, "/branch"),
+        },
+        "worktree.updated" => Event::WorktreesChanged {
+            project_id: str_at(d, "/projectID")?,
+        },
+        "command.updated" | "skill.updated" | "mcp.status.changed" => Event::ToolingChanged,
+        "session.skill.activated" => Event::SkillActivated { session_id: sid()? },
         "session.step.started" => Event::StepStarted {
             session_id: sid()?,
             message_id: mid()?,
@@ -396,6 +478,44 @@ mod tests {
     }
 
     #[test]
+    fn decodes_inbox_shell_vcs_events() {
+        // Shapes captured from opencode 2.2.6 (docs/protocol-notes.md, M7).
+        let ev = |s: &str| Envelope::from_json(s).unwrap().event;
+        assert!(matches!(
+            ev(r#"{"type":"session.inbox.enqueued","data":{"inboxID":"msg_q","sessionID":"ses_a","item":{"type":"user","payload":{"text":"later"},"delivery":"queue"}}}"#),
+            Event::InboxEnqueued { item, .. } if item.id == "msg_q" && item.text == "later" && item.delivery == Delivery::Queue
+        ));
+        assert!(matches!(
+            ev(
+                r#"{"type":"session.inbox.delivery.changed","data":{"sessionID":"ses_a","inboxID":"msg_q","delivery":"steer"}}"#
+            ),
+            Event::InboxDeliveryChanged {
+                delivery: Delivery::Steer,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ev(r#"{"type":"session.inbox.cancelled","data":{"sessionID":"ses_a","inboxID":"msg_q"}}"#),
+            Event::InboxCancelled { inbox_id, .. } if inbox_id == "msg_q"
+        ));
+        assert!(matches!(
+            ev(r#"{"type":"shell.exited","data":{"id":"sh_1","status":"killed"}}"#),
+            Event::ShellExited { status, exit: None, .. } if status == "killed"
+        ));
+        let created = Envelope::from_json(r#"{"type":"vcs.branch.updated","location":{"directory":"/p"},"data":{"branch":"main"}}"#).unwrap();
+        assert_eq!(
+            created.directory.as_deref(),
+            Some(std::path::Path::new("/p"))
+        );
+        assert!(matches!(created.event, Event::BranchChanged { branch: Some(b) } if b == "main"));
+        // A subagent session arrives with its parent, title and agent.
+        assert!(matches!(
+            ev(r#"{"type":"session.created","created":5,"data":{"sessionID":"ses_c","parentID":"ses_p","title":"Look around","agent":"general","location":{"directory":"/p"}}}"#),
+            Event::SessionUpserted(s) if s.parent_id.as_deref() == Some("ses_p") && s.title == "Look around" && s.agent.as_deref() == Some("general")
+        ));
+    }
+
+    #[test]
     fn decodes_form_events() {
         // Shape captured from a live sidecar (opencode 2.2.6 question tool).
         let created = Envelope::from_json(concat!(
@@ -448,7 +568,11 @@ mod tests {
     fn decodes_captured_turns() {
         let evs = fixture();
         let count = |f: fn(&Event) -> bool| evs.iter().filter(|e| f(&e.event)).count();
-        assert_eq!(count(|e| matches!(e, Event::UserPrompt { .. })), 2);
+        assert_eq!(
+            count(|e| matches!(e, Event::InboxEnqueued { item, .. } if item.kind == "user")),
+            2
+        );
+        assert_eq!(count(|e| matches!(e, Event::InboxDelivered { .. })), 2);
         assert_eq!(count(|e| matches!(e, Event::ExecutionStarted { .. })), 2);
         assert_eq!(
             count(|e| matches!(

@@ -5,8 +5,14 @@
 //! popup of matching files (`/api/fs/find`) and subagents; picking one turns
 //! it into an inline token that's sent as a prompt attachment. Up/Down at the
 //! start of an empty or recalled prompt walk through earlier prompts.
+//!
+//! While the selected session runs, Enter steers the running turn (delivered
+//! at its next step) and Ctrl/Cmd+Enter queues the prompt for when the turn
+//! ends; pending items are listed above the text box. Esc twice stops the
+//! turn. Each session keeps its own draft.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
@@ -20,31 +26,64 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::api::model::{FsEntry, Message, ModelRef};
+use crate::api::model::{Delivery, FsEntry, InboxItem, Message, ModelRef};
 use crate::controller::Controller;
 use crate::store::{Connection, Store};
-use crate::ui::mention::{self, AGENT_PREFIX, FILE_PREFIX, History};
+use crate::ui::mention::{self, AGENT_PREFIX, FILE_PREFIX, History, SKILL_PREFIX};
 
 /// Wait this long after the last keystroke before searching files.
 const FIND_DEBOUNCE: Duration = Duration::from_millis(120);
 const MAX_ITEMS: usize = 8;
+const SLASH_MAX_ITEMS: usize = 12;
+/// A second Esc within this window stops the running turn.
+const ESC_WINDOW: Duration = Duration::from_millis(1200);
+const PLACEHOLDER_IDLE: &str = "Ask opencode anything… @ to mention files, / for commands";
+const PLACEHOLDER_BUSY: &str = "Steer the running turn… (Ctrl+Enter queues it for later)";
 
 #[derive(Clone, Debug, PartialEq)]
 enum MentionItem {
     File(FsEntry),
-    Agent { id: String, name: String },
+    Agent {
+        id: String,
+        name: String,
+    },
+    // `/` menu entries.
+    /// A client action (`compact`).
+    Action {
+        id: &'static str,
+        detail: &'static str,
+    },
+    Command {
+        name: String,
+        detail: String,
+    },
+    Skill {
+        id: String,
+        name: String,
+        detail: String,
+    },
+    Mcp {
+        name: String,
+        status: String,
+        connected: bool,
+    },
 }
 
 impl MentionItem {
-    fn token(&self) -> InlineToken {
-        match self {
+    /// The inline token a pick becomes, for items that attach something.
+    fn token(&self) -> Option<InlineToken> {
+        Some(match self {
             MentionItem::File(f) => {
                 InlineToken::new(format!("{FILE_PREFIX}{}", f.path), format!("@{}", f.path))
             }
             MentionItem::Agent { id, .. } => {
                 InlineToken::new(format!("{AGENT_PREFIX}{id}"), format!("@{id}"))
             }
-        }
+            MentionItem::Skill { id, name, .. } => {
+                InlineToken::new(format!("{SKILL_PREFIX}{id}"), format!("/{name}"))
+            }
+            _ => return None,
+        })
     }
 }
 
@@ -53,6 +92,8 @@ struct MentionPopup {
     /// Byte offset of the `@` in the text.
     at: usize,
     query: String,
+    /// `/` menu entries (empty for `@`).
+    slash: Vec<MentionItem>,
     agents: Vec<MentionItem>,
     files: Vec<MentionItem>,
     selected: usize,
@@ -62,7 +103,16 @@ struct MentionPopup {
 
 impl MentionPopup {
     fn items(&self) -> impl Iterator<Item = &MentionItem> {
-        self.agents.iter().chain(&self.files).take(MAX_ITEMS)
+        let max = if self.slash.is_empty() {
+            MAX_ITEMS
+        } else {
+            SLASH_MAX_ITEMS
+        };
+        self.slash
+            .iter()
+            .chain(&self.agents)
+            .chain(&self.files)
+            .take(max)
     }
 
     fn len(&self) -> usize {
@@ -83,6 +133,13 @@ pub struct Composer {
     /// update that caused it, so a flag can't tell our own edits apart; the
     /// text itself can.
     recalled: Option<String>,
+    /// Unsent text per session (`None` = the start screen).
+    drafts: HashMap<Option<String>, String>,
+    /// The session the box's current text belongs to.
+    draft_key: Option<String>,
+    /// First Esc of a double-Esc stop.
+    esc_armed: Option<Instant>,
+    placeholder_busy: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -95,7 +152,7 @@ impl Composer {
     ) -> Self {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Ask opencode anything… @ to mention files")
+                .placeholder(PLACEHOLDER_IDLE)
                 .auto_grow(1, 10)
                 .submit_on_enter(true)
         });
@@ -103,9 +160,9 @@ impl Composer {
             cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
                 match ev {
                     InputEvent::PressEnter {
-                        secondary: false,
+                        secondary,
                         shift: false,
-                    } => this.submit(window, cx),
+                    } => this.submit(*secondary, window, cx),
                     InputEvent::Change => {
                         let value = this.input.read(cx).value();
                         if this.recalled.as_deref() != Some(value.as_ref()) {
@@ -119,8 +176,12 @@ impl Composer {
                 }
                 cx.notify();
             }),
-            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe_in(&store, window, |this, _, window, cx| {
+                this.swap_draft(window, cx);
+                cx.notify();
+            }),
         ];
+        let draft_key = store.read(cx).selected.clone();
         Self {
             input,
             controller,
@@ -130,8 +191,34 @@ impl Composer {
             history: History::default(),
             sent: Vec::new(),
             recalled: None,
+            drafts: HashMap::new(),
+            draft_key,
+            esc_armed: None,
+            placeholder_busy: false,
             _subs: subs,
         }
+    }
+
+    /// On selection change, park the box's text under the old session and
+    /// bring back the new one's, so a draft never goes to the wrong session.
+    fn swap_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.store.read(cx).selected.clone();
+        if selected == self.draft_key {
+            return;
+        }
+        let text = self.input.read(cx).value().to_string();
+        let old = std::mem::replace(&mut self.draft_key, selected.clone());
+        if text.trim().is_empty() {
+            self.drafts.remove(&old);
+        } else {
+            self.drafts.insert(old, text);
+        }
+        let restored = self.drafts.remove(&selected).unwrap_or_default();
+        self.close_mention(cx);
+        self.history.reset();
+        self.recalled = None;
+        self.esc_armed = None;
+        self.set_text(&restored, window, cx);
     }
 
     pub fn focus(this: &Entity<Self>, window: &mut Window, cx: &mut App) {
@@ -144,10 +231,14 @@ impl Composer {
         s.selected.as_deref().is_some_and(|id| s.is_busy(id))
     }
 
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy(cx) {
-            return;
-        }
+    /// Send the box. While the session runs, `secondary` (Ctrl/Cmd+Enter)
+    /// queues the prompt for after the turn; plain Enter steers it.
+    fn submit(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let delivery = self.busy(cx).then_some(if secondary {
+            Delivery::Queue
+        } else {
+            Delivery::Steer
+        });
         let content = self.input.read(cx).content();
         if content.text().trim().is_empty() {
             return;
@@ -155,7 +246,31 @@ impl Composer {
         let Some(folder) = self.store.read(cx).target_folder() else {
             return;
         };
-        let input = mention::build_prompt(
+        // `/name args` runs a server command; `/compact` compacts.
+        let text = content.text().to_string();
+        if let Some((name, rest)) = mention::parse_command(&text) {
+            let store = self.store.read(cx);
+            let known = store
+                .catalog_folder()
+                .and_then(|f| store.tooling.get(&f))
+                .is_some_and(|t| t.commands.iter().any(|c| c.name == name));
+            let (name, rest) = (name.to_string(), rest.to_string());
+            if known || (name == "compact" && rest.is_empty()) {
+                self.sent.push(text.trim().to_string());
+                self.history.reset();
+                self.close_mention(cx);
+                self.set_text("", window, cx);
+                self.controller.update(cx, |c, cx| {
+                    if name == "compact" && !known {
+                        c.compact(cx)
+                    } else {
+                        c.run_command(name, rest, delivery, cx)
+                    }
+                });
+                return;
+            }
+        }
+        let mut input = mention::build_prompt(
             content.text(),
             content
                 .tokens()
@@ -163,11 +278,133 @@ impl Composer {
                 .map(|t| (t.range(), t.token().id().as_ref())),
             &folder,
         );
+        input.delivery = delivery;
         self.sent.push(input.text.trim().to_string());
         self.history.reset();
         self.close_mention(cx);
         self.set_text("", window, cx);
         self.controller.update(cx, |c, cx| c.send_prompt(input, cx));
+    }
+
+    /// Esc with no popup: the first arms, a second within [`ESC_WINDOW`]
+    /// stops the turn, so one stray Esc can't kill a long run.
+    fn escape_to_stop(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.busy(cx) {
+            self.esc_armed = None;
+            return false;
+        }
+        match self.esc_armed {
+            Some(t) if t.elapsed() < ESC_WINDOW => {
+                self.esc_armed = None;
+                self.controller.update(cx, |c, cx| c.abort_if_busy(cx));
+            }
+            _ => {
+                self.esc_armed = Some(Instant::now());
+                // Drop the hint when the window passes.
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(ESC_WINDOW).await;
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                })
+                .detach();
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// Withdraw a pending prompt and put its text back in the box to edit.
+    fn edit_pending(&mut self, item: InboxItem, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sid) = self.store.read(cx).selected.clone() else {
+            return;
+        };
+        let current = self.input.read(cx).value().to_string();
+        let text = if current.trim().is_empty() {
+            item.text.clone()
+        } else {
+            format!("{}\n{current}", item.text)
+        };
+        self.set_text(&text, window, cx);
+        self.controller
+            .update(cx, |c, cx| c.cancel_inbox(sid, item.id, cx));
+    }
+
+    /// Pending (queued or steering) prompts of the selected session.
+    fn render_pending(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        let sid = store.selected.clone()?;
+        let items: Vec<InboxItem> = store
+            .pending_prompts(&sid)
+            .iter()
+            .filter(|i| i.kind == "user")
+            .cloned()
+            .collect();
+        if items.is_empty() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let rows = items.into_iter().enumerate().map(|(ix, item)| {
+            let queued = item.delivery == Delivery::Queue;
+            let (sid_s, sid_r) = (sid.clone(), sid.clone());
+            let (id_s, id_r) = (item.id.clone(), item.id.clone());
+            let edit_item = item.clone();
+            h_flex()
+                .id(SharedString::from(format!("pending-{ix}")))
+                .w_full()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_lg()
+                .bg(theme.secondary.opacity(0.6))
+                .text_sm()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(if queued {
+                            theme.muted_foreground
+                        } else {
+                            theme.primary
+                        })
+                        .child(if queued { "Queued" } else { "Steering" }),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(item.text.clone()))
+                .when(queued, |el| {
+                    el.child(
+                        Button::new(SharedString::from(format!("pending-steer-{ix}")))
+                            .label("Steer now")
+                            .ghost()
+                            .xsmall()
+                            .tooltip("Deliver at the next step instead of after the turn")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let (sid, id) = (sid_s.clone(), id_s.clone());
+                                this.controller.update(cx, |c, cx| c.steer_now(sid, id, cx));
+                            })),
+                    )
+                })
+                .child(
+                    Button::new(SharedString::from(format!("pending-edit-{ix}")))
+                        .icon(crate::ui::icons::pencil())
+                        .ghost()
+                        .xsmall()
+                        .tooltip("Edit (takes it back)")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.edit_pending(edit_item.clone(), window, cx);
+                        })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("pending-remove-{ix}")))
+                        .icon(IconName::Close)
+                        .ghost()
+                        .xsmall()
+                        .tooltip("Remove")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let (sid, id) = (sid_r.clone(), id_r.clone());
+                            this.controller
+                                .update(cx, |c, cx| c.cancel_inbox(sid, id, cx));
+                        })),
+                )
+        });
+        Some(v_flex().gap_1().children(rows).into_any_element())
     }
 
     fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -193,6 +430,12 @@ impl Composer {
             let tokens: Vec<_> = i.tokens().iter().map(|t| t.range()).collect();
             (i.value().to_string(), i.cursor(), tokens)
         };
+        if tokens.is_empty()
+            && let Some(query) = mention::slash_query(&text, caret)
+        {
+            self.open_slash(query.to_string(), cx);
+            return;
+        }
         let Some((at, query)) = mention::active_query(&text, caret, &tokens) else {
             self.close_mention(cx);
             return;
@@ -207,11 +450,9 @@ impl Composer {
         let Some(folder) = self.store.read(cx).target_folder() else {
             return;
         };
-        let agents: Vec<MentionItem> = self
-            .store
-            .read(cx)
-            .catalogs
-            .get(&folder)
+        let catalog_folder = self.store.read(cx).catalog_folder();
+        let agents: Vec<MentionItem> = catalog_folder
+            .and_then(|f| self.store.read(cx).catalogs.get(&f))
             .map(|c| {
                 c.agents
                     .iter()
@@ -239,6 +480,7 @@ impl Composer {
         self.mention = Some(MentionPopup {
             at,
             query: query.to_string(),
+            slash: Vec::new(),
             agents,
             files,
             selected: 0,
@@ -294,12 +536,107 @@ impl Composer {
             return;
         };
         let caret = self.input.read(cx).cursor();
-        self.input.update(cx, |i, cx| {
-            if let Err(e) = i.replace_range_with_token(m.at..caret, item.token(), window, cx) {
-                tracing::warn!("could not insert mention: {e:?}");
-                return;
+        let range = m.at..caret;
+        if let Some(token) = item.token() {
+            self.input.update(cx, |i, cx| {
+                if let Err(e) = i.replace_range_with_token(range, token, window, cx) {
+                    tracing::warn!("could not insert mention: {e:?}");
+                    return;
+                }
+                i.insert(" ", window, cx);
+            });
+            cx.notify();
+            return;
+        }
+        // `/` entries that act instead of attaching.
+        let rest = self.input.read(cx).value()[caret..].to_string();
+        match item {
+            MentionItem::Command { name, .. } => {
+                // Arguments follow; Enter runs it (see `submit`).
+                self.set_text(&format!("/{name} {}", rest.trim_start()), window, cx);
             }
-            i.insert(" ", window, cx);
+            MentionItem::Action { id: "compact", .. } => {
+                self.set_text(rest.trim_start(), window, cx);
+                self.controller.update(cx, |c, cx| c.compact(cx));
+            }
+            MentionItem::Mcp {
+                name, connected, ..
+            } => {
+                self.set_text(rest.trim_start(), window, cx);
+                self.controller
+                    .update(cx, |c, cx| c.set_mcp_connected(name, !connected, cx));
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Whether the box is in `/` menu mode (first word starts with `/`).
+    fn slash_mode(&self, cx: &App) -> bool {
+        let i = self.input.read(cx);
+        mention::slash_query(&i.value(), i.cursor()).is_some()
+    }
+
+    /// The `/` menu: client actions, the folder's server commands, skills
+    /// and MCP servers (picking one toggles its connection).
+    fn open_slash(&mut self, query: String, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let tooling = store
+            .catalog_folder()
+            .and_then(|f| store.tooling.get(&f).cloned())
+            .unwrap_or_default();
+        let has_session = store.selected.is_some();
+        let q = query.as_str();
+        let hit = |s: &str| mention::fuzzy_match(s, q);
+        let mut items = Vec::new();
+        if has_session && hit("compact") {
+            items.push(MentionItem::Action {
+                id: "compact",
+                detail: "Summarize the conversation to free up context",
+            });
+        }
+        items.extend(tooling.commands.iter().filter(|c| hit(&c.name)).map(|c| {
+            MentionItem::Command {
+                name: c.name.clone(),
+                detail: c.description.clone(),
+            }
+        }));
+        items.extend(
+            tooling
+                .skills
+                .iter()
+                .filter(|sk| hit(&sk.id) || hit(&sk.name))
+                .map(|sk| MentionItem::Skill {
+                    id: sk.id.clone(),
+                    name: sk.id.clone(),
+                    detail: sk.description.clone(),
+                }),
+        );
+        items.extend(
+            tooling
+                .mcp
+                .iter()
+                .filter(|m| hit(&m.name) || hit("mcp"))
+                .map(|m| MentionItem::Mcp {
+                    name: m.name.clone(),
+                    status: m.error.clone().unwrap_or_else(|| m.status.clone()),
+                    connected: m.connected(),
+                }),
+        );
+        self.mention_seq += 1;
+        let selected = self
+            .mention
+            .as_ref()
+            .filter(|m| !m.slash.is_empty() && m.query == query)
+            .map_or(0, |m| m.selected);
+        self.mention = Some(MentionPopup {
+            at: 0,
+            query,
+            slash: items,
+            agents: Vec::new(),
+            files: Vec::new(),
+            selected,
+            seq: self.mention_seq,
         });
         cx.notify();
     }
@@ -372,17 +709,43 @@ impl Composer {
             .items()
             .enumerate()
             .map(|(ix, item)| {
-                let (icon, label, detail) = match item {
+                use crate::ui::icons;
+                let (icon, label, detail): (Icon, String, String) = match item {
                     MentionItem::File(f) => {
                         let (dir, name) = match f.path.rsplit_once('/') {
                             Some((d, n)) => (d.to_string(), n.to_string()),
                             None => (String::new(), f.path.clone()),
                         };
-                        (IconName::File, name, dir)
+                        (Icon::new(IconName::File), name, dir)
                     }
-                    MentionItem::Agent { id, name } => {
-                        (IconName::Bot, id.clone(), format!("{name} agent"))
+                    MentionItem::Agent { id, name } => (
+                        Icon::new(IconName::Bot),
+                        id.clone(),
+                        format!("{name} agent"),
+                    ),
+                    MentionItem::Action { id, detail } => {
+                        (icons::layers(), format!("/{id}"), detail.to_string())
                     }
+                    MentionItem::Command { name, detail } => {
+                        (icons::slash(), format!("/{name}"), detail.clone())
+                    }
+                    MentionItem::Skill { name, detail, .. } => (
+                        icons::sparkles(),
+                        format!("/{name}"),
+                        format!("skill · {detail}"),
+                    ),
+                    MentionItem::Mcp {
+                        name,
+                        status,
+                        connected,
+                    } => (
+                        icons::plug(),
+                        name.clone(),
+                        format!(
+                            "MCP · {status} · {}",
+                            if *connected { "disconnect" } else { "connect" }
+                        ),
+                    ),
                 };
                 let selected = ix == m.selected;
                 h_flex()
@@ -394,7 +757,7 @@ impl Composer {
                     .cursor_pointer()
                     .when(selected, |d| d.bg(theme.accent))
                     .hover(|d| d.bg(theme.accent))
-                    .child(Icon::new(icon).small().text_color(theme.muted_foreground))
+                    .child(icon.small().text_color(theme.muted_foreground))
                     .child(div().text_sm().child(label))
                     .child(
                         div()
@@ -412,6 +775,11 @@ impl Composer {
             })
             .collect();
         let empty = rows.is_empty();
+        let empty_text = if m.at == 0 && m.agents.is_empty() && self.slash_mode(cx) {
+            "No matching commands"
+        } else {
+            "No matching files"
+        };
         let popup = v_flex()
             .absolute()
             .bottom_full()
@@ -432,7 +800,7 @@ impl Composer {
                         .py_1()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child("No matching files"),
+                        .child(empty_text),
                 )
             })
             .children(rows);
@@ -588,33 +956,61 @@ impl Composer {
 }
 
 impl Render for Composer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.busy(cx);
+        if busy != self.placeholder_busy {
+            self.placeholder_busy = busy;
+            let text = if busy {
+                PLACEHOLDER_BUSY
+            } else {
+                PLACEHOLDER_IDLE
+            };
+            self.input
+                .update(cx, |i, cx| i.set_placeholder(text, window, cx));
+        }
         let connected = self.store.read(cx).connection() == Connection::Connected;
         let empty = self.input.read(cx).value().trim().is_empty();
+        let focused = self
+            .input
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        let esc_armed = self.esc_armed.is_some_and(|t| t.elapsed() < ESC_WINDOW);
         let popup = self.render_mention(cx);
+        let pending = self.render_pending(cx);
         let pickers = self.render_pickers(cx);
         let theme = cx.theme();
 
-        let action = if busy {
+        let send = Button::new("send")
+            .icon(IconName::ArrowUp)
+            .small()
+            .rounded(px(999.))
+            .primary()
+            .tooltip(if busy {
+                "Steer the running turn (Enter) · queue (Ctrl+Enter)"
+            } else {
+                "Send (Enter)"
+            })
+            .disabled(empty || !connected)
+            .on_click(cx.listener(|this, _, window, cx| this.submit(false, window, cx)));
+        let stop = busy.then(|| {
             Button::new("stop")
                 .icon(IconName::Square)
                 .small()
                 .rounded(px(999.))
-                .primary()
-                .tooltip("Stop")
+                .when(empty, |b| b.primary())
+                .when(!empty, |b| b.outline())
+                .tooltip("Stop (Esc Esc)")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.controller.update(cx, |c, cx| c.abort(cx));
                 }))
+        });
+        let status = if esc_armed {
+            Some(("Press Esc again to stop", theme.warning))
+        } else if busy {
+            Some(("Working…", theme.muted_foreground))
         } else {
-            Button::new("send")
-                .icon(IconName::ArrowUp)
-                .small()
-                .rounded(px(999.))
-                .primary()
-                .tooltip("Send (Enter)")
-                .disabled(empty || !connected)
-                .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+            None
         };
 
         v_flex()
@@ -622,8 +1018,13 @@ impl Render for Composer {
             .w_full()
             .rounded_3xl()
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.background)
+            .border_color(if focused {
+                theme.ring.opacity(0.6)
+            } else {
+                theme.border
+            })
+            // A raised surface, so the box stands out from the page.
+            .bg(theme.secondary.opacity(0.35))
             .shadow_sm()
             .px_3()
             .pt_2()
@@ -666,9 +1067,7 @@ impl Render for Composer {
                 if this.mention.is_some() {
                     this.close_mention(cx);
                     cx.stop_propagation();
-                } else if this.busy(cx) {
-                    // Esc interrupts, as in opencode's TUI.
-                    this.controller.update(cx, |c, cx| c.abort_if_busy(cx));
+                } else if this.escape_to_stop(cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -680,6 +1079,7 @@ impl Render for Composer {
             }))
             .capture_action(cx.listener(|this, _: &MoveLeft, _, cx| this.close_mention(cx)))
             .capture_action(cx.listener(|this, _: &MoveRight, _, cx| this.close_mention(cx)))
+            .children(pending)
             .child(Textarea::new(&self.input).appearance(false))
             .child(
                 h_flex()
@@ -691,15 +1091,11 @@ impl Render for Composer {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .when(busy, |d| {
-                                d.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("Working…"),
-                                )
+                            .when_some(status, |d, (text, color)| {
+                                d.child(div().text_xs().text_color(color).child(text))
                             })
-                            .child(action),
+                            .children(stop)
+                            .when(!busy || !empty, |d| d.child(send)),
                     ),
             )
     }

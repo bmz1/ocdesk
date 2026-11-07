@@ -225,3 +225,92 @@ The UI also bounds its own preview, while Copy retains the returned patch.
   (re)connect, after adding a folder, and (debounced 300 ms) on
   `model.updated` / `agent.updated` / `provider.updated`, which arrive in a
   burst at sidecar startup.
+
+## M7: inbox, commands, background tasks, worktrees (probed on 2.2.6)
+
+Captured with `dev/harness.py` + the mock model (`tool:task`, `tool:sleep`,
+`slow` keywords) against a real `opencode serve`.
+
+**Inbox: queue and steer.** Every prompt goes through a per-session inbox.
+`POST …/prompt {text, delivery: "steer"|"queue"}` → `{data: {id, sessionID,
+time, type: "user", payload: {text}, delivery}}` (the inbox item; its `id`
+becomes the user message id). While a turn runs:
+
+- `steer` items are delivered at the next step boundary of the running turn
+  (they become a user message mid-turn; the model sees them on its next call);
+- `queue` items wait until the turn ends, then start the next turn.
+
+Order observed: `slow` turn → steer delivered → queued delivered.
+
+| Need | Route | Notes |
+|---|---|---|
+| Pending items | `GET /api/session/{id}/inbox` | `{data: [item]}`, oldest first |
+| Cancel | `DELETE /api/session/{id}/inbox/{itemID}` | 204, then `session.inbox.cancelled {sessionID, inboxID}` |
+| Re-target | `PATCH …/inbox/{itemID} {delivery}` | 204, then `session.inbox.delivery.changed {sessionID, inboxID, delivery}` |
+
+Events: `session.inbox.enqueued {sessionID, inboxID, item: {type, payload, delivery}}`,
+`session.inbox.delivered {sessionID, inboxID}`. An idle session's prompt is
+enqueued and delivered within ~20 ms. Item `type` is `user`, or `compaction`
+for `POST …/compact`.
+
+**Compaction.** `POST /api/session/{id}/compact {}` → an inbox item
+`{type: "compaction", delivery: "steer"}`. The message projection gains
+`{type: "compaction", status: "completed"|"failed", reason: "manual"|…,
+error?, tokens, cost}`. (With the mock model it fails: "Compaction summary did
+not match the required template", which is a fine error-path fixture.)
+
+**Commands.** `GET /api/command?location[directory]=…` → `{data: [{name,
+description}]}`; built-ins on 2.2.6: `init`, `review`, `goal`.
+`POST /api/session/{id}/command {name, text, files?, agents?, skills?, delivery?}`
+→ 204; the expanded template becomes the user message (e.g. `/review` →
+"You are a code reviewer…"). Unknown name → 404 `CommandNotFoundError`.
+
+**Skills.** `GET /api/skill?location[directory]=…` → `{data: [{id, name,
+description, path, content}]}` (built-in `opencode` skill). Two ways to use
+one: a `skills: [{id, mention?}]` prompt attachment, or
+`POST /api/experimental/session/{id}/skill {id}` → 204 +
+`session.skill.activated {sessionID, id, name, text}` and a `{type: "skill"}`
+entry in the projection.
+
+**MCP.** `GET /api/mcp?location[directory]=…` → `{data: [{name, title?,
+integrationID?, status: {status: connected|pending|disabled|failed|needs_auth,
+error?}}]}`. Config key is `mcp.servers.<name>` (2.x). Connect/disconnect:
+`POST /api/experimental/mcp/{server}/connect|disconnect`. Event
+`mcp.status.changed`.
+
+**Subagents.** The tool is `subagent` (`{agent, description, prompt,
+background?}`, `background: true` returns at once). The child is a normal
+session with `parentID` (`GET /api/session?parentID=<id>`) and `agent`;
+`session.created` carries `parentID`, `title` (= description) and `agent`.
+The parent's tool block: `state.metadata.sessionID` = child id,
+`state.metadata.status`, `state.input = {agent, description, prompt}`; result
+text is wrapped in `<subagent sessionID=… state=completed>…</subagent>`. The
+child's own events stream on `/api/event` like any session's.
+
+**Shells and jobs.** A long `shell` tool call is moved to the background by
+the server (tool result: "Command moved to the background (shell ID: sh_…)").
+`GET /api/shell?location[directory]=…` → `{data: [Shell.Info]}`: `{id, status:
+running|exited|timeout|killed, command, cwd, shell, file, pid, exit?, signal?,
+metadata: {sessionID}, time: {started, completed?}}`.
+`GET /api/shell/{id}/output?cursor=&limit=` → `{data: {output, cursor, size,
+truncated}}`. `DELETE /api/shell/{id}` kills it. Events: `shell.created {info}`,
+`shell.exited {id, status, exit?}`, `shell.deleted {id}`.
+`GET /api/experimental/job` → `{data: [Job.Shell | Job.Subagent | Job.Image]}`
+with `kind`, `status: running|completed|error|cancelled`, `sessionID`, and
+`shellID`/`command` or `childSessionID`/`agent`/`description`.
+
+**VCS and worktrees.** `GET /api/vcs?location[directory]=…` → `{data:
+{provider: "git", branch: {current, default}}}` (`branch: {}` until resolved;
+event `vcs.branch.updated {branch}` with the event's `location`).
+`GET /api/vcs/branch` → `{data: ["main", …]}`. Worktrees are per project
+(`projectID` from `GET /api/location` → `project.id`):
+
+| Need | Route | Notes |
+|---|---|---|
+| List | `GET /api/worktree?projectID=` | `[{directory, strategy?}]`; includes the main checkout (no `strategy`) |
+| Create | `POST /api/worktree {projectID, name?, branch?, from?, directory?}` | `{directory}`, default under `$XDG_DATA_HOME/opencode/worktree/<hash>/<name>` |
+| Remove | `DELETE /api/worktree {projectID, directory, force}` | 400 with `forceRequired` when dirty |
+| Move a session | `POST /api/session/{id}/move {directory}` | 204; the session's `location.directory` changes |
+
+Events: `worktree.updated {projectID}`, `worktree.resolved`. A worktree
+location reports its own `project.id` with `canonical` = the main checkout.

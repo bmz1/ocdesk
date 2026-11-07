@@ -1,0 +1,138 @@
+name: Package
+
+# Tag `vX.Y.Z` (matching Cargo.toml's version) to build installers and attach
+# them to a draft GitHub release. "Run workflow" builds them as artifacts only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  linux:
+    name: Linux AppImage + tarball (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    # The oldest supported runner, so the binary's glibc floor stays low.
+    runs-on: ${{ matrix.runner }}
+    # ARM runners may be unavailable (e.g. private repos on free plans);
+    # don't let that block the x86_64 and macOS release.
+    continue-on-error: ${{ matrix.arch == 'aarch64' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
+            libx11-xcb-dev libxcb-xkb-dev libfontconfig-dev libssl-dev \
+            libasound2-dev libzstd-dev imagemagick file
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != Cargo.toml $v"; exit 1; }
+
+      - name: Package
+        run: packaging/linux/package.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            target/package/*.AppImage
+            target/package/*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: macOS .app (universal)
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Developer ID signing + notarization only when the secrets exist;
+      # otherwise the app is ad-hoc signed.
+      - name: Import signing certificate
+        if: env.MACOS_CERT_P12 != ''
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          kc=$RUNNER_TEMP/build.keychain-db
+          kcpw=$(uuidgen)
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kcpw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kcpw" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$kc"
+          security set-key-partition-list -S apple-tool:,apple: -k "$kcpw" "$kc"
+          security list-keychains -d user -s "$kc"
+          id=$(security find-identity -v -p codesigning "$kc" | sed -n 's/.*"\(Developer ID Application.*\)"/\1/p' | head -1)
+          echo "MACOS_SIGN_IDENTITY=$id" >> "$GITHUB_ENV"
+          if [ -n "$APPLE_ID" ]; then
+            xcrun notarytool store-credentials ocdesk-notary --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --keychain "$kc"
+            echo "NOTARY_PROFILE=ocdesk-notary" >> "$GITHUB_ENV"
+          fi
+
+      - name: Package
+        env:
+          ARCHS: "arm64 x86_64"
+        run: packaging/macos/bundle.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: |
+            target/package/*.dmg
+            target/package/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/*

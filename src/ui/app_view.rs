@@ -13,6 +13,9 @@ use crate::ui::frame_stats::FrameStats;
 use crate::ui::keys;
 use crate::ui::sidebar::{SIDEBAR_MAX_W, SIDEBAR_MIN_W, SIDEBAR_W, Sidebar};
 
+/// Reverse-DNS id shared by the window class, `.desktop` file and `.app`.
+pub const APP_ID: &str = "io.github.bmz1.ocdesk";
+
 /// Drag payload of the sidebar's resize handle.
 struct SidebarResize;
 
@@ -62,6 +65,8 @@ pub fn window_options(settings: &Settings, cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(window_bounds),
         window_min_size: Some(size(px(WindowPlacement::MIN_W), px(WindowPlacement::MIN_H))),
+        // Matches the desktop entry (StartupWMClass) and the macOS bundle id.
+        app_id: Some(APP_ID.into()),
         titlebar: Some(TitlebarOptions {
             title: Some("ocdesk".into()),
             ..Default::default()
@@ -242,6 +247,9 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &keys::ToggleChanges, _, cx| {
                 this.conversation.update(cx, |c, cx| c.toggle_changes(cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::ToggleTasks, _, cx| {
+                this.conversation.update(cx, |c, cx| c.toggle_tasks(cx));
             }))
             .on_action(|_: &keys::ShowShortcuts, window, cx| keys::show_shortcuts(window, cx))
             .on_action(|_: &keys::Quit, _, cx| cx.quit())

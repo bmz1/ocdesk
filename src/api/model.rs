@@ -24,6 +24,13 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
+    pub(crate) fn with_title(mut self, title: Option<String>) -> Self {
+        if let Some(t) = title {
+            self.title = t;
+        }
+        self
+    }
+
     /// The server titles a session (`session.renamed`) shortly after its
     /// first prompt; until then it has none.
     pub fn display_title(&self) -> String {
@@ -204,6 +211,71 @@ pub struct PromptInput {
     pub files: Vec<(std::path::PathBuf, Mention)>,
     /// Subagent ids to delegate to.
     pub agents: Vec<(String, Mention)>,
+    /// Skill ids to load for this prompt (`/skill` picks).
+    pub skills: Vec<(String, Mention)>,
+    /// How a prompt for a running session is delivered; `None` = server
+    /// default (an idle session starts right away either way).
+    pub delivery: Option<Delivery>,
+}
+
+/// `Session.Inbox` delivery: steer into the running turn at its next step,
+/// or queue until the turn ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Steer,
+    Queue,
+}
+
+impl Delivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Delivery::Steer => "steer",
+            Delivery::Queue => "queue",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "steer" => Some(Delivery::Steer),
+            "queue" => Some(Delivery::Queue),
+            _ => None,
+        }
+    }
+}
+
+/// A pending inbox entry (`GET …/inbox`, `session.inbox.enqueued`): a prompt
+/// or a compaction request that hasn't reached the transcript yet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InboxItem {
+    /// Becomes the user message id on delivery.
+    pub id: String,
+    /// `user`, `compaction`, …
+    pub kind: String,
+    pub text: String,
+    pub delivery: Delivery,
+}
+
+impl InboxItem {
+    /// REST shape `{id, type, payload: {text}, delivery}`; the event's
+    /// `item` lacks `id`, so it's passed separately.
+    pub fn from_json(id: Option<&str>, v: &Value) -> Option<Self> {
+        Some(Self {
+            id: id
+                .map(str::to_string)
+                .or_else(|| v.get("id")?.as_str().map(str::to_string))?,
+            kind: v.get("type")?.as_str()?.to_string(),
+            text: v
+                .pointer("/payload/text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            delivery: v
+                .get("delivery")
+                .and_then(Value::as_str)
+                .and_then(Delivery::parse)
+                .unwrap_or(Delivery::Steer),
+        })
+    }
 }
 
 impl PromptInput {
@@ -229,6 +301,16 @@ impl PromptInput {
                 .map(|(name, m)| serde_json::json!({ "name": name, "mention": m.to_json() }))
                 .collect();
         }
+        if !self.skills.is_empty() {
+            v["skills"] = self
+                .skills
+                .iter()
+                .map(|(id, m)| serde_json::json!({ "id": id, "mention": m.to_json() }))
+                .collect();
+        }
+        if let Some(d) = self.delivery {
+            v["delivery"] = d.as_str().into();
+        }
         v
     }
 }
@@ -250,6 +332,9 @@ pub fn file_uri(path: &std::path::Path) -> String {
 pub enum Message {
     User(UserMessage),
     Assistant(AssistantMessage),
+    /// A non-chat transcript entry shown as a divider: a compaction or an
+    /// activated skill.
+    Marker(MarkerMessage),
 }
 
 impl Message {
@@ -257,8 +342,21 @@ impl Message {
         match self {
             Message::User(m) => &m.id,
             Message::Assistant(m) => &m.id,
+            Message::Marker(m) => &m.id,
         }
     }
+}
+
+/// `{type: "compaction", status, error?}` or `{type: "skill", name}` in the
+/// message projection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkerMessage {
+    pub id: String,
+    /// "compaction" or "skill".
+    pub kind: String,
+    /// "Context compacted", "Compaction failed: …", "Skill: greeter".
+    pub text: String,
+    pub failed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -525,6 +623,37 @@ impl Message {
                     error: error_text(v.get("error")),
                 }))
             }
+            "compaction" => {
+                let status = str_at(v, "/status").unwrap_or_default();
+                let failed = status == "failed";
+                let text = if failed {
+                    format!(
+                        "Compaction failed: {}",
+                        error_text(v.get("error")).unwrap_or_else(|| "unknown error".into())
+                    )
+                } else if status == "completed" {
+                    "Context compacted".to_string()
+                } else {
+                    "Compacting context…".to_string()
+                };
+                Some(Message::Marker(MarkerMessage {
+                    id,
+                    kind: "compaction".into(),
+                    text,
+                    failed,
+                }))
+            }
+            "skill" => Some(Message::Marker(MarkerMessage {
+                id,
+                kind: "skill".into(),
+                text: format!(
+                    "Skill: {}",
+                    str_at(v, "/name")
+                        .or_else(|| str_at(v, "/skill"))
+                        .unwrap_or_default()
+                ),
+                failed: false,
+            })),
             _ => None,
         }
     }
@@ -669,5 +798,242 @@ mod tests {
             panic!("expected assistant")
         };
         assert_eq!(stopped.error.as_deref(), Some("Step interrupted"));
+    }
+}
+
+// ── M7: commands, skills, MCP, shells, VCS ──────────────────────────────
+
+/// `GET /api/command`: a server-side slash command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+}
+
+impl CommandInfo {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            name: v.get("name")?.as_str()?.to_string(),
+            description: v
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        })
+    }
+}
+
+/// `GET /api/skill`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkillInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+impl SkillInfo {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let id = v.get("id")?.as_str()?.to_string();
+        Some(Self {
+            name: v
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_string(),
+            description: v
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            id,
+        })
+    }
+}
+
+/// `GET /api/mcp`: a configured MCP server and its connection state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpServer {
+    pub name: String,
+    /// `connected`, `pending`, `disabled`, `failed`, `needs_auth`.
+    pub status: String,
+    pub error: Option<String>,
+}
+
+impl McpServer {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            name: v.get("name")?.as_str()?.to_string(),
+            status: v
+                .pointer("/status/status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            error: v
+                .pointer("/status/error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    pub fn connected(&self) -> bool {
+        self.status == "connected"
+    }
+}
+
+/// `Shell.Info`: a shell command the server runs (backgrounded tool calls).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShellInfo {
+    pub id: String,
+    /// `running`, `exited`, `timeout`, `killed`.
+    pub status: String,
+    pub command: String,
+    pub session_id: Option<String>,
+    pub exit: Option<i64>,
+    pub started: u64,
+    pub completed: Option<u64>,
+}
+
+impl ShellInfo {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            id: v.get("id")?.as_str()?.to_string(),
+            status: v
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("running")
+                .to_string(),
+            command: v
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            session_id: v
+                .pointer("/metadata/sessionID")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            exit: v.get("exit").and_then(Value::as_f64).map(|e| e as i64),
+            started: v
+                .pointer("/time/started")
+                .and_then(Value::as_f64)
+                .unwrap_or_default() as u64,
+            completed: v
+                .pointer("/time/completed")
+                .and_then(Value::as_f64)
+                .map(|t| t as u64),
+        })
+    }
+
+    pub fn running(&self) -> bool {
+        self.status == "running"
+    }
+}
+
+/// `GET /api/vcs` + the project's worktrees, per folder.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VcsInfo {
+    /// Current branch; `None` when detached, not git, or not resolved yet.
+    pub branch: Option<String>,
+    pub default_branch: Option<String>,
+}
+
+impl VcsInfo {
+    pub fn from_json(v: &Value) -> Self {
+        let s = |p: &str| v.pointer(p).and_then(Value::as_str).map(str::to_string);
+        Self {
+            branch: s("/branch/current"),
+            default_branch: s("/branch/default"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod m7_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn inbox_item_from_rest_and_event() {
+        // Real 2.2.6 shapes (docs/protocol-notes.md, M7).
+        let rest = json!({"id":"msg_1","sessionID":"ses_1","time":{"created":1},"type":"user",
+            "payload":{"text":"queued follow-up"},"delivery":"queue"});
+        let item = InboxItem::from_json(None, &rest).unwrap();
+        assert_eq!(item.id, "msg_1");
+        assert_eq!(item.text, "queued follow-up");
+        assert_eq!(item.delivery, Delivery::Queue);
+        let ev = json!({"type":"compaction","payload":{},"delivery":"steer"});
+        let item = InboxItem::from_json(Some("msg_2"), &ev).unwrap();
+        assert_eq!(
+            (item.kind.as_str(), item.delivery),
+            ("compaction", Delivery::Steer)
+        );
+    }
+
+    #[test]
+    fn prompt_body_carries_delivery_and_skills() {
+        let text = "/greeter hi";
+        let input = PromptInput {
+            text: text.into(),
+            skills: vec![(
+                "greeter".into(),
+                Mention::from_byte_range(text, 0..8).unwrap(),
+            )],
+            delivery: Some(Delivery::Queue),
+            ..Default::default()
+        };
+        let v = input.to_json();
+        assert_eq!(v["delivery"], "queue");
+        assert_eq!(v["skills"][0]["id"], "greeter");
+        assert_eq!(v["skills"][0]["mention"]["end"], 8);
+        assert!(PromptInput::default().to_json().get("delivery").is_none());
+    }
+
+    #[test]
+    fn shells_mcp_vcs() {
+        let sh = ShellInfo::from_json(&json!({"id":"sh_1","status":"running","command":"sleep 20",
+            "cwd":"/p","shell":"/bin/bash","file":"/f","pid":1,"metadata":{"sessionID":"ses_1"},
+            "time":{"started":1794068522236u64}}))
+        .unwrap();
+        assert!(sh.running());
+        assert_eq!(sh.session_id.as_deref(), Some("ses_1"));
+        let mcp =
+            McpServer::from_json(&json!({"name":"x","status":{"status":"failed","error":"boom"}}))
+                .unwrap();
+        assert!(!mcp.connected());
+        assert_eq!(mcp.error.as_deref(), Some("boom"));
+        let vcs = VcsInfo::from_json(
+            &json!({"provider":"git","branch":{"current":"main","default":"main"}}),
+        );
+        assert_eq!(vcs.branch.as_deref(), Some("main"));
+        assert_eq!(
+            VcsInfo::from_json(&json!({"branch":{}})),
+            VcsInfo::default()
+        );
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn compaction_and_skill_entries_become_markers() {
+        // Shapes from the 2.2.6 projection (docs/protocol-notes.md, M7).
+        let failed = Message::from_v2_json(&json!({"type":"compaction","id":"msg_c","status":"failed",
+            "reason":"manual","error":{"type":"compaction.failed","message":"Compaction summary did not match the required template"}}))
+        .unwrap();
+        assert!(
+            matches!(&failed, Message::Marker(m) if m.failed && m.text.contains("did not match"))
+        );
+        let ok =
+            Message::from_v2_json(&json!({"type":"compaction","id":"msg_d","status":"completed"}))
+                .unwrap();
+        assert!(matches!(&ok, Message::Marker(m) if !m.failed && m.text == "Context compacted"));
+        let skill = Message::from_v2_json(
+            &json!({"type":"skill","id":"msg_s","skill":"greeter","name":"greeter","text":"x"}),
+        )
+        .unwrap();
+        assert!(matches!(&skill, Message::Marker(m) if m.text == "Skill: greeter"));
+        assert!(Message::from_v2_json(&json!({"type":"idle","id":"msg_i"})).is_none());
     }
 }

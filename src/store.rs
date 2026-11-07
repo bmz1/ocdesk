@@ -14,8 +14,9 @@ use gpui_kit::{Context, EventEmitter};
 
 use crate::api::events::Outcome;
 use crate::api::model::{
-    AgentInfo, AssistantMessage, Block, BlockKind, FileDiff, FormRequest, Message, ModelInfo,
-    ModelRef, PermissionRequest, SessionInfo, ToolCall, ToolStatus, UserMessage,
+    AgentInfo, AssistantMessage, Block, BlockKind, CommandInfo, FileDiff, FormRequest, InboxItem,
+    McpServer, Message, ModelInfo, ModelRef, PermissionRequest, SessionInfo, ShellInfo, SkillInfo,
+    ToolCall, ToolStatus, UserMessage, VcsInfo,
 };
 use crate::api::{Envelope, Event};
 
@@ -48,8 +49,16 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    /// `Ok(index)` of message `id`, else `Err(len)`: new messages append.
+    ///
+    /// The transcript is in *delivery* order, not id order (a queued prompt
+    /// is created before a later steer but delivered after it), so this is
+    /// a search from the end, where streaming happens, not a binary search.
     pub fn index_of(&self, id: &str) -> Result<usize, usize> {
-        self.messages.binary_search_by(|m| m.id().cmp(id))
+        self.messages
+            .iter()
+            .rposition(|m| m.id() == id)
+            .ok_or(self.messages.len())
     }
 
     /// The assistant message `id`, created on demand (a block can arrive
@@ -68,7 +77,7 @@ impl Conversation {
         };
         match &mut self.messages[index] {
             Message::Assistant(a) => (index, inserted, a),
-            Message::User(_) => unreachable!("message id {id} is a user message"),
+            _ => unreachable!("message id {id} is not an assistant message"),
         }
     }
 }
@@ -98,6 +107,28 @@ pub enum StoreEvent {
     ConnectionChanged,
     /// A folder's models/agents, or the composer's model/agent choice, changed.
     ChoicesChanged,
+    /// A session's pending inbox (queued/steering prompts) changed.
+    InboxChanged {
+        session_id: String,
+    },
+    /// Subagent sessions or background shells changed.
+    TasksChanged,
+    /// Branches, worktrees or `/` menu sources of a folder changed.
+    FolderInfoChanged,
+}
+
+/// Result of [`Store::apply_m7`].
+enum M7 {
+    Handled(Vec<StoreEvent>),
+    Continue(Vec<StoreEvent>),
+}
+
+/// What `/` offers in a folder: server commands, skills and MCP servers.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Tooling {
+    pub commands: Vec<CommandInfo>,
+    pub skills: Vec<SkillInfo>,
+    pub mcp: Vec<McpServer>,
 }
 
 /// What a folder offers: its models, default model and agents.
@@ -142,6 +173,24 @@ pub struct Store {
     pub conversations: HashMap<String, Conversation>,
     /// Why a session's history couldn't be fetched (cleared on success).
     pub load_errors: HashMap<String, String>,
+    /// Pending prompts/compactions per session, oldest first. Kept whether
+    /// or not the conversation is loaded; a user item moves into the
+    /// transcript on `session.inbox.delivered`.
+    pub inbox: HashMap<String, Vec<InboxItem>>,
+    /// Subagent sessions by parent id, oldest first.
+    pub children: HashMap<String, Vec<SessionInfo>>,
+    /// Shell commands the server runs, by shell id.
+    pub shells: HashMap<String, ShellInfo>,
+    /// Per folder (or worktree directory): current branch.
+    pub vcs: HashMap<PathBuf, VcsInfo>,
+    /// Per sidebar folder: its project id and extra worktree checkouts.
+    pub projects: HashMap<PathBuf, String>,
+    pub worktrees: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Per folder: `/` menu sources.
+    pub tooling: HashMap<PathBuf, Tooling>,
+    /// Sessions whose transcript gained entries the stream doesn't describe
+    /// (compactions, skills): re-fetched when their turn ends.
+    pub needs_reload: HashSet<String>,
     pub connection: Option<Connection>,
     pub opencode_version: Option<String>,
     /// A transient, app-level problem shown as a dismissible banner.
@@ -323,7 +372,14 @@ impl Store {
 
     /// The catalog of the folder the composer targets.
     pub fn target_catalog(&self) -> Option<&Catalog> {
-        self.catalogs.get(&self.target_folder()?)
+        self.catalogs.get(&self.catalog_folder()?)
+    }
+
+    /// The sidebar folder whose catalog and `/` menu apply to the target
+    /// folder (a worktree uses its repository's).
+    pub fn catalog_folder(&self) -> Option<PathBuf> {
+        let dir = self.target_folder()?;
+        Some(self.folder_of(&dir).unwrap_or(dir))
     }
 
     /// The model the next prompt runs with: the selected session's, else the
@@ -402,6 +458,221 @@ impl Store {
             None => 0,
         };
         Some(order[next as usize].to_string())
+    }
+
+    // ── M7: inbox, background tasks, folder info ─────────────────────────
+
+    /// The M7 events. A delivered user item is rewritten into a
+    /// `UserPrompt` and continues to the transcript code.
+    fn apply_m7(&mut self, env: &mut Envelope) -> M7 {
+        let inbox_changed = |sid: &str| {
+            M7::Handled(vec![StoreEvent::InboxChanged {
+                session_id: sid.to_string(),
+            }])
+        };
+        match &env.event {
+            Event::InboxEnqueued { session_id, item } => {
+                let items = self.inbox.entry(session_id.clone()).or_default();
+                if !items.iter().any(|i| i.id == item.id) {
+                    items.push(item.clone());
+                }
+                inbox_changed(session_id)
+            }
+            Event::InboxCancelled {
+                session_id,
+                inbox_id,
+            } => {
+                self.remove_inbox_item(session_id, inbox_id);
+                inbox_changed(session_id)
+            }
+            Event::InboxDeliveryChanged {
+                session_id,
+                inbox_id,
+                delivery,
+            } => {
+                if let Some(item) = self
+                    .inbox
+                    .get_mut(session_id)
+                    .and_then(|v| v.iter_mut().find(|i| &i.id == inbox_id))
+                {
+                    item.delivery = *delivery;
+                }
+                inbox_changed(session_id)
+            }
+            Event::InboxDelivered {
+                session_id,
+                inbox_id,
+            } => {
+                let (sid, id) = (session_id.clone(), inbox_id.clone());
+                let item = self.remove_inbox_item(&sid, &id);
+                let out = vec![StoreEvent::InboxChanged {
+                    session_id: sid.clone(),
+                }];
+                match item {
+                    Some(item) if item.kind == "user" => {
+                        env.event = Event::UserPrompt {
+                            session_id: sid,
+                            message_id: id,
+                            text: item.text,
+                        };
+                        M7::Continue(out)
+                    }
+                    // A compaction (or an enqueue we missed): the REST
+                    // projection fills the transcript when the turn ends.
+                    _ => {
+                        self.needs_reload.insert(sid);
+                        M7::Handled(out)
+                    }
+                }
+            }
+            Event::SkillActivated { session_id } => {
+                self.needs_reload.insert(session_id.clone());
+                M7::Handled(vec![])
+            }
+            Event::ShellCreated(info) => {
+                self.shells.insert(info.id.clone(), info.clone());
+                M7::Handled(vec![StoreEvent::TasksChanged])
+            }
+            Event::ShellExited { id, status, exit } => {
+                if let Some(sh) = self.shells.get_mut(id) {
+                    sh.status = status.clone();
+                    sh.exit = *exit;
+                }
+                M7::Handled(vec![StoreEvent::TasksChanged])
+            }
+            Event::ShellDeleted { id } => {
+                // Keep finished shells visible (with their status) until the
+                // next snapshot; drop only ones still marked running.
+                if self.shells.get(id).is_some_and(ShellInfo::running) {
+                    self.shells.remove(id);
+                }
+                M7::Handled(vec![StoreEvent::TasksChanged])
+            }
+            Event::BranchChanged { branch } => {
+                let Some(dir) = env.directory.clone() else {
+                    return M7::Handled(vec![]);
+                };
+                self.vcs.entry(dir).or_default().branch = branch.clone();
+                M7::Handled(vec![StoreEvent::FolderInfoChanged])
+            }
+            _ => M7::Continue(vec![]),
+        }
+    }
+
+    fn remove_inbox_item(&mut self, session_id: &str, item_id: &str) -> Option<InboxItem> {
+        let items = self.inbox.get_mut(session_id)?;
+        let pos = items.iter().position(|i| i.id == item_id)?;
+        let item = items.remove(pos);
+        if items.is_empty() {
+            self.inbox.remove(session_id);
+        }
+        Some(item)
+    }
+
+    /// Pending items the user can still act on (prompts, not compactions).
+    pub fn pending_prompts(&self, session_id: &str) -> &[InboxItem] {
+        self.inbox.get(session_id).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn set_inbox(&mut self, session_id: &str, items: Vec<InboxItem>, cx: &mut Context<Self>) {
+        if items.is_empty() {
+            self.inbox.remove(session_id);
+        } else {
+            self.inbox.insert(session_id.to_string(), items);
+        }
+        cx.emit(StoreEvent::InboxChanged {
+            session_id: session_id.to_string(),
+        });
+        cx.notify();
+    }
+
+    pub fn set_children(
+        &mut self,
+        parent: &str,
+        mut kids: Vec<SessionInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        kids.sort_by_key(|k| k.created);
+        self.children.insert(parent.to_string(), kids);
+        cx.emit(StoreEvent::TasksChanged);
+        cx.notify();
+    }
+
+    /// Replace the shells of one folder with a snapshot.
+    pub fn set_shells(&mut self, shells: Vec<ShellInfo>, cx: &mut Context<Self>) {
+        for sh in shells {
+            self.shells.insert(sh.id.clone(), sh);
+        }
+        cx.emit(StoreEvent::TasksChanged);
+        cx.notify();
+    }
+
+    /// Subagent sessions of a session, oldest first.
+    pub fn children_of(&self, session_id: &str) -> &[SessionInfo] {
+        self.children.get(session_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Shells started by a session, newest first.
+    pub fn shells_of(&self, session_id: &str) -> Vec<&ShellInfo> {
+        let mut v: Vec<&ShellInfo> = self
+            .shells
+            .values()
+            .filter(|s| s.session_id.as_deref() == Some(session_id))
+            .collect();
+        v.sort_by_key(|s| std::cmp::Reverse(s.started));
+        v
+    }
+
+    /// Running subagents + shells of a session (the header badge).
+    pub fn running_tasks(&self, session_id: &str) -> usize {
+        self.children_of(session_id)
+            .iter()
+            .filter(|k| self.is_busy(&k.id))
+            .count()
+            + self
+                .shells_of(session_id)
+                .iter()
+                .filter(|s| s.running())
+                .count()
+    }
+
+    pub fn set_vcs(&mut self, dir: PathBuf, info: VcsInfo, cx: &mut Context<Self>) {
+        self.vcs.insert(dir, info);
+        cx.emit(StoreEvent::FolderInfoChanged);
+        cx.notify();
+    }
+
+    pub fn set_worktrees(
+        &mut self,
+        folder: PathBuf,
+        project_id: String,
+        worktrees: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.projects.insert(folder.clone(), project_id);
+        // The main checkout is the folder itself.
+        let extra: Vec<PathBuf> = worktrees.into_iter().filter(|w| *w != folder).collect();
+        self.worktrees.insert(folder, extra);
+        cx.emit(StoreEvent::FolderInfoChanged);
+        cx.notify();
+    }
+
+    pub fn set_tooling(&mut self, folder: PathBuf, tooling: Tooling, cx: &mut Context<Self>) {
+        self.tooling.insert(folder, tooling);
+        cx.emit(StoreEvent::FolderInfoChanged);
+        cx.notify();
+    }
+
+    /// The sidebar folder a directory belongs to: itself, or the folder
+    /// whose worktree it is.
+    pub fn folder_of(&self, dir: &Path) -> Option<PathBuf> {
+        if self.folders.iter().any(|f| f == dir) {
+            return Some(dir.to_path_buf());
+        }
+        self.worktrees
+            .iter()
+            .find(|(_, wts)| wts.iter().any(|w| w == dir))
+            .map(|(f, _)| f.clone())
     }
 
     /// The selected session's history hasn't arrived yet and there's nothing
@@ -562,13 +833,30 @@ impl Store {
         }
     }
 
-    pub(crate) fn apply_inner(&mut self, env: Envelope) -> Vec<StoreEvent> {
-        let mut out = Vec::new();
+    pub(crate) fn apply_inner(&mut self, mut env: Envelope) -> Vec<StoreEvent> {
+        // Inbox, background tasks and folder info are session-/folder-level.
+        let mut out = match self.apply_m7(&mut env) {
+            M7::Handled(events) => return events,
+            M7::Continue(events) => events,
+        };
         // Session-level state first (applies whether or not the conversation
         // is loaded).
         match &env.event {
             Event::SessionUpserted(s) => {
-                if s.parent_id.is_none() {
+                if let Some(parent) = &s.parent_id {
+                    let kids = self.children.entry(parent.clone()).or_default();
+                    match kids.iter_mut().find(|k| k.id == s.id) {
+                        Some(k) => {
+                            let title = std::mem::take(&mut k.title);
+                            *k = s.clone();
+                            if k.title.is_empty() {
+                                k.title = title;
+                            }
+                        }
+                        None => kids.push(s.clone()),
+                    }
+                    out.push(StoreEvent::TasksChanged);
+                } else {
                     let old = self.session(&s.id).cloned();
                     self.sessions.retain(|x| x.id != s.id);
                     let mut s = s.clone();
@@ -595,6 +883,12 @@ impl Store {
                     s.title = title.clone();
                     out.push(StoreEvent::SessionsChanged);
                 }
+                for kid in self.children.values_mut().flatten() {
+                    if &kid.id == session_id {
+                        kid.title = title.clone();
+                        out.push(StoreEvent::TasksChanged);
+                    }
+                }
                 return out;
             }
             Event::SessionRemoved { session_id } => {
@@ -613,6 +907,8 @@ impl Store {
                 self.diffs.remove(session_id);
                 self.diff_loading.remove(session_id);
                 self.diff_errors.remove(session_id);
+                self.inbox.remove(session_id);
+                self.children.remove(session_id);
                 out.push(StoreEvent::SessionsChanged);
                 if self.selected.as_ref() == Some(session_id) {
                     self.selected = None;
@@ -882,23 +1178,31 @@ impl Store {
             .conversations
             .entry(session_id.to_string())
             .or_default();
-        let mut old: HashMap<String, Message> = std::mem::take(&mut conv.messages)
-            .into_iter()
-            .map(|m| (m.id().to_string(), m))
-            .collect();
+        // The snapshot's order is authoritative (delivery order).
+        let old = std::mem::take(&mut conv.messages);
+        let in_snapshot: HashSet<String> = history.iter().map(|m| m.id().to_string()).collect();
+        let mut local: HashMap<String, Message> = HashMap::new();
+        let mut newer: Vec<Message> = Vec::new();
+        for m in old {
+            if in_snapshot.contains(m.id()) {
+                local.insert(m.id().to_string(), m);
+            } else {
+                newer.push(m);
+            }
+        }
         let mut merged: Vec<Message> = history
             .into_iter()
             .map(|mut snap| {
-                let local = old.remove(snap.id());
-                if let (Message::Assistant(s), Some(Message::Assistant(l))) = (&mut snap, local) {
+                let prev = local.remove(snap.id());
+                if let (Message::Assistant(s), Some(Message::Assistant(l))) = (&mut snap, prev) {
                     merge_blocks(&mut s.blocks, l.blocks);
                 }
                 snap
             })
             .collect();
-        // Messages created after the snapshot was taken survive.
-        merged.extend(old.into_values());
-        merged.sort_by(|a, b| a.id().cmp(b.id()));
+        // Messages streamed after the snapshot was taken survive, after it,
+        // in the order they arrived.
+        merged.extend(newer);
         conv.messages = merged;
         conv.loaded = true;
         vec![StoreEvent::MessagesReset {
@@ -1011,6 +1315,7 @@ fn same_block(a: &Block, b: &Block) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::model::Delivery;
 
     fn fixture() -> Vec<Envelope> {
         include_str!("../tests/fixtures/v2-events.jsonl")
@@ -1040,6 +1345,107 @@ mod tests {
             model: None,
             agent: None,
         }
+    }
+
+    fn wire(json: &str) -> Envelope {
+        Envelope::from_json(json).unwrap()
+    }
+
+    #[test]
+    fn queued_prompt_reaches_transcript_only_on_delivery() {
+        let mut s = Store::default();
+        s.reconcile_inner("ses_a", vec![]);
+        let enq = |id: &str, text: &str, d: &str| {
+            wire(&format!(
+                r#"{{"type":"session.inbox.enqueued","data":{{"inboxID":"{id}","sessionID":"ses_a","item":{{"type":"user","payload":{{"text":"{text}"}},"delivery":"{d}"}}}}}}"#
+            ))
+        };
+        s.apply_inner(enq("msg_q", "later", "queue"));
+        s.apply_inner(enq("msg_x", "drop me", "queue"));
+        assert_eq!(s.pending_prompts("ses_a").len(), 2);
+        assert!(
+            s.conversations["ses_a"].messages.is_empty(),
+            "pending isn't transcript"
+        );
+        // Promote, cancel, deliver.
+        s.apply_inner(wire(r#"{"type":"session.inbox.delivery.changed","data":{"sessionID":"ses_a","inboxID":"msg_q","delivery":"steer"}}"#));
+        assert_eq!(s.pending_prompts("ses_a")[0].delivery, Delivery::Steer);
+        s.apply_inner(wire(
+            r#"{"type":"session.inbox.cancelled","data":{"sessionID":"ses_a","inboxID":"msg_x"}}"#,
+        ));
+        let events = s.apply_inner(wire(
+            r#"{"type":"session.inbox.delivered","data":{"sessionID":"ses_a","inboxID":"msg_q"}}"#,
+        ));
+        assert!(s.pending_prompts("ses_a").is_empty());
+        assert!(events.contains(&StoreEvent::InboxChanged {
+            session_id: "ses_a".into()
+        }));
+        assert!(matches!(&s.conversations["ses_a"].messages[..],
+            [Message::User(u)] if u.id == "msg_q" && u.text == "later"));
+        // A delivery we never saw enqueued is left to the next reconcile.
+        s.apply_inner(wire(r#"{"type":"session.inbox.delivered","data":{"sessionID":"ses_a","inboxID":"msg_unknown"}}"#));
+        assert_eq!(s.conversations["ses_a"].messages.len(), 1);
+    }
+
+    #[test]
+    fn transcript_keeps_delivery_order_not_id_order() {
+        // Observed on 2.2.6: a queued prompt (smaller id) sent before a steer
+        // is delivered after it; the REST projection uses delivery order.
+        let mut s = Store::default();
+        s.reconcile_inner("ses_a", vec![]);
+        for (id, d) in [("msg_1_queue", "queue"), ("msg_2_steer", "steer")] {
+            s.apply_inner(wire(&format!(
+                r#"{{"type":"session.inbox.enqueued","data":{{"inboxID":"{id}","sessionID":"ses_a","item":{{"type":"user","payload":{{"text":"{id}"}},"delivery":"{d}"}}}}}}"#
+            )));
+        }
+        for id in ["msg_2_steer", "msg_1_queue"] {
+            s.apply_inner(wire(&format!(
+                r#"{{"type":"session.inbox.delivered","data":{{"sessionID":"ses_a","inboxID":"{id}"}}}}"#
+            )));
+        }
+        let ids = |s: &Store| -> Vec<String> {
+            s.conversations["ses_a"]
+                .messages
+                .iter()
+                .map(|m| m.id().to_string())
+                .collect()
+        };
+        assert_eq!(ids(&s), ["msg_2_steer", "msg_1_queue"]);
+        // A snapshot in the same order changes nothing; a message streamed
+        // after the snapshot stays after it.
+        let user = |id: &str| {
+            Message::User(UserMessage {
+                id: id.into(),
+                text: id.into(),
+            })
+        };
+        s.apply_inner(wire(r#"{"type":"session.step.started","data":{"sessionID":"ses_a","assistantMessageID":"msg_0_reply"}}"#));
+        s.reconcile_inner("ses_a", vec![user("msg_2_steer"), user("msg_1_queue")]);
+        assert_eq!(ids(&s), ["msg_2_steer", "msg_1_queue", "msg_0_reply"]);
+    }
+
+    #[test]
+    fn subagents_and_shells_are_tracked_per_parent() {
+        let mut s = Store::default();
+        s.apply_inner(wire(r#"{"type":"session.created","created":5,"data":{"sessionID":"ses_c","parentID":"ses_p","title":"Look around","agent":"general","location":{"directory":"/p"}}}"#));
+        assert!(s.sessions.is_empty(), "children stay out of the sidebar");
+        assert_eq!(s.children_of("ses_p")[0].title, "Look around");
+        s.apply_inner(wire(
+            r#"{"type":"session.execution.started","data":{"sessionID":"ses_c"}}"#,
+        ));
+        s.apply_inner(wire(r#"{"type":"shell.created","data":{"info":{"id":"sh_1","status":"running","command":"sleep 20","metadata":{"sessionID":"ses_p"},"time":{"started":1}}}}"#));
+        assert_eq!(s.running_tasks("ses_p"), 2);
+        s.apply_inner(wire(
+            r#"{"type":"shell.exited","data":{"id":"sh_1","status":"killed"}}"#,
+        ));
+        s.apply_inner(wire(
+            r#"{"type":"session.execution.succeeded","data":{"sessionID":"ses_c"}}"#,
+        ));
+        assert_eq!(s.running_tasks("ses_p"), 0);
+        assert_eq!(s.shells_of("ses_p")[0].status, "killed");
+        // Branch updates are keyed by the event's location.
+        s.apply_inner(wire(r#"{"type":"vcs.branch.updated","location":{"directory":"/p"},"data":{"branch":"feat"}}"#));
+        assert_eq!(s.vcs[Path::new("/p")].branch.as_deref(), Some("feat"));
     }
 
     #[test]
@@ -1105,6 +1511,7 @@ mod tests {
                 })
                 .chain(a.error.clone())
                 .collect(),
+            Message::Marker(m) => vec![m.text.clone()],
         }
     }
 

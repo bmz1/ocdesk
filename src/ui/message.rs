@@ -21,6 +21,7 @@ pub fn render_message(
     cache: &Entity<ProseCache>,
     expanded: &HashSet<String>,
     toggle: ToggleTool,
+    open_task: &super::tasks::OpenTask,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -49,6 +50,30 @@ pub fn render_message(
                 .into_any_element();
         }
         Message::Assistant(a) => a,
+        Message::Marker(m) => {
+            // A quiet divider: ─── Context compacted ───
+            let color = if m.failed {
+                theme.danger
+            } else {
+                theme.muted_foreground
+            };
+            let rule = || div().flex_1().h(px(1.)).bg(theme.border);
+            return h_flex()
+                .w_full()
+                .gap_3()
+                .items_center()
+                .text_xs()
+                .text_color(color)
+                .child(rule())
+                .child(
+                    div()
+                        .max_w(relative(0.8))
+                        .text_center()
+                        .child(m.text.clone()),
+                )
+                .child(rule())
+                .into_any_element();
+        }
     };
 
     let mut col = v_flex().w_full().gap_3();
@@ -76,6 +101,7 @@ pub fn render_message(
                 &a.id,
                 expanded,
                 toggle.clone(),
+                open_task,
                 cx,
             )),
         };

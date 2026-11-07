@@ -56,6 +56,7 @@ pub fn prose_blocks(msg: &Message) -> impl Iterator<Item = (BlockKey, &str)> {
     let (user, blocks) = match msg {
         Message::User(u) => (Some(u.text.as_str()), &[][..]),
         Message::Assistant(a) => (None, &a.blocks[..]),
+        Message::Marker(_) => (None, &[][..]),
     };
     let user_key = id.clone();
     user.map(move |t| {

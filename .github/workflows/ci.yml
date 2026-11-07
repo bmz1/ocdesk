@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.99.1"
+  OPENCODE_VERSION: "2.2.6"
+
+jobs:
+  linux:
+    name: Linux (fmt, clippy, test, e2e)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
+            libx11-xcb-dev libxcb-xkb-dev libfontconfig-dev libssl-dev \
+            libasound2-dev libzstd-dev \
+            xvfb mesa-vulkan-drivers shellcheck
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --locked
+
+      - name: Shell scripts
+        run: shellcheck packaging/linux/*.sh packaging/macos/*.sh dev/*.sh
+
+      - name: Build
+        run: cargo build --locked
+
+      # End-to-end against real opencode with the deterministic mock model.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install opencode ${{ env.OPENCODE_VERSION }}
+        run: npm i -g @opencode/cli@${{ env.OPENCODE_VERSION }}
+
+      - name: Protocol smoke test (permissions, diffs)
+        run: python3 dev/m3-protocol-test.py "$(command -v opencode2)"
+
+      - name: Sidecar teardown test
+        run: |
+          Xvfb :99 -screen 0 1400x900x24 &
+          python3 dev/mock_llm.py &
+          sleep 1
+          DISPLAY=:99 dev/teardown-test.sh
+
+  macos:
+    name: macOS (clippy, test, build)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --locked

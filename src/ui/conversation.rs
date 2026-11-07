@@ -1,11 +1,14 @@
 //! The main column: header, virtualized message list, status line, composer.
 //! With no session selected it shows a centered Codex-style start screen.
 
+use std::path::PathBuf;
+
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -17,6 +20,9 @@ use crate::ui::folder_name;
 use crate::ui::message::{COLUMN_MAX_W, render_message};
 use crate::ui::prose::{self, ProseCache};
 
+/// Below this window width the tasks drawer overlays the conversation.
+const SPLIT_MIN_WINDOW_W: f32 = 1440.;
+
 pub struct ConversationView {
     expanded_tools: std::collections::HashSet<String>,
     show_changes: bool,
@@ -25,6 +31,8 @@ pub struct ConversationView {
     store: Entity<Store>,
     controller: Entity<Controller>,
     composer: Entity<Composer>,
+    tasks: Entity<super::tasks::TasksDrawer>,
+    tasks_open: bool,
     scroller: Entity<MessageScrollerState>,
     prose: Entity<ProseCache>,
     _subs: Vec<Subscription>,
@@ -50,7 +58,11 @@ impl ConversationView {
             cx.observe(&store, |_, _, cx| cx.notify()),
         ];
         Composer::focus(&composer, window, cx);
+        let tasks =
+            cx.new(|cx| super::tasks::TasksDrawer::new(store.clone(), controller.clone(), cx));
         Self {
+            tasks,
+            tasks_open: false,
             expanded_tools: Default::default(),
             show_changes: false,
             form_inputs: Default::default(),
@@ -133,6 +145,24 @@ impl ConversationView {
         Composer::focus(&self.composer, window, cx);
     }
 
+    pub fn toggle_tasks(&mut self, cx: &mut Context<Self>) {
+        if self.store.read(cx).selected.is_none() {
+            return;
+        }
+        self.tasks_open = !self.tasks_open;
+        if self.tasks_open {
+            self.tasks
+                .update(cx, |t, cx| t.show(super::tasks::TaskView::List, cx));
+        }
+        cx.notify();
+    }
+
+    pub fn open_task(&mut self, view: super::tasks::TaskView, cx: &mut Context<Self>) {
+        self.tasks_open = true;
+        self.tasks.update(cx, |t, cx| t.show(view, cx));
+        cx.notify();
+    }
+
     /// Switch between the conversation and the latest turn's changes.
     pub fn toggle_changes(&mut self, cx: &mut Context<Self>) {
         let Some(sid) = self.store.read(cx).selected.clone() else {
@@ -201,6 +231,20 @@ impl ConversationView {
         let store = self.store.read(cx);
         let folders = store.folders.clone();
         let current = store.target_folder();
+        // Each folder followed by its worktrees ("  ⎇ feature-x · branch").
+        let choices: Vec<(PathBuf, String)> = folders
+            .iter()
+            .flat_map(|f| {
+                std::iter::once((f.clone(), folder_name(f))).chain(
+                    store.worktrees.get(f).into_iter().flatten().map(|w| {
+                        (
+                            w.clone(),
+                            format!("   ⎇ {}", super::git::checkout_label(store, w)),
+                        )
+                    }),
+                )
+            })
+            .collect();
         let controller = self.controller.clone();
 
         let chooser = if folders.is_empty() {
@@ -220,10 +264,10 @@ impl ConversationView {
                 .small()
                 .dropdown_caret(true)
                 .dropdown_menu(move |mut menu, _, _| {
-                    for f in &folders {
+                    for (f, label) in &choices {
                         let (c, f2) = (controller.clone(), f.clone());
                         menu = menu.item(
-                            PopupMenuItem::new(folder_name(f))
+                            PopupMenuItem::new(label.clone())
                                 .checked(current.as_ref() == Some(f))
                                 .on_click(move |_, _, cx| {
                                     let f = f2.clone();
@@ -417,6 +461,11 @@ impl Render for ConversationView {
         let title = session.map(|s| s.display_title());
         let folder = session.map(|s| folder_name(&s.directory));
         let has_selection = store.selected.is_some();
+        let branch_pill = super::git::branch_pill(&self.store, &self.controller, cx);
+        let store_running = store
+            .selected
+            .as_ref()
+            .map_or(0, |id| store.running_tasks(id));
         let form_inputs = self.sync_form_inputs(window, cx);
 
         let notice_bar = notice.map(|n| {
@@ -469,13 +518,17 @@ impl Render for ConversationView {
                 });
             });
             let cache = self.prose.clone();
+            let view = cx.entity().downgrade();
+            let open_task: super::tasks::OpenTask = std::rc::Rc::new(move |task, cx| {
+                let _ = view.update(cx, |this, cx| this.open_task(task, cx));
+            });
             let list = MessageScroller::new("messages", self.scroller.clone(), move |ix, _, cx| {
                 prose::sync_row(&store, &cache, ix, cx);
                 let s = store.read(cx);
                 let row = s
                     .selected_conversation()
                     .and_then(|c| c.messages.get(ix))
-                    .map(|m| render_message(m, &cache, &expanded, toggle.clone(), cx))
+                    .map(|m| render_message(m, &cache, &expanded, toggle.clone(), &open_task, cx))
                     .unwrap_or_else(|| div().into_any_element());
                 h_flex()
                     .w_full()
@@ -567,15 +620,30 @@ impl Render for ConversationView {
                         el.child(div().text_color(theme.muted_foreground).child(f))
                             .child(div().text_color(theme.muted_foreground).child("/"))
                     })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(title.unwrap_or_default()),
-                    )
+                    .child(div().min_w_0().truncate().child(title.unwrap_or_default()))
+                    .children(branch_pill)
+                    .child(div().flex_1())
                     .when(has_selection, |el| {
+                        let running = store_running;
                         el.child(
+                            Button::new("toggle-tasks")
+                                .icon(super::icons::workflow())
+                                .label(if running > 0 {
+                                    format!("Tasks · {running}")
+                                } else {
+                                    "Tasks".to_string()
+                                })
+                                .ghost()
+                                .small()
+                                .selected(self.tasks_open)
+                                .tooltip_with_action(
+                                    "Background tasks: subagents and shells",
+                                    &super::keys::ToggleTasks,
+                                    None,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_tasks(cx))),
+                        )
+                        .child(
                             Button::new("toggle-changes")
                                 .label(if self.show_changes {
                                     "Conversation"
@@ -589,6 +657,28 @@ impl Render for ConversationView {
                     }),
             )
             .children(notice_bar)
-            .child(div().flex_1().min_h_0().child(body))
+            .child({
+                // Side by side when there's room for the column and the
+                // drawer; otherwise the drawer floats over the conversation.
+                let show_tasks = self.tasks_open && has_selection;
+                let split = window.viewport_size().width >= px(SPLIT_MIN_WINDOW_W);
+                h_flex()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().flex_1().min_w_0().h_full().child(body))
+                    .when(show_tasks && split, |el| el.child(self.tasks.clone()))
+                    .when(show_tasks && !split, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .right_0()
+                                .shadow_lg()
+                                .child(self.tasks.clone()),
+                        )
+                    })
+            })
     }
 }

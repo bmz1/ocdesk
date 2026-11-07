@@ -3,7 +3,7 @@
 State of ocdesk for whoever picks it up next. Read this first, then
 [README.md](README.md) and [docs/protocol-notes.md](docs/protocol-notes.md).
 
-_Last updated: 2026-11-07, M5 pushed on `claude/loving-dirac-otenca`._
+_Last updated: 2026-11-07, M6 + M7 pushed on `claude/loving-dirac-otenca`._
 
 ## Where things are
 
@@ -15,18 +15,22 @@ _Last updated: 2026-11-07, M5 pushed on `claude/loving-dirac-otenca`._
   diffs) and M4 (question forms, Codex-style tool cards, model/agent/variant
   pickers, `@` mentions of files and subagents, prompt history) and M5
   (keyboard shortcuts, persisted window/sidebar/last session/draft model,
-  error states), targeting
+  error states), M6 (CI, macOS `.app`/dmg, Linux AppImage/tarball,
+  login-shell PATH) and M7 (queue/steer, `/` menu, background tasks
+  drawer, git branch + worktrees), targeting
   **opencode 2.2.6 only**. Dark theme by default.
 - **Workflow the owner wants:** branch from `master` → feature PR → owner
   reviews → merge to `master`. Don't push to `master` directly; the owner
   opens/asks for PRs. M1–M3 are merged (PRs #1–#3).
-- M4 is merged (PR #4). **M5** is pushed on `claude/loving-dirac-otenca`
-  (branched from `master` @ `9f8e626`). **No PR opened yet**; the owner
-  asks for it.
+- M1–M5 are merged (PRs #1–#5). **M6 + M7** are pushed on
+  `claude/loving-dirac-otenca` (branched from `master` @ `41d9595`).
+  **No PR opened yet**; the owner asks for it.
 - The old `claude/friendly-lamport-ne3gxc` remote branch could not be deleted
   from the agent sandbox (git proxy 403); the owner was asked to delete it.
-- **Next:** owner review of M5, then **M6** (packaging: .app, AppImage; CI).
-  Running on macOS is still the biggest gap.
+- **Next:** owner review of M6/M7; watch the first CI run (macOS job and
+  the Package workflow have never run). The owner will pick from the
+  design review (`docs/design-review.md`, status column = what's done)
+  later; don't apply it unasked. Running on a Mac is still the biggest gap.
 
 ## Decisions already made (don't re-litigate)
 
@@ -118,6 +122,7 @@ real opencode 2.2.6 + deterministic mock model):
 
 ```
 src/main.rs            logging, tokio runtime, signal handling, window
+src/shell_env.rs       login-shell PATH when launched outside a terminal
 src/sidecar.rs         spawn/health/kill opencode; version gate (>= 2.x)
 src/settings.rs        folders, collapsed, theme → settings.json
 src/api/mod.rs         HTTP client + SSE reader (heartbeat timeout, backoff)
@@ -130,6 +135,13 @@ src/ui/*               app_view (layout, window/sidebar persistence), keys (shor
 src/ui/prose.rs        ProseCache: one TextViewState per prose block, LRU-capped
 src/ui/frame_stats.rs  OCDESK_FRAME_LOG frame-time + peak-RSS probe
 src/ui/tool_card.rs    expandable input/output, errors and optional edit diffs
+src/ui/keys.rs         app-wide shortcuts + shortcuts sheet
+src/ui/tasks.rs        background tasks drawer (subagents, shells)
+src/ui/git.rs          branch pill, worktree dialogs
+src/ui/icons.rs        extra Lucide icons + AppAssets
+packaging/             icon, macOS bundle.sh + Info.plist, Linux package.sh
+.github/workflows/     ci.yml (checks + e2e), package.yml (installers)
+dev/harness.py         real opencode serve + mock model, for protocol probes
 src/ui/permission.rs   pending permission queue and explicit reply controls
 src/ui/changes.rs      read-only latest-turn file diffs
 src/demo.rs            OCDESK_DEMO offline mode (synthetic history + streaming)
@@ -245,5 +257,61 @@ Data flow: view → `Controller` intent → `Api` on Tokio → result back via
 - Ideas left: an "interrupted" marker for turns cut off by a sidecar crash;
   a command palette; per-session composer drafts.
 
-**M6:** see README roadmap.
+**M6 notes**
+- **Toolchain is 1.99.1** (`rust-toolchain.toml`; CI pins the same).
+  gpui-pre-macos 0.3.11 calls `Option::map_or_default`, unstable on 1.97,
+  so the old pin could never build on a Mac. `cargo check`/`clippy` pass
+  for `aarch64-apple-darwin` (type-check only: the gpui Metal build script
+  needs Xcode; I touched an empty `stitched_shaders.metal` in `target/`).
+  Nothing has been linked or run on macOS.
+- `src/shell_env.rs`: when stdin isn't a terminal (Finder/Dock/desktop
+  launch), run `$SHELL -l -i -c` once at the top of `main` (5 s timeout,
+  markers, fish handled) and prepend its PATH. `OCDESK_NO_SHELL_ENV=1`
+  opts out. Verified detached with `PATH=/usr/bin:/bin`.
+- App id `io.github.bmz1.ocdesk` (window `app_id`, `.desktop`, bundle id).
+  Icon `packaging/icon.png` is generated; scripts derive all sizes.
+- `packaging/linux/package.sh`: stripped tarball (+ install.sh, desktop
+  entry, hicolor icons; tested here) and AppImage via linuxdeploy (running
+  the downloaded tool was blocked in the sandbox; first run will be CI;
+  `SKIP_APPIMAGE=1` skips it). `packaging/macos/bundle.sh`: universal
+  `.app`, icns, ad-hoc or Developer ID signing, optional notarization, zip
+  + dmg. **Never run.**
+- CI: `ci.yml` (Linux fmt/clippy/test/shellcheck/build + opencode 2.2.6
+  e2e: `m3-protocol-test.py`, `teardown-test.sh`; macOS clippy/test/build)
+  only on `master` pushes and PRs. `package.yml` on `v*` tags (draft
+  release, SHA256SUMS) or manual; signing secrets optional (README).
+
+**M7 notes** (all probed live first; shapes in docs/protocol-notes.md, *M7*)
+- `dev/harness.py` boots a real `opencode serve` + mock model in a temp
+  repo. Mock keywords added: `tool:task` (subagent tool), `tool:sleep`
+  (long shell), `slow` (10 s stream).
+- **Queue/steer**: `delivery` on prompt; per-session inbox in the store
+  (`session.inbox.*`, `GET …/inbox`); a user prompt enters the transcript
+  on *delivered*, not enqueued. Enter steers while busy, Ctrl/Cmd+Enter
+  queues; pending stack above the composer (Steer now / edit / remove).
+  **Transcript order is delivery order, not id order**: store lookups
+  search from the end, `Api::messages` and reconcile keep server order
+  (the old id sort hid this from `OCDESK_VERIFY_ON_IDLE`).
+- Composer: per-session drafts, Esc twice to stop, busy placeholder.
+- **`/` menu** (first word only): `/compact`, server commands
+  (`POST …/command {name, text}`), skills (token → `skills` attachment),
+  MCP servers (toggle; untested, no server configured). Compaction/skill
+  entries are `Message::Marker` dividers; no stream event describes them,
+  so those sessions are re-fetched at turn end (`Store::needs_reload`).
+- **Background tasks drawer** (`ui/tasks.rs`, Mod+Shift+T): child sessions
+  (`parentID`) and shells (`shell.*`, output polled 1 s, Stop = DELETE).
+  Subagent calls / backgrounded shells are one row in the transcript.
+  Overlays below a 1440 px window. Subagent result shown as plain text.
+- **Git** (`ui/git.rs`): branch pill (start session in / move session /
+  New worktree…), worktrees as sidebar sub-groups, remove asks on
+  `forceRequired` (`api::WorktreeDirty`). opencode creates worktrees
+  **detached** and only checks out existing branches, so the pill says
+  "detached". Worktrees reuse their repo folder's catalog/`/` menu.
+- Gotcha: `use super::*` in a test module of a file with
+  `use gpui_kit::*` imports gpui's `test` attribute; import explicitly.
+- Verified (Linux/Xvfb, real 2.2.6 + mock): fmt, clippy `-D warnings`,
+  `cargo test` **51 passed**; by hand: queue+steer order, Steer now,
+  remove, double Esc, `/review`, `/compact` (failure marker), skill token,
+  subagent row + drawer, shell drawer + Stop, worktree create / session /
+  move / remove with force; `verify: store matches REST` after each.
 
