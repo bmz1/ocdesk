@@ -1,12 +1,11 @@
 //! Renders one message: markdown prose (see `prose.rs`), collapsible
 //! reasoning, and expandable tool cards.
 
-use super::tool_card::ToggleTool;
+use super::tool_card::ToolCtx;
 use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
-use std::collections::HashSet;
 
 use crate::api::model::{Block, BlockKind, Message};
 use crate::ui::prose::{BlockKey, ProseCache, prose_blocks};
@@ -19,9 +18,7 @@ pub const COLUMN_MAX_W: f32 = 760.;
 pub fn render_message(
     msg: &Message,
     cache: &Entity<ProseCache>,
-    expanded: &HashSet<String>,
-    toggle: ToggleTool,
-    open_task: &super::tasks::OpenTask,
+    tools: &ToolCtx,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -77,8 +74,11 @@ pub fn render_message(
     };
 
     let mut col = v_flex().w_full().gap_3();
+    // Consecutive tool calls render together (folded into one row); prose
+    // that renders nothing doesn't break the run.
+    let mut run: Vec<&crate::api::model::ToolCall> = Vec::new();
     for block in &a.blocks {
-        col = match block {
+        match block {
             Block::Prose {
                 kind, text, done, ..
             } => {
@@ -86,26 +86,25 @@ pub fn render_message(
                 let Some((key, _)) = keys.next() else {
                     continue;
                 };
-                match kind {
-                    BlockKind::Text if !text.is_empty() => {
-                        col.children(prose.state(&key).map(|s| markdown(&key, s)))
-                    }
+                let el = match kind {
+                    BlockKind::Text if !text.is_empty() => prose
+                        .state(&key)
+                        .map(|s| markdown(&key, s).into_any_element()),
                     BlockKind::Reasoning if !text.trim().is_empty() => {
-                        col.child(reasoning(key, *done, prose, cache, cx))
+                        Some(reasoning(key, *done, prose, cache, cx))
                     }
-                    _ => col,
+                    _ => None,
+                };
+                if let Some(el) = el {
+                    col = col.children(super::tool_card::render_tools(&run, &a.id, tools, cx));
+                    run.clear();
+                    col = col.child(el);
                 }
             }
-            Block::Tool(t) => col.child(super::tool_card::render_tool(
-                t,
-                &a.id,
-                expanded,
-                toggle.clone(),
-                open_task,
-                cx,
-            )),
-        };
+            Block::Tool(t) => run.push(t),
+        }
     }
+    col = col.children(super::tool_card::render_tools(&run, &a.id, tools, cx));
     if let Some(err) = &a.error {
         let stopped = err == "Step interrupted";
         col = col.child(

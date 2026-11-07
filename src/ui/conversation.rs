@@ -25,6 +25,7 @@ const SPLIT_MIN_WINDOW_W: f32 = 1440.;
 
 pub struct ConversationView {
     expanded_tools: std::collections::HashSet<String>,
+    tool_scrolls: super::tool_card::ScrollHandles,
     show_changes: bool,
     /// Free-text inputs for pending question forms, keyed (form, field).
     form_inputs: super::form_view::FormInputs,
@@ -64,6 +65,7 @@ impl ConversationView {
             tasks,
             tasks_open: false,
             expanded_tools: Default::default(),
+            tool_scrolls: Default::default(),
             show_changes: false,
             form_inputs: Default::default(),
             store,
@@ -195,6 +197,7 @@ impl ConversationView {
             StoreEvent::SelectionChanged | StoreEvent::FoldersChanged => {
                 self.show_changes = false;
                 self.expanded_tools.clear();
+                self.tool_scrolls.borrow_mut().clear();
                 if matches!(ev, StoreEvent::SelectionChanged) {
                     self.prose.update(cx, |p, _| p.clear());
                 }
@@ -499,6 +502,7 @@ impl Render for ConversationView {
         } else {
             let store = self.store.clone();
             let expanded = self.expanded_tools.clone();
+            let scrolls = self.tool_scrolls.clone();
             let view = cx.entity().downgrade();
             let toggle: super::tool_card::ToggleTool = std::rc::Rc::new(move |key, cx| {
                 let _ = view.update(cx, |this, cx| {
@@ -528,7 +532,15 @@ impl Render for ConversationView {
                 let row = s
                     .selected_conversation()
                     .and_then(|c| c.messages.get(ix))
-                    .map(|m| render_message(m, &cache, &expanded, toggle.clone(), &open_task, cx))
+                    .map(|m| {
+                        let tools = super::tool_card::ToolCtx {
+                            expanded: &expanded,
+                            toggle: toggle.clone(),
+                            open_task: &open_task,
+                            scrolls: &scrolls,
+                        };
+                        render_message(m, &cache, &tools, cx)
+                    })
                     .unwrap_or_else(|| div().into_any_element());
                 h_flex()
                     .w_full()
