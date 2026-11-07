@@ -1,176 +1,299 @@
-//! Our own normalized event enum. The rest of the app never sees
-//! `opencode_codes` types for events, so the protocol crate can be swapped.
+//! Normalized events from opencode's v2 global stream (`GET /api/event`).
+//!
+//! Wire envelope: `{id, type, data, location?: {directory}, durable?: {aggregateID, seq}}`.
+//! Durable events carry a per-session `seq`; deltas are live-only and every
+//! `*.ended` event repeats the full text, so a client that missed deltas
+//! self-heals at the end of each block.
 
-#[cfg(test)]
-use opencode_codes::StreamEvent;
-use opencode_codes::protocol_generated::types::{self as oc, Event as OcEvent};
+use std::path::PathBuf;
 
-/// Session run state as reported by `session.status`.
+use serde_json::Value;
+
+use super::model::{BlockKind, SessionInfo, content_text, error_text, str_at, u64_at};
+
 #[derive(Clone, Debug, PartialEq)]
-pub enum RunState {
-    Idle,
-    Busy,
-    Retry { attempt: u64, message: String },
+pub struct Envelope {
+    pub event: Event,
+    /// Durable per-session sequence number, if the event is durable.
+    pub seq: Option<u64>,
+    pub directory: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
-#[expect(
-    dead_code,
-    reason = "payloads are folded into the Store in M1; M0 only logs them"
-)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    /// The SSE stream (re)connected. Frames may have been missed: reconcile.
+    /// The stream (re)connected. Live frames may have been missed: reconcile.
     Connected,
-    /// The SSE stream dropped; the pump is backing off and will reconnect.
+    /// The stream dropped; the pump backs off and reconnects.
     Disconnected,
-    SessionUpserted(oc::Session),
+    SessionUpserted(SessionInfo),
     SessionDeleted {
         session_id: String,
     },
-    SessionStatus {
+    /// A user prompt was delivered into the transcript.
+    Prompted {
         session_id: String,
-        state: RunState,
+        message_id: String,
+        text: String,
     },
-    SessionIdle {
-        session_id: String,
-    },
-    SessionError {
-        session_id: Option<String>,
-        message: String,
-    },
-    MessageUpserted {
-        session_id: String,
-        info: oc::Message,
-    },
-    MessageRemoved {
+    StepStarted {
         session_id: String,
         message_id: String,
     },
-    PartUpserted {
-        session_id: String,
-        part: oc::Part,
-    },
-    /// Append `delta` to `field` (e.g. "text") of an existing part.
-    PartDelta {
+    BlockStarted {
         session_id: String,
         message_id: String,
-        part_id: String,
-        field: String,
+        kind: BlockKind,
+        block_id: String,
+    },
+    BlockDelta {
+        session_id: String,
+        message_id: String,
+        kind: BlockKind,
+        block_id: String,
         delta: String,
     },
-    PartRemoved {
+    BlockEnded {
         session_id: String,
         message_id: String,
-        part_id: String,
+        kind: BlockKind,
+        block_id: String,
+        text: String,
     },
-    PermissionAsked(oc::PermissionAskedData),
-    PermissionReplied {
+    ToolStarted {
         session_id: String,
-        request_id: String,
+        message_id: String,
+        call_id: String,
+        name: String,
     },
-    /// Anything we do not model yet. Carries the wire `type` for logging.
+    ToolCalled {
+        session_id: String,
+        message_id: String,
+        call_id: String,
+        name: String,
+        input: Value,
+    },
+    ToolSucceeded {
+        session_id: String,
+        message_id: String,
+        call_id: String,
+        output: String,
+    },
+    ToolFailed {
+        session_id: String,
+        message_id: String,
+        call_id: String,
+        error: String,
+    },
+    /// `finish` is "stop", "tool-calls", "length", … ("tool-calls" means
+    /// another step follows).
+    StepEnded {
+        session_id: String,
+        message_id: String,
+        finish: String,
+    },
+    StepFailed {
+        session_id: String,
+        message_id: String,
+        error: String,
+    },
+    Retried {
+        session_id: String,
+        attempt: u64,
+        message: String,
+    },
+    /// Anything we don't model yet. Carries the wire `type` for logging.
     Other(String),
 }
 
-impl Event {
+impl Envelope {
+    pub fn bare(event: Event) -> Self {
+        Self {
+            event,
+            seq: None,
+            directory: None,
+        }
+    }
+
     /// Decode one SSE `data:` payload.
     pub fn from_json(data: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(data).ok()?;
-        Some(match serde_json::from_value::<OcEvent>(value.clone()) {
-            Ok(ev) => Self::from_oc(ev),
-            Err(_) => Event::Other(
-                value
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("?")
-                    .to_string(),
-            ),
+        let v: Value = serde_json::from_str(data).ok()?;
+        let ty = v.get("type")?.as_str()?.to_string();
+        let d = v.get("data").cloned().unwrap_or(Value::Null);
+        let seq = u64_at(&v, "/durable/seq");
+        let directory = v
+            .pointer("/location/directory")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let event = decode(&ty, &d).unwrap_or(Event::Other(ty));
+        Some(Self {
+            event,
+            seq,
+            directory,
         })
-    }
-
-    #[cfg(test)]
-    pub fn from_stream(ev: StreamEvent) -> Self {
-        match ev {
-            StreamEvent::Connected => Event::Connected,
-            StreamEvent::Event(ev) => Self::from_oc(*ev),
-            StreamEvent::Unknown(v) => Event::Other(
-                v.get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("?")
-                    .to_string(),
-            ),
-            _ => Event::Other("unmodelled stream item".into()),
-        }
-    }
-
-    fn from_oc(ev: OcEvent) -> Self {
-        match ev {
-            OcEvent::SessionCreated(e) => Event::SessionUpserted(e.properties.info),
-            OcEvent::SessionUpdated(e) => Event::SessionUpserted(e.properties.info),
-            OcEvent::SessionDeleted(e) => Event::SessionDeleted {
-                session_id: e.properties.session_id,
-            },
-            OcEvent::SessionStatus(e) => Event::SessionStatus {
-                session_id: e.properties.session_id,
-                state: match e.properties.status {
-                    oc::SessionStatus::Idle => RunState::Idle,
-                    oc::SessionStatus::Busy => RunState::Busy,
-                    oc::SessionStatus::Retry {
-                        attempt, message, ..
-                    } => RunState::Retry { attempt, message },
-                },
-            },
-            OcEvent::SessionIdle(e) => Event::SessionIdle {
-                session_id: e.properties.session_id,
-            },
-            OcEvent::SessionError(e) => Event::SessionError {
-                session_id: e.properties.session_id,
-                message: e
-                    .properties
-                    .error
-                    .map(|err| crate::store::error_message(&err))
-                    .unwrap_or_else(|| "unknown error".into()),
-            },
-            OcEvent::MessageUpdated(e) => Event::MessageUpserted {
-                session_id: e.properties.session_id,
-                info: e.properties.info,
-            },
-            OcEvent::MessageRemoved(e) => Event::MessageRemoved {
-                session_id: e.properties.session_id,
-                message_id: e.properties.message_id,
-            },
-            OcEvent::MessagePartUpdated(e) => Event::PartUpserted {
-                session_id: e.properties.session_id,
-                part: e.properties.part,
-            },
-            OcEvent::MessagePartDelta(e) => {
-                let d = e.properties;
-                Event::PartDelta {
-                    session_id: d.session_id,
-                    message_id: d.message_id,
-                    part_id: d.part_id,
-                    field: d.field,
-                    delta: d.delta,
-                }
-            }
-            OcEvent::MessagePartRemoved(e) => Event::PartRemoved {
-                session_id: e.properties.session_id,
-                message_id: e.properties.message_id,
-                part_id: e.properties.part_id,
-            },
-            OcEvent::PermissionAsked(e) => Event::PermissionAsked(e.properties),
-            OcEvent::PermissionReplied(e) => Event::PermissionReplied {
-                session_id: e.properties.session_id,
-                request_id: e.properties.request_id,
-            },
-            other => Event::Other(event_type(&other)),
-        }
     }
 }
 
-fn event_type(ev: &OcEvent) -> String {
-    serde_json::to_value(ev)
-        .ok()
-        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
-        .unwrap_or_else(|| "?".into())
+fn decode(ty: &str, d: &Value) -> Option<Event> {
+    let sid = || str_at(d, "/sessionID");
+    let mid = || str_at(d, "/assistantMessageID");
+    let block = |kind: BlockKind| -> Option<(String, String, BlockKind, String)> {
+        let id_field = if kind == BlockKind::Text {
+            "/textID"
+        } else {
+            "/reasoningID"
+        };
+        Some((sid()?, mid()?, kind, str_at(d, id_field)?))
+    };
+    let kind_of = |ty: &str| {
+        if ty.starts_with("session.next.text.") {
+            BlockKind::Text
+        } else {
+            BlockKind::Reasoning
+        }
+    };
+    Some(match ty {
+        "session.created" | "session.updated" => {
+            Event::SessionUpserted(SessionInfo::from_json(d.get("info")?)?)
+        }
+        "session.deleted" => Event::SessionDeleted {
+            session_id: sid().or_else(|| str_at(d, "/info/id"))?,
+        },
+        "session.next.prompted" => Event::Prompted {
+            session_id: sid()?,
+            message_id: str_at(d, "/messageID")?,
+            text: str_at(d, "/prompt/text").unwrap_or_default(),
+        },
+        "session.next.step.started" => Event::StepStarted {
+            session_id: sid()?,
+            message_id: mid()?,
+        },
+        "session.next.text.started" | "session.next.reasoning.started" => {
+            let (session_id, message_id, kind, block_id) = block(kind_of(ty))?;
+            Event::BlockStarted {
+                session_id,
+                message_id,
+                kind,
+                block_id,
+            }
+        }
+        "session.next.text.delta" | "session.next.reasoning.delta" => {
+            let (session_id, message_id, kind, block_id) = block(kind_of(ty))?;
+            Event::BlockDelta {
+                session_id,
+                message_id,
+                kind,
+                block_id,
+                delta: str_at(d, "/delta")?,
+            }
+        }
+        "session.next.text.ended" | "session.next.reasoning.ended" => {
+            let (session_id, message_id, kind, block_id) = block(kind_of(ty))?;
+            Event::BlockEnded {
+                session_id,
+                message_id,
+                kind,
+                block_id,
+                text: str_at(d, "/text").unwrap_or_default(),
+            }
+        }
+        "session.next.tool.input.started" => Event::ToolStarted {
+            session_id: sid()?,
+            message_id: mid()?,
+            call_id: str_at(d, "/callID")?,
+            name: str_at(d, "/name").unwrap_or_default(),
+        },
+        "session.next.tool.called" => Event::ToolCalled {
+            session_id: sid()?,
+            message_id: mid()?,
+            call_id: str_at(d, "/callID")?,
+            name: str_at(d, "/tool").unwrap_or_default(),
+            input: d.get("input").cloned().unwrap_or(Value::Null),
+        },
+        "session.next.tool.success" => Event::ToolSucceeded {
+            session_id: sid()?,
+            message_id: mid()?,
+            call_id: str_at(d, "/callID")?,
+            output: content_text(d.get("content")),
+        },
+        "session.next.tool.failed" => Event::ToolFailed {
+            session_id: sid()?,
+            message_id: mid()?,
+            call_id: str_at(d, "/callID")?,
+            error: error_text(d.get("error")).unwrap_or_else(|| "failed".into()),
+        },
+        "session.next.step.ended" => Event::StepEnded {
+            session_id: sid()?,
+            message_id: mid()?,
+            finish: str_at(d, "/finish").unwrap_or_default(),
+        },
+        "session.next.step.failed" => Event::StepFailed {
+            session_id: sid()?,
+            message_id: mid()?,
+            error: error_text(d.get("error")).unwrap_or_else(|| "failed".into()),
+        },
+        "session.next.retried" => Event::Retried {
+            session_id: sid()?,
+            attempt: u64_at(d, "/attempt").unwrap_or(0),
+            message: error_text(d.get("error")).unwrap_or_default(),
+        },
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> Vec<Envelope> {
+        include_str!("../../tests/fixtures/v2-events.jsonl")
+            .lines()
+            .map(|l| Envelope::from_json(l).expect("every captured frame decodes"))
+            .collect()
+    }
+
+    #[test]
+    fn decodes_captured_v2_turn() {
+        let evs = fixture();
+        let count = |f: fn(&Event) -> bool| evs.iter().filter(|e| f(&e.event)).count();
+        assert_eq!(count(|e| matches!(e, Event::Prompted { .. })), 2);
+        assert_eq!(
+            count(|e| matches!(e, Event::ToolCalled { name, .. } if name == "bash")),
+            1
+        );
+        assert_eq!(
+            count(
+                |e| matches!(e, Event::ToolSucceeded { output, .. } if output.contains("hello-from-bash"))
+            ),
+            1
+        );
+        assert_eq!(
+            count(|e| matches!(e, Event::StepEnded { finish, .. } if finish == "tool-calls")),
+            1
+        );
+        assert_eq!(
+            count(
+                |e| matches!(e, Event::StepFailed { error, .. } if error == "Provider turn interrupted")
+            ),
+            1
+        );
+        assert!(
+            count(|e| matches!(
+                e,
+                Event::BlockDelta {
+                    kind: BlockKind::Text,
+                    ..
+                }
+            )) > 10
+        );
+        // Durable events carry seq and location.
+        let created = evs
+            .iter()
+            .find(|e| matches!(e.event, Event::SessionUpserted(_)))
+            .unwrap();
+        assert_eq!(created.seq, Some(0));
+        assert_eq!(
+            created.directory.as_deref(),
+            Some(std::path::Path::new("/tmp/claude-0/v2proj"))
+        );
+    }
 }

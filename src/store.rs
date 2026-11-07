@@ -1,18 +1,21 @@
-//! App state: the single source of truth for sessions, messages and parts.
+//! App state: the single source of truth for folders, sessions and
+//! conversations.
 //!
-//! The API layer folds SSE events into it with [`Store::apply`] and replaces a
-//! session's history with [`Store::reconcile`] after every (re)connect. Views
-//! observe the `Entity<Store>` and subscribe to [`StoreEvent`] to remeasure
-//! only what changed. Views never mutate it directly; they go through the
+//! The controller folds v2 events into it with [`Store::apply`] and replaces
+//! a conversation with the REST projection via [`Store::reconcile`]. Views
+//! observe `Entity<Store>` and subscribe to [`StoreEvent`] to re-measure only
+//! what changed. Views never mutate it directly; they go through the
 //! controller.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use gpui_kit::{Context, EventEmitter};
-use opencode_codes::protocol_generated::types as oc;
 
-use crate::api::Event;
-use crate::api::events::RunState;
+use crate::api::model::{
+    AssistantMessage, Block, BlockKind, Message, SessionInfo, ToolCall, ToolStatus, UserMessage,
+};
+use crate::api::{Envelope, Event};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Connection {
@@ -29,40 +32,49 @@ pub enum Connection {
     },
 }
 
-pub struct MessageEntry {
-    pub info: oc::Message,
-    /// Sorted by part id (ids are time-ordered).
-    pub parts: Vec<oc::Part>,
-}
-
-impl MessageEntry {
-    pub fn id(&self) -> &str {
-        message_id(&self.info)
-    }
-
-    pub fn is_user(&self) -> bool {
-        matches!(self.info, oc::Message::User(_))
-    }
-}
-
 #[derive(Default)]
 pub struct Conversation {
     /// Sorted by message id (ids are time-ordered).
-    pub messages: Vec<MessageEntry>,
-    /// True once the REST history has been fetched; events for conversations
-    /// that are not loaded are dropped (they are fetched on selection).
+    pub messages: Vec<Message>,
+    /// True once the REST history has been fetched. Events for conversations
+    /// that are not loaded are dropped; they are fetched on selection.
     pub loaded: bool,
+    /// Created through the v1 API: no v2 history, shown read-only.
+    pub legacy: bool,
+    /// Highest durable sequence number folded in.
+    pub last_seq: Option<u64>,
 }
 
 impl Conversation {
     fn index_of(&self, id: &str) -> Result<usize, usize> {
         self.messages.binary_search_by(|m| m.id().cmp(id))
     }
+
+    /// The assistant message `id`, created on demand (a block can arrive
+    /// before its step.started if we connected mid-turn).
+    fn assistant_mut(&mut self, id: &str) -> (usize, bool, &mut AssistantMessage) {
+        let (index, inserted) = match self.index_of(id) {
+            Ok(i) => (i, false),
+            Err(i) => {
+                let msg = AssistantMessage {
+                    id: id.to_string(),
+                    ..Default::default()
+                };
+                self.messages.insert(i, Message::Assistant(msg));
+                (i, true)
+            }
+        };
+        match &mut self.messages[index] {
+            Message::Assistant(a) => (index, inserted, a),
+            Message::User(_) => unreachable!("message id {id} is a user message"),
+        }
+    }
 }
 
 /// What changed, so views can do the minimum amount of relayout.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoreEvent {
+    FoldersChanged,
     SessionsChanged,
     SelectionChanged,
     /// The selected conversation's rows were replaced wholesale.
@@ -73,11 +85,7 @@ pub enum StoreEvent {
         session_id: String,
         index: usize,
     },
-    MessageRemoved {
-        session_id: String,
-        index: usize,
-    },
-    /// Content of one row changed (a part was added, grew, or was updated).
+    /// Content of one row changed (a block was added, grew, or finished).
     MessageChanged {
         session_id: String,
         index: usize,
@@ -90,10 +98,16 @@ pub enum StoreEvent {
 
 #[derive(Default)]
 pub struct Store {
-    /// Root sessions, most recently updated first.
-    pub sessions: Vec<oc::Session>,
+    /// The user's folders, in sidebar order. Each is an opencode location.
+    pub folders: Vec<PathBuf>,
+    pub collapsed: HashSet<PathBuf>,
+    /// Where "New session" creates sessions.
+    pub current_folder: Option<PathBuf>,
+    /// Root sessions in every location, most recently updated first.
+    pub sessions: Vec<SessionInfo>,
     pub selected: Option<String>,
-    pub status: HashMap<String, RunState>,
+    pub busy: HashSet<String>,
+    pub retry: HashMap<String, (u64, String)>,
     /// Last error per session, cleared when a new prompt is sent.
     pub errors: HashMap<String, String>,
     pub conversations: HashMap<String, Conversation>,
@@ -118,32 +132,81 @@ impl Store {
         }
     }
 
-    pub fn session(&self, id: &str) -> Option<&oc::Session> {
+    pub fn session(&self, id: &str) -> Option<&SessionInfo> {
         self.sessions.iter().find(|s| s.id == id)
     }
 
+    pub fn sessions_in<'a>(
+        &'a self,
+        folder: &'a Path,
+    ) -> impl Iterator<Item = &'a SessionInfo> + 'a {
+        self.sessions.iter().filter(move |s| s.directory == folder)
+    }
+
     pub fn is_busy(&self, session_id: &str) -> bool {
-        matches!(
-            self.status.get(session_id),
-            Some(RunState::Busy | RunState::Retry { .. })
-        )
+        self.busy.contains(session_id)
     }
 
     pub fn selected_conversation(&self) -> Option<&Conversation> {
         self.conversations.get(self.selected.as_ref()?)
     }
 
+    /// The folder a new session goes into: the selected session's folder,
+    /// else the current folder, else the first folder.
+    pub fn target_folder(&self) -> Option<PathBuf> {
+        self.selected
+            .as_ref()
+            .and_then(|id| self.session(id))
+            .map(|s| s.directory.clone())
+            .or_else(|| self.current_folder.clone())
+            .or_else(|| self.folders.first().cloned())
+    }
+
     pub fn select(&mut self, id: Option<String>, cx: &mut Context<Self>) {
         if self.selected != id {
+            if let Some(dir) = id
+                .as_ref()
+                .and_then(|i| self.session(i))
+                .map(|s| s.directory.clone())
+            {
+                self.current_folder = Some(dir);
+            }
             self.selected = id;
             cx.emit(StoreEvent::SelectionChanged);
             cx.notify();
         }
     }
 
-    pub fn set_sessions(&mut self, mut sessions: Vec<oc::Session>, cx: &mut Context<Self>) {
+    pub fn set_folders(&mut self, folders: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.folders = folders;
+        if self
+            .current_folder
+            .as_ref()
+            .is_none_or(|c| !self.folders.contains(c))
+        {
+            self.current_folder = self.folders.first().cloned();
+        }
+        cx.emit(StoreEvent::FoldersChanged);
+        cx.notify();
+    }
+
+    pub fn set_current_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        self.current_folder = Some(folder);
+        cx.emit(StoreEvent::FoldersChanged);
+        cx.notify();
+    }
+
+    pub fn toggle_collapsed(&mut self, folder: &Path, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(folder) {
+            self.collapsed.insert(folder.to_path_buf());
+        }
+        cx.emit(StoreEvent::FoldersChanged);
+        cx.notify();
+    }
+
+    pub fn set_sessions(&mut self, mut sessions: Vec<SessionInfo>, cx: &mut Context<Self>) {
         sessions.retain(|s| s.parent_id.is_none());
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.time.updated));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.updated));
         self.sessions = sessions;
         if let Some(sel) = &self.selected
             && self.session(sel).is_none()
@@ -155,265 +218,45 @@ impl Store {
         cx.notify();
     }
 
-    pub fn set_status(&mut self, session_id: &str, state: RunState, cx: &mut Context<Self>) {
-        let changes = self.set_status_inner(session_id, state);
-        self.emit_all(changes, cx);
+    /// Replace busy state with the server's view (`GET /api/session/active`).
+    pub fn set_active(&mut self, active: Vec<String>, cx: &mut Context<Self>) {
+        let new: HashSet<String> = active.into_iter().collect();
+        let changed: Vec<String> = self.busy.symmetric_difference(&new).cloned().collect();
+        self.busy = new;
+        let events = changed
+            .into_iter()
+            .map(|session_id| StoreEvent::StatusChanged { session_id })
+            .collect();
+        self.emit_all(events, cx);
+    }
+
+    pub fn set_busy(&mut self, session_id: &str, busy: bool, cx: &mut Context<Self>) {
+        let events = self.set_busy_inner(session_id, busy);
+        self.emit_all(events, cx);
     }
 
     pub fn clear_error(&mut self, session_id: &str) {
         self.errors.remove(session_id);
+        self.retry.remove(session_id);
     }
 
     /// Fold one event. Emits [`StoreEvent`]s and notifies when anything changed.
-    pub fn apply(&mut self, ev: Event, cx: &mut Context<Self>) {
-        let changes = self.apply_inner(ev);
-        self.emit_all(changes, cx);
+    pub fn apply(&mut self, env: Envelope, cx: &mut Context<Self>) {
+        let events = self.apply_inner(env);
+        self.emit_all(events, cx);
     }
 
-    /// Replace a conversation with the authoritative REST history, merging so
-    /// that text streamed after the snapshot was taken is not lost.
+    /// Replace a conversation with the authoritative REST projection,
+    /// merging so that text streamed after the snapshot was taken survives.
     pub fn reconcile(
         &mut self,
         session_id: &str,
-        history: Vec<oc::MessageWithParts>,
+        history: Vec<Message>,
+        legacy: bool,
         cx: &mut Context<Self>,
     ) {
-        let changes = self.reconcile_inner(session_id, history);
-        self.emit_all(changes, cx);
-    }
-
-    fn emit_all(&mut self, changes: Vec<StoreEvent>, cx: &mut Context<Self>) {
-        if changes.is_empty() {
-            return;
-        }
-        for c in changes {
-            cx.emit(c);
-        }
-        cx.notify();
-    }
-
-    fn set_status_inner(&mut self, session_id: &str, state: RunState) -> Vec<StoreEvent> {
-        if self.status.get(session_id) == Some(&state) {
-            return vec![];
-        }
-        if state == RunState::Idle {
-            self.status.remove(session_id);
-        } else {
-            self.status.insert(session_id.to_string(), state);
-        }
-        vec![StoreEvent::StatusChanged {
-            session_id: session_id.to_string(),
-        }]
-    }
-
-    pub(crate) fn apply_inner(&mut self, ev: Event) -> Vec<StoreEvent> {
-        match ev {
-            Event::SessionUpserted(s) => {
-                if s.parent_id.is_some() {
-                    return vec![];
-                }
-                self.sessions.retain(|x| x.id != s.id);
-                let pos = self
-                    .sessions
-                    .iter()
-                    .position(|x| x.time.updated <= s.time.updated)
-                    .unwrap_or(self.sessions.len());
-                self.sessions.insert(pos, s);
-                vec![StoreEvent::SessionsChanged]
-            }
-            Event::SessionDeleted { session_id } => {
-                self.sessions.retain(|x| x.id != session_id);
-                self.conversations.remove(&session_id);
-                self.status.remove(&session_id);
-                let mut out = vec![StoreEvent::SessionsChanged];
-                if self.selected.as_deref() == Some(&session_id) {
-                    self.selected = None;
-                    out.push(StoreEvent::SelectionChanged);
-                }
-                out
-            }
-            Event::SessionStatus { session_id, state } => self.set_status_inner(&session_id, state),
-            Event::SessionIdle { session_id } => self.set_status_inner(&session_id, RunState::Idle),
-            Event::SessionError {
-                session_id: Some(sid),
-                message,
-            } => {
-                // The server can send the same error twice (second with a
-                // stack trace); keep the first line of the first one.
-                let first = message.lines().next().unwrap_or_default().to_string();
-                if !self.errors.contains_key(&sid) {
-                    self.errors.insert(sid.clone(), first);
-                }
-                vec![StoreEvent::StatusChanged { session_id: sid }]
-            }
-            Event::MessageUpserted { session_id, info } => {
-                let Some(conv) = self.loaded_mut(&session_id) else {
-                    return vec![];
-                };
-                let id = message_id(&info).to_string();
-                match conv.index_of(&id) {
-                    Ok(index) => {
-                        conv.messages[index].info = info;
-                        vec![StoreEvent::MessageChanged { session_id, index }]
-                    }
-                    Err(index) => {
-                        conv.messages.insert(
-                            index,
-                            MessageEntry {
-                                info,
-                                parts: vec![],
-                            },
-                        );
-                        vec![StoreEvent::MessageInserted { session_id, index }]
-                    }
-                }
-            }
-            Event::MessageRemoved {
-                session_id,
-                message_id,
-            } => {
-                let Some(conv) = self.loaded_mut(&session_id) else {
-                    return vec![];
-                };
-                match conv.index_of(&message_id) {
-                    Ok(index) => {
-                        conv.messages.remove(index);
-                        vec![StoreEvent::MessageRemoved { session_id, index }]
-                    }
-                    Err(_) => vec![],
-                }
-            }
-            Event::PartUpserted { session_id, part } => {
-                let Some(conv) = self.loaded_mut(&session_id) else {
-                    return vec![];
-                };
-                let mid = part_message_id(&part).to_string();
-                let (index, mut out) = match conv.index_of(&mid) {
-                    Ok(i) => (i, vec![]),
-                    Err(i) => {
-                        // Part arrived before its message.updated: create a
-                        // placeholder from the part so nothing is dropped.
-                        let Some(info) = placeholder_message(&session_id, &mid, &part) else {
-                            return vec![];
-                        };
-                        conv.messages.insert(
-                            i,
-                            MessageEntry {
-                                info,
-                                parts: vec![],
-                            },
-                        );
-                        (
-                            i,
-                            vec![StoreEvent::MessageInserted {
-                                session_id: session_id.clone(),
-                                index: i,
-                            }],
-                        )
-                    }
-                };
-                let parts = &mut conv.messages[index].parts;
-                let pid = part_id(&part).to_string();
-                match parts.binary_search_by(|p| part_id(p).cmp(&pid)) {
-                    Ok(i) => parts[i] = part,
-                    Err(i) => parts.insert(i, part),
-                }
-                out.push(StoreEvent::MessageChanged { session_id, index });
-                out
-            }
-            Event::PartDelta {
-                session_id,
-                message_id,
-                part_id: pid,
-                field,
-                delta,
-            } => {
-                let Some(conv) = self.loaded_mut(&session_id) else {
-                    return vec![];
-                };
-                let Ok(index) = conv.index_of(&message_id) else {
-                    return vec![];
-                };
-                let parts = &mut conv.messages[index].parts;
-                let Ok(i) = parts.binary_search_by(|p| part_id(p).cmp(&pid)) else {
-                    return vec![];
-                };
-                if field != "text" {
-                    return vec![];
-                }
-                match &mut parts[i] {
-                    oc::Part::Text(t) => t.text.push_str(&delta),
-                    oc::Part::Reasoning(r) => r.text.push_str(&delta),
-                    _ => return vec![],
-                }
-                vec![StoreEvent::MessageChanged { session_id, index }]
-            }
-            Event::PartRemoved {
-                session_id,
-                message_id,
-                part_id: pid,
-            } => {
-                let Some(conv) = self.loaded_mut(&session_id) else {
-                    return vec![];
-                };
-                let Ok(index) = conv.index_of(&message_id) else {
-                    return vec![];
-                };
-                conv.messages[index].parts.retain(|p| part_id(p) != pid);
-                vec![StoreEvent::MessageChanged { session_id, index }]
-            }
-            Event::SessionError {
-                session_id: None, ..
-            }
-            | Event::PermissionAsked(_)
-            | Event::PermissionReplied { .. }
-            | Event::Connected
-            | Event::Disconnected
-            | Event::Other(_) => vec![],
-        }
-    }
-
-    fn loaded_mut(&mut self, session_id: &str) -> Option<&mut Conversation> {
-        self.conversations.get_mut(session_id).filter(|c| c.loaded)
-    }
-
-    pub(crate) fn reconcile_inner(
-        &mut self,
-        session_id: &str,
-        history: Vec<oc::MessageWithParts>,
-    ) -> Vec<StoreEvent> {
-        let conv = self
-            .conversations
-            .entry(session_id.to_string())
-            .or_default();
-        let mut old: HashMap<String, MessageEntry> = std::mem::take(&mut conv.messages)
-            .into_iter()
-            .map(|m| (m.id().to_string(), m))
-            .collect();
-
-        let mut merged: Vec<MessageEntry> = history
-            .into_iter()
-            .map(|mwp| {
-                let mut parts = mwp.parts;
-                if let Some(local) = old.remove(message_id(&mwp.info)) {
-                    merge_parts(&mut parts, local.parts);
-                }
-                parts.sort_by(|a, b| part_id(a).cmp(part_id(b)));
-                MessageEntry {
-                    info: mwp.info,
-                    parts,
-                }
-            })
-            .collect();
-        // Messages created after the snapshot was taken survive.
-        merged.extend(old.into_values());
-        merged.sort_by(|a, b| a.id().cmp(b.id()));
-
-        conv.messages = merged;
-        conv.loaded = true;
-        vec![StoreEvent::MessagesReset {
-            session_id: session_id.to_string(),
-        }]
+        let events = self.reconcile_inner(session_id, history, legacy);
+        self.emit_all(events, cx);
     }
 
     /// Forget fetched history for every session except `keep`, so it is
@@ -425,280 +268,513 @@ impl Store {
             }
         }
     }
-}
 
-/// Snapshot parts win, except where local streamed text strictly extends the
-/// snapshot's text (deltas that arrived after the snapshot was taken), and
-/// local parts the snapshot doesn't know about yet are kept.
-fn merge_parts(snapshot: &mut Vec<oc::Part>, local: Vec<oc::Part>) {
-    for lp in local {
-        match snapshot.iter_mut().find(|sp| part_id(sp) == part_id(&lp)) {
-            Some(sp) => {
-                if let (Some(s_text), Some(l_text)) = (part_text(sp), part_text(&lp))
-                    && l_text.len() > s_text.len()
-                    && l_text.starts_with(s_text)
-                {
-                    *sp = lp;
+    fn emit_all(&mut self, events: Vec<StoreEvent>, cx: &mut Context<Self>) {
+        if events.is_empty() {
+            return;
+        }
+        for e in events {
+            cx.emit(e);
+        }
+        cx.notify();
+    }
+
+    fn set_busy_inner(&mut self, session_id: &str, busy: bool) -> Vec<StoreEvent> {
+        let changed = if busy {
+            self.busy.insert(session_id.to_string())
+        } else {
+            self.busy.remove(session_id)
+        };
+        if !busy {
+            self.retry.remove(session_id);
+        }
+        if changed {
+            vec![StoreEvent::StatusChanged {
+                session_id: session_id.to_string(),
+            }]
+        } else {
+            vec![]
+        }
+    }
+
+    pub(crate) fn apply_inner(&mut self, env: Envelope) -> Vec<StoreEvent> {
+        let mut out = Vec::new();
+        // Session-level state first (applies whether or not the conversation
+        // is loaded).
+        match &env.event {
+            Event::SessionUpserted(s) => {
+                if s.parent_id.is_none() {
+                    self.sessions.retain(|x| x.id != s.id);
+                    let pos = self
+                        .sessions
+                        .iter()
+                        .position(|x| x.updated <= s.updated)
+                        .unwrap_or(self.sessions.len());
+                    self.sessions.insert(pos, s.clone());
+                    out.push(StoreEvent::SessionsChanged);
+                }
+                return out;
+            }
+            Event::SessionDeleted { session_id } => {
+                self.sessions.retain(|x| &x.id != session_id);
+                self.conversations.remove(session_id);
+                self.busy.remove(session_id);
+                out.push(StoreEvent::SessionsChanged);
+                if self.selected.as_ref() == Some(session_id) {
+                    self.selected = None;
+                    out.push(StoreEvent::SelectionChanged);
+                }
+                return out;
+            }
+            Event::Prompted { session_id, .. } | Event::StepStarted { session_id, .. } => {
+                out.extend(self.set_busy_inner(session_id, true));
+            }
+            Event::StepEnded {
+                session_id, finish, ..
+            } if finish != "tool-calls" => {
+                out.extend(self.set_busy_inner(session_id, false));
+            }
+            Event::StepFailed {
+                session_id, error, ..
+            } => {
+                out.extend(self.set_busy_inner(session_id, false));
+                if error != "Provider turn interrupted" {
+                    self.errors.insert(session_id.clone(), error.clone());
                 }
             }
-            None => snapshot.push(lp),
+            Event::Retried {
+                session_id,
+                attempt,
+                message,
+            } => {
+                self.retry
+                    .insert(session_id.clone(), (*attempt, message.clone()));
+                out.push(StoreEvent::StatusChanged {
+                    session_id: session_id.clone(),
+                });
+            }
+            _ => {}
+        }
+
+        let Some(session_id) = event_session(&env.event).map(str::to_string) else {
+            return out;
+        };
+        let Some(conv) = self.conversations.get_mut(&session_id).filter(|c| c.loaded) else {
+            return out;
+        };
+        if let Some(seq) = env.seq {
+            conv.last_seq = Some(conv.last_seq.map_or(seq, |s| s.max(seq)));
+        }
+        let changed = |index: usize, inserted: bool| {
+            if inserted {
+                StoreEvent::MessageInserted {
+                    session_id: session_id.clone(),
+                    index,
+                }
+            } else {
+                StoreEvent::MessageChanged {
+                    session_id: session_id.clone(),
+                    index,
+                }
+            }
+        };
+
+        match env.event {
+            Event::Prompted {
+                message_id, text, ..
+            } => {
+                if let Err(index) = conv.index_of(&message_id) {
+                    conv.messages.insert(
+                        index,
+                        Message::User(UserMessage {
+                            id: message_id,
+                            text,
+                        }),
+                    );
+                    out.push(changed(index, true));
+                }
+            }
+            Event::StepStarted { message_id, .. } => {
+                let (index, inserted, _) = conv.assistant_mut(&message_id);
+                if inserted {
+                    out.push(changed(index, true));
+                }
+            }
+            Event::BlockStarted {
+                message_id,
+                kind,
+                block_id,
+                ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                prose_mut(msg, kind, &block_id);
+                out.push(changed(index, inserted));
+            }
+            Event::BlockDelta {
+                message_id,
+                kind,
+                block_id,
+                delta,
+                ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                let (text, _) = prose_mut(msg, kind, &block_id);
+                text.push_str(&delta);
+                out.push(changed(index, inserted));
+            }
+            Event::BlockEnded {
+                message_id,
+                kind,
+                block_id,
+                text: full,
+                ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                let (text, done) = prose_mut(msg, kind, &block_id);
+                *text = full;
+                *done = true;
+                out.push(changed(index, inserted));
+            }
+            Event::ToolStarted {
+                message_id,
+                call_id,
+                name,
+                ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                tool_mut(msg, &call_id).name = name;
+                out.push(changed(index, inserted));
+            }
+            Event::ToolCalled {
+                message_id,
+                call_id,
+                name,
+                input,
+                ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                let t = tool_mut(msg, &call_id);
+                t.name = name;
+                t.input = input;
+                t.status = ToolStatus::Running;
+                out.push(changed(index, inserted));
+            }
+            Event::ToolSucceeded {
+                message_id,
+                call_id,
+                output,
+                ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                let t = tool_mut(msg, &call_id);
+                t.status = ToolStatus::Completed;
+                t.output = output;
+                out.push(changed(index, inserted));
+            }
+            Event::ToolFailed {
+                message_id,
+                call_id,
+                error,
+                ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                let t = tool_mut(msg, &call_id);
+                t.status = ToolStatus::Error;
+                t.error = Some(error);
+                out.push(changed(index, inserted));
+            }
+            Event::StepEnded {
+                message_id, finish, ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                msg.completed = true;
+                msg.finish = Some(finish);
+                out.push(changed(index, inserted));
+            }
+            Event::StepFailed {
+                message_id, error, ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                msg.completed = true;
+                msg.error = Some(error);
+                out.push(changed(index, inserted));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    pub(crate) fn reconcile_inner(
+        &mut self,
+        session_id: &str,
+        history: Vec<Message>,
+        legacy: bool,
+    ) -> Vec<StoreEvent> {
+        let conv = self
+            .conversations
+            .entry(session_id.to_string())
+            .or_default();
+        let mut old: HashMap<String, Message> = std::mem::take(&mut conv.messages)
+            .into_iter()
+            .map(|m| (m.id().to_string(), m))
+            .collect();
+        let mut merged: Vec<Message> = history
+            .into_iter()
+            .map(|mut snap| {
+                let local = old.remove(snap.id());
+                if let (Message::Assistant(s), Some(Message::Assistant(l))) = (&mut snap, local) {
+                    merge_blocks(&mut s.blocks, l.blocks);
+                }
+                snap
+            })
+            .collect();
+        // Messages created after the snapshot was taken survive.
+        merged.extend(old.into_values());
+        merged.sort_by(|a, b| a.id().cmp(b.id()));
+        conv.messages = merged;
+        conv.loaded = true;
+        conv.legacy = legacy;
+        vec![StoreEvent::MessagesReset {
+            session_id: session_id.to_string(),
+        }]
+    }
+}
+
+fn event_session(e: &Event) -> Option<&str> {
+    Some(match e {
+        Event::Prompted { session_id, .. }
+        | Event::StepStarted { session_id, .. }
+        | Event::BlockStarted { session_id, .. }
+        | Event::BlockDelta { session_id, .. }
+        | Event::BlockEnded { session_id, .. }
+        | Event::ToolStarted { session_id, .. }
+        | Event::ToolCalled { session_id, .. }
+        | Event::ToolSucceeded { session_id, .. }
+        | Event::ToolFailed { session_id, .. }
+        | Event::StepEnded { session_id, .. }
+        | Event::StepFailed { session_id, .. } => session_id,
+        _ => return None,
+    })
+}
+
+fn prose_mut<'a>(
+    msg: &'a mut AssistantMessage,
+    kind: BlockKind,
+    block_id: &str,
+) -> (&'a mut String, &'a mut bool) {
+    let pos = msg.blocks.iter().position(
+        |b| matches!(b, Block::Prose { kind: k, id, .. } if *k == kind && id == block_id),
+    );
+    let pos = pos.unwrap_or_else(|| {
+        msg.blocks.push(Block::Prose {
+            kind,
+            id: block_id.to_string(),
+            text: String::new(),
+            done: false,
+        });
+        msg.blocks.len() - 1
+    });
+    match &mut msg.blocks[pos] {
+        Block::Prose { text, done, .. } => (text, done),
+        Block::Tool(_) => unreachable!(),
+    }
+}
+
+fn tool_mut<'a>(msg: &'a mut AssistantMessage, call_id: &str) -> &'a mut ToolCall {
+    let pos = msg
+        .blocks
+        .iter()
+        .position(|b| matches!(b, Block::Tool(t) if t.call_id == call_id));
+    let pos = pos.unwrap_or_else(|| {
+        msg.blocks.push(Block::Tool(ToolCall {
+            call_id: call_id.to_string(),
+            name: String::new(),
+            status: ToolStatus::Pending,
+            input: serde_json::Value::Null,
+            output: String::new(),
+            error: None,
+        }));
+        msg.blocks.len() - 1
+    });
+    match &mut msg.blocks[pos] {
+        Block::Tool(t) => t,
+        Block::Prose { .. } => unreachable!(),
+    }
+}
+
+/// Snapshot blocks win, except where local streamed text strictly extends
+/// the snapshot's (the server persists text slightly after streaming it),
+/// and local blocks the snapshot doesn't know yet are kept.
+fn merge_blocks(snapshot: &mut Vec<Block>, local: Vec<Block>) {
+    for lb in local {
+        let found = snapshot.iter_mut().find(|sb| same_block(sb, &lb));
+        match (found, &lb) {
+            (Some(Block::Prose { text: s, .. }), Block::Prose { text: l, .. }) => {
+                if l.len() > s.len() && l.starts_with(s.as_str()) {
+                    *s = l.clone();
+                }
+            }
+            (Some(_), _) => {}
+            (None, _) => snapshot.push(lb),
         }
     }
 }
 
-pub fn part_text(p: &oc::Part) -> Option<&str> {
-    match p {
-        oc::Part::Text(t) => Some(&t.text),
-        oc::Part::Reasoning(r) => Some(&r.text),
-        _ => None,
+fn same_block(a: &Block, b: &Block) -> bool {
+    match (a, b) {
+        (
+            Block::Prose {
+                kind: ka, id: ia, ..
+            },
+            Block::Prose {
+                kind: kb, id: ib, ..
+            },
+        ) => ka == kb && ia == ib,
+        (Block::Tool(x), Block::Tool(y)) => x.call_id == y.call_id,
+        _ => false,
     }
-}
-
-pub fn message_id(m: &oc::Message) -> &str {
-    match m {
-        oc::Message::User(u) => &u.id,
-        oc::Message::Assistant(a) => &a.id,
-    }
-}
-
-pub fn part_id(p: &oc::Part) -> &str {
-    use oc::Part::*;
-    match p {
-        Text(x) => &x.id,
-        Subtask(x) => &x.id,
-        Reasoning(x) => &x.id,
-        File(x) => &x.id,
-        Tool(x) => &x.id,
-        StepStart(x) => &x.id,
-        StepFinish(x) => &x.id,
-        Snapshot(x) => &x.id,
-        Patch(x) => &x.id,
-        Agent(x) => &x.id,
-        Retry(x) => &x.id,
-        Compaction(x) => &x.id,
-    }
-}
-
-pub fn part_message_id(p: &oc::Part) -> &str {
-    use oc::Part::*;
-    match p {
-        Text(x) => &x.message_id,
-        Subtask(x) => &x.message_id,
-        Reasoning(x) => &x.message_id,
-        File(x) => &x.message_id,
-        Tool(x) => &x.message_id,
-        StepStart(x) => &x.message_id,
-        StepFinish(x) => &x.message_id,
-        Snapshot(x) => &x.message_id,
-        Patch(x) => &x.message_id,
-        Agent(x) => &x.message_id,
-        Retry(x) => &x.message_id,
-        Compaction(x) => &x.message_id,
-    }
-}
-
-/// Assistant placeholder for a part whose `message.updated` hasn't arrived.
-/// The real info replaces it as soon as it does.
-fn placeholder_message(
-    session_id: &str,
-    message_id: &str,
-    _part: &oc::Part,
-) -> Option<oc::Message> {
-    serde_json::from_value(serde_json::json!({
-        "role": "assistant", "id": message_id, "sessionID": session_id,
-        "agent": "", "cost": 0, "mode": "", "modelID": "", "providerID": "",
-        "parentID": "", "path": {"cwd": "", "root": ""},
-        "time": {"created": 0},
-        "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
-    }))
-    .ok()
-}
-
-/// First line of the `data.message` of an opencode error object.
-pub fn error_message(err: &impl serde::Serialize) -> String {
-    let v = serde_json::to_value(err).unwrap_or_default();
-    let msg = v
-        .pointer("/data/message")
-        .and_then(|m| m.as_str())
-        .or_else(|| v.get("name").and_then(|n| n.as_str()))
-        .unwrap_or("error");
-    msg.lines().next().unwrap_or_default().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SID: &str = "ses_1";
+    const SID: &str = "ses_e4a80e891ffeMVuHnRk3ssjEfA";
 
-    fn ev(json: serde_json::Value) -> Event {
-        let oc_ev: oc::Event = serde_json::from_value(json).expect("valid event");
-        Event::from_stream(opencode_codes::StreamEvent::Event(Box::new(oc_ev)))
-    }
-
-    fn assistant(id: &str) -> serde_json::Value {
-        serde_json::json!({"type":"message.updated","id":"evt","properties":{"sessionID":SID,"info":{
-            "id":id,"parentID":"msg_0","role":"assistant","mode":"build","agent":"build",
-            "path":{"cwd":"/","root":"/"},"cost":0,
-            "tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},
-            "modelID":"m","providerID":"p","time":{"created":1},"sessionID":SID}}})
-    }
-
-    fn text_part(mid: &str, pid: &str, text: &str) -> serde_json::Value {
-        serde_json::json!({"type":"message.part.updated","id":"evt","properties":{"sessionID":SID,"time":1,
-            "part":{"type":"text","text":text,"messageID":mid,"sessionID":SID,"id":pid}}})
-    }
-
-    fn delta(mid: &str, pid: &str, d: &str) -> serde_json::Value {
-        serde_json::json!({"type":"message.part.delta","id":"evt","properties":{"sessionID":SID,
-            "messageID":mid,"partID":pid,"field":"text","delta":d}})
+    fn fixture() -> Vec<Envelope> {
+        include_str!("../tests/fixtures/v2-events.jsonl")
+            .lines()
+            .filter_map(Envelope::from_json)
+            .collect()
     }
 
     fn loaded_store() -> Store {
         let mut s = Store::default();
-        s.reconcile_inner(SID, vec![]);
+        s.reconcile_inner(SID, vec![], false);
         s
     }
 
-    fn text_of(s: &Store, mi: usize) -> String {
-        let conv = &s.conversations[SID];
-        part_text(&conv.messages[mi].parts[0]).unwrap().to_string()
-    }
-
-    #[test]
-    fn streaming_deltas_append() {
-        let mut s = loaded_store();
-        assert_eq!(
-            s.apply_inner(ev(assistant("msg_2"))),
-            vec![StoreEvent::MessageInserted {
-                session_id: SID.into(),
-                index: 0
-            }]
-        );
-        s.apply_inner(ev(text_part("msg_2", "prt_1", "")));
-        for d in ["Hel", "lo ", "world"] {
-            let ch = s.apply_inner(ev(delta("msg_2", "prt_1", d)));
-            assert_eq!(
-                ch,
-                vec![StoreEvent::MessageChanged {
-                    session_id: SID.into(),
-                    index: 0
-                }]
-            );
+    fn assistant(s: &Store, i: usize) -> &AssistantMessage {
+        match &s.conversations[SID].messages[i] {
+            Message::Assistant(a) => a,
+            m => panic!("expected assistant, got {m:?}"),
         }
-        assert_eq!(text_of(&s, 0), "Hello world");
-        // Final part.updated carries the full text and self-heals.
-        s.apply_inner(ev(text_part("msg_2", "prt_1", "Hello world!")));
-        assert_eq!(text_of(&s, 0), "Hello world!");
+    }
+
+    fn summary(m: &Message) -> Vec<String> {
+        match m {
+            Message::User(u) => vec![u.text.clone()],
+            Message::Assistant(a) => a
+                .blocks
+                .iter()
+                .map(|b| match b {
+                    Block::Prose { text, .. } => text.clone(),
+                    Block::Tool(t) => format!("{}:{:?}:{}", t.name, t.status, t.output),
+                })
+                .collect(),
+        }
     }
 
     #[test]
-    fn events_for_unloaded_sessions_are_ignored() {
-        let mut s = Store::default();
-        assert!(s.apply_inner(ev(assistant("msg_2"))).is_empty());
-        assert!(!s.conversations.contains_key(SID));
-    }
-
-    #[test]
-    fn part_before_message_creates_placeholder() {
+    fn replaying_captured_events_matches_rest_projection() {
         let mut s = loaded_store();
-        s.apply_inner(ev(text_part("msg_9", "prt_1", "early")));
-        assert_eq!(text_of(&s, 0), "early");
-        s.apply_inner(ev(assistant("msg_9")));
-        assert_eq!(s.conversations[SID].messages.len(), 1);
-    }
-
-    #[test]
-    fn messages_stay_sorted_by_id() {
-        let mut s = loaded_store();
-        s.apply_inner(ev(assistant("msg_3")));
-        let ch = s.apply_inner(ev(assistant("msg_2")));
-        assert_eq!(
-            ch,
-            vec![StoreEvent::MessageInserted {
-                session_id: SID.into(),
-                index: 0
-            }]
-        );
-        let ids: Vec<_> = s.conversations[SID]
-            .messages
+        for env in fixture() {
+            s.apply_inner(env);
+        }
+        // The REST projection of the same session, captured after the first
+        // two turns (the fixture then has an interrupted third turn).
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/v2-messages.json")).unwrap();
+        let mut rest: Vec<Message> = v["data"]
+            .as_array()
+            .unwrap()
             .iter()
-            .map(|m| m.id().to_string())
+            .filter_map(Message::from_v2_json)
             .collect();
-        assert_eq!(ids, ["msg_2", "msg_3"]);
+        rest.sort_by(|a, b| a.id().cmp(b.id()));
+        let live = &s.conversations[SID].messages;
+        assert!(live.len() > rest.len());
+        for (l, r) in live.iter().zip(&rest) {
+            assert_eq!(l.id(), r.id());
+            assert_eq!(summary(l), summary(r));
+        }
+        assert!(!s.is_busy(SID));
+        assert!(!s.errors.contains_key(SID), "an interrupt is not an error");
     }
 
-    fn history(mid: &str, pid: &str, text: &str) -> Vec<oc::MessageWithParts> {
-        let info = match ev(assistant(mid)) {
-            Event::MessageUpserted { info, .. } => info,
-            _ => unreachable!(),
-        };
-        let part = match ev(text_part(mid, pid, text)) {
-            Event::PartUpserted { part, .. } => part,
-            _ => unreachable!(),
-        };
-        vec![oc::MessageWithParts {
-            info,
-            parts: vec![part],
-        }]
+    #[test]
+    fn busy_follows_steps() {
+        let mut s = loaded_store();
+        let mut saw_busy_after_tool_step = false;
+        for env in fixture() {
+            let tool_step =
+                matches!(&env.event, Event::StepEnded { finish, .. } if finish == "tool-calls");
+            s.apply_inner(env);
+            if tool_step {
+                saw_busy_after_tool_step = s.is_busy(SID);
+            }
+        }
+        assert!(
+            saw_busy_after_tool_step,
+            "a tool-calls step keeps the session busy"
+        );
+    }
+
+    #[test]
+    fn events_for_unloaded_sessions_only_touch_status() {
+        let mut s = Store::default();
+        for env in fixture().into_iter().take(12) {
+            s.apply_inner(env);
+        }
+        assert!(!s.conversations.contains_key(SID));
+        assert!(s.is_busy(SID));
+        assert_eq!(s.sessions.len(), 1);
     }
 
     #[test]
     fn reconcile_keeps_local_text_that_extends_snapshot() {
         let mut s = loaded_store();
-        s.apply_inner(ev(assistant("msg_2")));
-        s.apply_inner(ev(text_part("msg_2", "prt_1", "Hello wor")));
-        // Snapshot taken earlier than our latest delta.
-        s.reconcile_inner(SID, history("msg_2", "prt_1", "Hello"));
-        assert_eq!(text_of(&s, 0), "Hello wor");
+        let block = |t: &str| Block::Prose {
+            kind: BlockKind::Text,
+            id: "text-0".into(),
+            text: t.into(),
+            done: false,
+        };
+        let msg = |t: &str| {
+            Message::Assistant(AssistantMessage {
+                id: "msg_2".into(),
+                blocks: vec![block(t)],
+                ..Default::default()
+            })
+        };
+        s.reconcile_inner(SID, vec![msg("Hello wor")], false);
+        s.reconcile_inner(SID, vec![msg("Hello")], false);
+        assert!(
+            matches!(&assistant(&s, 0).blocks[0], Block::Prose { text, .. } if text == "Hello wor")
+        );
+        s.reconcile_inner(SID, vec![msg("Hello world")], false);
+        assert!(
+            matches!(&assistant(&s, 0).blocks[0], Block::Prose { text, .. } if text == "Hello world")
+        );
     }
 
     #[test]
-    fn reconcile_fills_in_missed_frames() {
-        let mut s = loaded_store();
-        s.apply_inner(ev(assistant("msg_2")));
-        s.apply_inner(ev(text_part("msg_2", "prt_1", "Hel")));
-        // We missed deltas while disconnected; the snapshot is ahead.
-        s.reconcile_inner(SID, history("msg_2", "prt_1", "Hello world"));
-        assert_eq!(text_of(&s, 0), "Hello world");
-    }
-
-    #[test]
-    fn reconcile_keeps_messages_newer_than_snapshot() {
-        let mut s = loaded_store();
-        s.apply_inner(ev(assistant("msg_5")));
-        s.reconcile_inner(SID, history("msg_2", "prt_1", "old"));
-        let ids: Vec<_> = s.conversations[SID]
-            .messages
-            .iter()
-            .map(|m| m.id().to_string())
-            .collect();
-        assert_eq!(ids, ["msg_2", "msg_5"]);
-    }
-
-    #[test]
-    fn duplicate_session_errors_keep_first_line() {
-        let mut s = loaded_store();
-        for m in [
-            "Model not found: x.",
-            "ProviderModelNotFoundError: Model not found: x.\n    at foo",
-        ] {
-            s.apply_inner(ev(
-                serde_json::json!({"type":"session.error","id":"e","properties":{
-                "sessionID":SID,"error":{"name":"UnknownError","data":{"message":m}}}}),
-            ));
-        }
-        assert_eq!(s.errors[SID], "Model not found: x.");
-    }
-
-    #[test]
-    fn status_idle_clears_busy() {
-        let mut s = Store::default();
-        s.set_status_inner(SID, RunState::Busy);
-        assert!(s.is_busy(SID));
-        s.apply_inner(ev(
-            serde_json::json!({"type":"session.idle","id":"e","properties":{"sessionID":SID}}),
-        ));
-        assert!(!s.is_busy(SID));
+    fn target_folder_prefers_selected_session() {
+        let mut s = Store {
+            folders: vec!["/a".into(), "/b".into()],
+            current_folder: Some("/a".into()),
+            ..Default::default()
+        };
+        s.sessions.push(SessionInfo {
+            id: "ses_x".into(),
+            title: String::new(),
+            directory: "/b".into(),
+            created: 0,
+            updated: 0,
+            parent_id: None,
+        });
+        assert_eq!(s.target_folder(), Some(PathBuf::from("/a")));
+        s.selected = Some("ses_x".into());
+        assert_eq!(s.target_folder(), Some(PathBuf::from("/b")));
     }
 }

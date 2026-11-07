@@ -4,9 +4,11 @@
 set -u
 BIN=${BIN:-target/debug/ocdesk}
 export DISPLAY=${DISPLAY:-:99}
-export OPENCODE_CONFIG_CONTENT="$(cat dev/mock-opencode.json)"
 WORK=$(mktemp -d)
 export OCDESK_DIR=$WORK
+# opencode v2 reads provider config from the config dir, not OPENCODE_CONFIG_CONTENT.
+mkdir -p "$WORK/xdg" && cp -r dev/xdg/opencode "$WORK/xdg/"
+export XDG_CONFIG_HOME=$WORK/xdg
 pass=0; fail=0
 # A killed orphan can linger as a zombie when PID 1 does not reap (containers);
 # a zombie holds no resources, so it counts as gone.

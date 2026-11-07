@@ -1,9 +1,10 @@
 //! Root layout: sidebar | conversation.
 
-use gpui_kit::component::{ActiveTheme as _, Theme, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, h_flex};
 use gpui_kit::*;
 
-use crate::controller::Controller;
+use crate::controller::{self, Controller};
+use crate::settings::Settings;
 use crate::store::Store;
 use crate::ui::conversation::ConversationView;
 use crate::ui::sidebar::Sidebar;
@@ -16,23 +17,32 @@ pub struct AppView {
 }
 
 impl AppView {
-    pub fn new(
-        rt: tokio::runtime::Handle,
-        working_dir: std::path::PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Theme::sync_system_appearance(Some(window), cx);
+    pub fn new(rt: tokio::runtime::Handle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let settings = Settings::load();
+        // Dark by default; "light" or "system" (follow the OS) on request.
+        let theme = std::env::var("OCDESK_THEME")
+            .ok()
+            .or_else(|| settings.theme.clone());
+        let follow_system = theme.as_deref() == Some("system");
+        match theme.as_deref() {
+            Some("light") => Theme::change(ThemeMode::Light, Some(window), cx),
+            Some("system") => Theme::sync_system_appearance(Some(window), cx),
+            _ => Theme::change(ThemeMode::Dark, Some(window), cx),
+        }
         let store = cx.new(|_| Store::default());
-        let controller = cx.new(|cx| Controller::new(rt, store.clone(), working_dir, cx));
+        let initial = controller::initial_folder(!settings.folders.is_empty());
+        let controller = cx.new(|cx| Controller::new(rt, store.clone(), settings, initial, cx));
         if let Ok(p) = std::env::var("OCDESK_PROBE_PROMPT") {
             controller.update(cx, |c, cx| c.probe_on_connect(p, cx));
         }
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), controller.clone(), cx));
         let conversation = cx.new(|cx| ConversationView::new(store, controller, window, cx));
-        let subs = vec![cx.observe_window_appearance(window, |_, window, cx| {
-            Theme::sync_system_appearance(Some(window), cx);
-        })];
+        let mut subs = Vec::new();
+        if follow_system {
+            subs.push(cx.observe_window_appearance(window, |_, window, cx| {
+                Theme::sync_system_appearance(Some(window), cx);
+            }));
+        }
         Self {
             sidebar,
             conversation,

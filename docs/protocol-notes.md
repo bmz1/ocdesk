@@ -1,14 +1,143 @@
 # opencode server protocol notes
 
 Observed against **opencode 1.19.5** (`opencode serve`), November 2026. Every
-sample below is a real frame captured from `GET /event`, trimmed only where
-marked. The full OpenAPI document served at `GET /doc` is checked in as
-[`openapi-opencode-1.19.5.json`](openapi-opencode-1.19.5.json); diff it when
-bumping the pinned version.
+sample below is a real frame captured from the running server, trimmed only
+where marked. The full OpenAPI document served at `GET /doc` is checked in
+as [`openapi-opencode-1.19.5.json`](openapi-opencode-1.19.5.json); diff it
+when bumping the pinned version. Real v2 captures used by the unit tests live
+in [`tests/fixtures/`](../tests/fixtures).
 
-Samples were captured with the free `opencode` provider (until it hit
-`free_tier_limit`, see *Retry* below) and the deterministic mock provider in
-`dev/mock_llm.py` (see README, *Developing*).
+## v1 vs v2: what ocdesk uses
+
+opencode 1.19.x ships two HTTP surfaces in one server:
+
+- **v1**: `/session`, `/event`, `/permission`, … (what the 1.x TUI and
+  `opencode-codes` use). Message = `{info, parts[]}`, events in
+  `properties`.
+- **v2**: `/api/*` (`/api/session`, `/api/event`, `/api/session/{id}/prompt`, …).
+  This is the direction of opencode 2.0, which is in beta (npm dist-tags
+  `beta`/`dev`). The `dev` build (`0.0.0-dev-202610280534`) serves exactly the
+  same 188 operations as 1.19.5, so targeting v2 today is forward-compatible.
+
+**ocdesk uses v2**, falling back to v1 only for what v2 doesn't expose yet:
+
+| Need | v2 route | Notes |
+|---|---|---|
+| List sessions (all folders) | `GET /api/session?limit=&order=&cursor=` | `{data: [SessionV2Info], cursor: {next, previous}}`; each has `location.directory` |
+| Create session | `POST /api/session` `{location: {directory}, model?}` | pinned to that directory for life |
+| Prompt | `POST /api/session/{id}/prompt` `{prompt: {text}}` | → `{data: {admittedSeq, id, …}}`; optional `delivery: steer\|queue`, `resume` |
+| History | `GET /api/session/{id}/message?order=asc&limit=&cursor=` | projection; see *Messages* |
+| Stop | `POST /api/session/{id}/interrupt` | → 204; turn ends with `step.failed` |
+| Busy sessions | `GET /api/session/active` | `{data: {"ses_…": {type: "running"}}}` |
+| Validate a folder | `GET /api/location?location[directory]=…` | `{directory, project: {id, directory}}` |
+| Events (all folders) | `GET /api/event` | one global SSE stream |
+| Durable per-session log | `GET /api/session/{id}/event?after=<seq>` | replays then **keeps following** (no end marker in 1.19.5) |
+| Permissions (M3) | `GET /api/session/{id}/permission`, `POST …/permission/{id}/reply {reply}` | 204 |
+| Rename | — | **v1** `PATCH /session/{id}?directory=…` `{title}` |
+| Delete | — | **v1** `DELETE /session/{id}?directory=…` |
+| Legacy history | — | **v1** `GET /session/{id}/message?directory=…` |
+
+### v2 surprises (1.19.5)
+
+- **Sessions created through v1 have no v2 history.** `GET /api/session/{id}/message`
+  returns `[]` for them while v1 returns the full transcript. ocdesk shows
+  such sessions read-only from the v1 history ("legacy").
+- **`OPENCODE_CONFIG_CONTENT` and `OPENCODE_CONFIG` are ignored by v2** for
+  providers/models: the v2 catalog (`GET /api/model`) only sees the global
+  config dir (`$XDG_CONFIG_HOME/opencode/opencode.json`) and the project's
+  `opencode.json`. The dev mock is therefore injected with
+  `XDG_CONFIG_HOME=dev/xdg`.
+- **A model the v2 catalog doesn't know fails silently**: the server logs
+  `Failed to drain Session … ModelUnavailableError` and emits *no* event; the
+  prompt was admitted and nothing else happens.
+- **No idle/busy events.** v1's `session.status`/`session.idle` are not sent
+  for v2 turns. ocdesk infers busy from `prompted`/`step.started`, idle from
+  `step.ended` (finish ≠ `tool-calls`) or `step.failed`, and confirms with
+  `GET /api/session/active` where that's ambiguous: an interrupt during a
+  tool ends with `tool.failed` + `step.ended {finish: "tool-calls"}` and then
+  nothing.
+- **No title generation.** v2 sessions keep `"New session - <ISO time>"`
+  (v1 generated a title from the first prompt). ocdesk displays "New session".
+- `--port 0` binds 4096 when free (see *Process and auth*).
+
+### Event envelope
+
+```json
+{"id":"evt_…","type":"session.next.step.started",
+ "durable":{"aggregateID":"ses_…","seq":3,"version":1},
+ "location":{"directory":"/tmp/claude-0/v2proj"},
+ "data":{ … }}
+```
+
+`durable` is present on durable events only (deltas are live-only). `seq` is
+per session. `location` says which folder the event belongs to. Startup noise
+(`plugin.added`, `catalog.updated`, …) and `server.heartbeat` are ignored.
+
+### A v2 turn with a tool call (captured)
+
+```
+session.created                (durable seq 0; data.info is the v1 Session shape)
+session.next.prompt.admitted   (seq 1)
+session.next.prompted          (seq 2)  data: {messageID, prompt: {text}, delivery}
+session.next.step.started      (seq 3)  data: {assistantMessageID, agent, model, snapshot}
+session.next.reasoning.started (seq 4)  data: {reasoningID: "reasoning-0"}
+session.next.reasoning.delta   (live)   data: {reasoningID, delta}
+session.next.reasoning.ended   (seq 5)  data: {reasoningID, text: <full>}
+session.next.text.started      (seq 6)  data: {textID: "text-0"}
+session.next.text.delta        (live)
+session.next.tool.input.started(seq 7)  data: {callID, name: "bash"}
+session.next.tool.input.delta  (live)   data: {callID, delta: <json fragment>}
+session.next.tool.input.ended  (seq 8)
+session.next.tool.called       (seq 9)  data: {callID, tool, input: {...}}
+session.next.text.ended        (seq 10) data: {textID, text: <full>}
+permission.v2.asked            (live, only if the config says "ask")
+permission.v2.replied
+session.next.tool.success      (seq 11) data: {callID, content: [{type:"text", text}], structured}
+session.next.step.ended        (seq 12) data: {finish: "tool-calls", tokens, cost}
+session.next.step.started      (seq 13) … second step answers with the tool output …
+session.next.step.ended        (seq 18) data: {finish: "stop"}
+```
+
+Interrupt: `session.next.step.failed` with
+`data.error = {"type":"unknown","message":"Provider turn interrupted"}`.
+
+Every `*.ended` carries the complete text, so missed deltas self-heal at the
+end of each block. Block ids (`text-0`, `reasoning-1`) are per message.
+
+```json
+{"id":"evt_1b57f1b770026DXsZugwKY4LSH","type":"permission.v2.asked","location":{"directory":"/tmp/claude-0/v2proj"},"data":{"id":"per_1b57f1b77001CzrNmPhTyxXwGL","sessionID":"ses_e4a80e891ffeMVuHnRk3ssjEfA","action":"bash","resources":["echo hello-from-bash && ls | head -5"],"save":["echo hello-from-bash && ls | head -5"],"source":{"type":"tool","messageID":"msg_1b57f197b001HtL7G8cQFhKz1e","callID":"call_1794046368360"}}}
+```
+
+### Messages (v2 projection)
+
+`GET /api/session/{id}/message` (newest first by default):
+
+```json
+{"id":"msg_1b57f17b30016Z1tc1ZlZat2HV","time":{"created":1794046367668},"text":"tool:bash please","type":"user"}
+{"id":"msg_1b57f197b001HtL7G8cQFhKz1e","type":"assistant","time":{"created":…,"completed":…},
+ "agent":"build","model":{"id":"mock-1","providerID":"mock","variant":"default"},
+ "content":[
+   {"type":"reasoning","id":"reasoning-0","text":"I should run a command.","time":{…}},
+   {"type":"text","id":"text-0","text":"Running a command.\n"},
+   {"type":"tool","id":"call_1794046368360","name":"bash","provider":{"executed":false},
+    "state":{"status":"completed","input":{"command":"echo hello-from-bash && ls | head -5","description":"Say hello and list files"},
+             "content":[{"type":"text","text":"hello-from-bash\nopencode.json\n"},{"type":"text","text":"Command exited with code 0."}],
+             "structured":{"exit":0,"truncated":false}},
+    "time":{"created":…,"ran":…,"completed":…}}],
+ "finish":"tool-calls","cost":0,"tokens":{…}}
+```
+
+Other message types exist (`synthetic`, `system`, `shell`, `compaction`,
+`agent-switched`, `model-switched`); ocdesk skips them for now. A unit test
+replays the captured live events and checks the result equals this
+projection.
+
+---
+
+# v1 notes (M0/M1)
+
+Kept for reference: rename/delete/legacy history still use v1, and the v1
+`/event` stream is what the 1.x TUI sees.
 
 ## Process and auth
 

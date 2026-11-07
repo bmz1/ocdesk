@@ -1,5 +1,6 @@
 mod api;
 mod controller;
+mod settings;
 mod sidecar;
 mod store;
 mod ui;
@@ -79,16 +80,8 @@ fn main() -> Result<()> {
                 }),
                 ..Default::default()
             };
-            let working_dir = match controller::default_working_dir() {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!("no working directory: {e:#}");
-                    cx.quit();
-                    return;
-                }
-            };
             if let Err(e) = gpui_kit::open_window(opts, cx, |window, cx| {
-                cx.new(|cx| AppView::new(rt, working_dir, window, cx))
+                cx.new(|cx| AppView::new(rt, window, cx))
             }) {
                 tracing::error!("failed to open window: {e:#}");
                 cx.quit();

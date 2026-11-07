@@ -2,48 +2,47 @@
 
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
-use opencode_codes::protocol_generated::types as oc;
 
-use crate::store::{MessageEntry, error_message};
+use crate::api::model::{Block, BlockKind, Message, ToolCall, ToolStatus};
 
 /// Width of the conversation column, Codex-style.
 pub const COLUMN_MAX_W: f32 = 760.;
 
-pub fn render_message(entry: &MessageEntry, cx: &App) -> AnyElement {
+pub fn render_message(msg: &Message, cx: &App) -> AnyElement {
     let theme = cx.theme();
-    if entry.is_user() {
-        let text: String = entry
-            .parts
-            .iter()
-            .filter_map(|p| match p {
-                oc::Part::Text(t) if t.synthetic != Some(true) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        return h_flex()
-            .w_full()
-            .justify_end()
-            .child(
-                div()
-                    .max_w(relative(0.8))
-                    .px_4()
-                    .py_2p5()
-                    .rounded_2xl()
-                    .bg(theme.secondary)
-                    .text_color(theme.secondary_foreground)
-                    .child(text),
-            )
-            .into_any_element();
-    }
+    let a = match msg {
+        Message::User(u) => {
+            return h_flex()
+                .w_full()
+                .justify_end()
+                .child(
+                    div()
+                        .max_w(relative(0.8))
+                        .px_4()
+                        .py_2p5()
+                        .rounded_2xl()
+                        .bg(theme.secondary)
+                        .text_color(theme.secondary_foreground)
+                        .child(u.text.clone()),
+                )
+                .into_any_element();
+        }
+        Message::Assistant(a) => a,
+    };
 
     let mut col = v_flex().w_full().gap_3();
-    for part in &entry.parts {
-        col = match part {
-            oc::Part::Text(t) if !t.text.is_empty() => {
-                col.child(div().w_full().child(t.text.clone()))
-            }
-            oc::Part::Reasoning(r) if !r.text.trim().is_empty() => col.child(
+    for block in &a.blocks {
+        col = match block {
+            Block::Prose {
+                kind: BlockKind::Text,
+                text,
+                ..
+            } if !text.is_empty() => col.child(div().w_full().child(text.clone())),
+            Block::Prose {
+                kind: BlockKind::Reasoning,
+                text,
+                ..
+            } if !text.trim().is_empty() => col.child(
                 v_flex()
                     .gap_1()
                     .text_sm()
@@ -54,77 +53,59 @@ pub fn render_message(entry: &MessageEntry, cx: &App) -> AnyElement {
                             .pl_3()
                             .border_l_2()
                             .border_color(theme.border)
-                            .child(r.text.clone()),
+                            .child(text.clone()),
                     ),
             ),
-            oc::Part::Tool(t) => col.child(tool_row(t, cx)),
+            Block::Tool(t) => col.child(tool_row(t, cx)),
             _ => col,
         };
     }
-    if let oc::Message::Assistant(a) = &entry.info
-        && let Some(err) = &a.error
-    {
-        let msg = error_message(err);
-        let aborted = serde_json::to_value(err)
-            .ok()
-            .and_then(|v| {
-                v.get("name")
-                    .and_then(|n| n.as_str())
-                    .map(|n| n == "MessageAbortedError")
-            })
-            .unwrap_or(false);
+    if let Some(err) = &a.error {
+        let stopped = err == "Provider turn interrupted";
         col = col.child(
             h_flex()
                 .gap_1p5()
                 .text_sm()
-                .text_color(if aborted {
+                .text_color(if stopped {
                     theme.muted_foreground
                 } else {
                     theme.danger
                 })
                 .child(Icon::new(IconName::CircleAlert).xsmall())
-                .child(if aborted { "Stopped".to_string() } else { msg }),
+                .child(if stopped {
+                    "Stopped".to_string()
+                } else {
+                    err.clone()
+                }),
         );
     }
     col.into_any_element()
 }
 
-/// One quiet line per tool call, e.g. "▸ bash  echo hello · done".
-fn tool_row(t: &oc::ToolPart, cx: &App) -> AnyElement {
+/// One quiet line per tool call, e.g. "› bash  echo hello   done".
+fn tool_row(t: &ToolCall, cx: &App) -> AnyElement {
     let theme = cx.theme();
-    let state = serde_json::to_value(&t.state).unwrap_or_default();
-    let status = state
-        .get("status")
-        .and_then(|s| s.as_str())
-        .unwrap_or("pending")
-        .to_string();
-    let input = state.get("input");
-    let summary = state
-        .get("title")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            input
-                .and_then(|i| i.get("command"))
-                .and_then(|v| v.as_str())
-        })
-        .or_else(|| {
-            input
-                .and_then(|i| i.get("filePath"))
-                .and_then(|v| v.as_str())
-        })
-        .or_else(|| {
-            input
-                .and_then(|i| i.get("description"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("")
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let status_color = match status.as_str() {
-        "error" => theme.danger,
-        _ => theme.muted_foreground,
+    let input = &t.input;
+    let summary = [
+        "command",
+        "filePath",
+        "path",
+        "pattern",
+        "url",
+        "description",
+    ]
+    .iter()
+    .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
+    .unwrap_or("")
+    .lines()
+    .next()
+    .unwrap_or("")
+    .to_string();
+    let (status, color) = match t.status {
+        ToolStatus::Pending => ("pending", theme.muted_foreground),
+        ToolStatus::Running => ("running", theme.muted_foreground),
+        ToolStatus::Completed => ("done", theme.muted_foreground),
+        ToolStatus::Error => ("error", theme.danger),
     };
     h_flex()
         .gap_2()
@@ -135,7 +116,7 @@ fn tool_row(t: &oc::ToolPart, cx: &App) -> AnyElement {
             div()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.foreground)
-                .child(t.tool.clone()),
+                .child(t.name.clone()),
         )
         .child(
             div()
@@ -145,6 +126,6 @@ fn tool_row(t: &oc::ToolPart, cx: &App) -> AnyElement {
                 .font_family(theme.mono_font_family.clone())
                 .child(summary),
         )
-        .child(div().text_color(status_color).child(status))
+        .child(div().text_color(color).child(status))
         .into_any_element()
 }

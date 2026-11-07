@@ -1,8 +1,10 @@
 //! Turns user intents into API calls and API results into store updates.
 //!
-//! Owns the sidecar lifecycle (start, crash detection, auto-restart) and the
-//! SSE pump. All network work runs on the Tokio runtime; results come back to
-//! the GPUI thread through channels awaited in `cx.spawn` tasks.
+//! Owns the sidecar lifecycle (start, crash detection, auto-restart), the
+//! SSE pump, and the folder list. One sidecar serves every folder: v2
+//! sessions are pinned to a location (directory) and `/api/event` covers all
+//! locations. All network work runs on the Tokio runtime; results come back
+//! to the GPUI thread through channels awaited in `cx.spawn` tasks.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -13,8 +15,8 @@ use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use gpui_kit::{Context, Entity, Task};
 
-use crate::api::events::RunState;
-use crate::api::{Api, Event};
+use crate::api::{Api, Envelope, Event};
+use crate::settings::Settings;
 use crate::sidecar::{self, SidecarConfig};
 use crate::store::{Connection, Store};
 
@@ -25,7 +27,7 @@ const CRASH_WINDOW: Duration = Duration::from_secs(60);
 pub struct Controller {
     rt: tokio::runtime::Handle,
     store: Entity<Store>,
-    working_dir: PathBuf,
+    settings: Settings,
     api: Option<Api>,
     /// Bumped on every sidecar (re)start so stale callbacks can be ignored.
     generation: u64,
@@ -38,25 +40,33 @@ impl Controller {
     pub fn new(
         rt: tokio::runtime::Handle,
         store: Entity<Store>,
-        working_dir: PathBuf,
+        mut settings: Settings,
+        initial_folder: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
+        if let Some(f) = initial_folder
+            && !settings.folders.contains(&f)
+        {
+            settings.folders.insert(0, f);
+        }
+        let (folders, collapsed) = (settings.folders.clone(), settings.collapsed.clone());
+        store.update(cx, |s, cx| {
+            s.collapsed = collapsed.into_iter().collect();
+            s.set_folders(folders, cx);
+        });
         let mut this = Self {
             rt,
             store,
-            working_dir,
+            settings,
             api: None,
             generation: 0,
             pump: None,
             exit_watch: None,
             recent_crashes: Vec::new(),
         };
+        this.save_settings();
         this.start_sidecar(cx);
         this
-    }
-
-    pub fn working_dir(&self) -> &PathBuf {
-        &self.working_dir
     }
 
     /// Run `fut` on the Tokio runtime and hand the result back on the UI thread.
@@ -81,6 +91,15 @@ impl Controller {
         .detach();
     }
 
+    fn save_settings(&self) {
+        let settings = self.settings.clone();
+        self.rt.spawn_blocking(move || {
+            if let Err(e) = settings.save() {
+                tracing::warn!("could not save settings: {e:#}");
+            }
+        });
+    }
+
     // ── sidecar lifecycle ────────────────────────────────────────────────
 
     /// Kill whatever is running and start a fresh sidecar.
@@ -99,7 +118,15 @@ impl Controller {
         self.store
             .update(cx, |s, cx| s.set_connection(Connection::Starting, cx));
 
-        let working_dir = self.working_dir.clone();
+        // Sessions carry their own location, so the sidecar's own directory
+        // barely matters; use the first folder so v1-only calls resolve.
+        let working_dir = self
+            .settings
+            .folders
+            .first()
+            .cloned()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("/"));
         self.run(
             cx,
             async move {
@@ -119,25 +146,11 @@ impl Controller {
                 if this.generation != generation {
                     return;
                 }
-                let (sc, exit_rx) = match res {
+                let started = res.and_then(|(sc, exit_rx)| Ok((Api::new(&sc)?, sc, exit_rx)));
+                let (api, sc, exit_rx) = match started {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::error!("sidecar failed to start: {e:#}");
-                        this.store.update(cx, |s, cx| {
-                            s.set_connection(
-                                Connection::SidecarDown {
-                                    message: format!("{e:#}"),
-                                    last_lines: vec![],
-                                },
-                                cx,
-                            )
-                        });
-                        return;
-                    }
-                };
-                let api = match Api::new(&sc) {
-                    Ok(api) => api,
-                    Err(e) => {
                         this.store.update(cx, |s, cx| {
                             s.set_connection(
                                 Connection::SidecarDown {
@@ -189,10 +202,7 @@ impl Controller {
                         cx,
                     );
                     // Nothing is running any more.
-                    let busy: Vec<String> = s.status.keys().cloned().collect();
-                    for id in busy {
-                        s.set_status(&id, RunState::Idle, cx);
-                    }
+                    s.set_active(vec![], cx);
                 });
                 if this.recent_crashes.len() as u32 <= MAX_QUICK_RESTARTS {
                     tracing::warn!("restarting sidecar automatically");
@@ -217,8 +227,8 @@ impl Controller {
             .spawn(async move { api.run_events(tx).await })
             .abort_handle();
         let task = cx.spawn(async move |this, cx| {
-            while let Some(ev) = rx.next().await {
-                if this.update(cx, |this, cx| this.on_event(ev, cx)).is_err() {
+            while let Some(env) = rx.next().await {
+                if this.update(cx, |this, cx| this.on_event(env, cx)).is_err() {
                     break;
                 }
             }
@@ -234,8 +244,8 @@ impl Controller {
         }
     }
 
-    fn on_event(&mut self, ev: Event, cx: &mut Context<Self>) {
-        match ev {
+    fn on_event(&mut self, env: Envelope, cx: &mut Context<Self>) {
+        match env.event {
             Event::Connected => {
                 #[cfg(debug_assertions)]
                 if std::env::var_os("OCDESK_DEBUG_PANIC").is_some() {
@@ -252,70 +262,112 @@ impl Controller {
                     }
                 });
             }
-            ev => {
-                #[cfg(debug_assertions)]
-                if let Event::SessionIdle { session_id } = &ev
-                    && std::env::var_os("OCDESK_VERIFY_ON_IDLE").is_some()
-                {
-                    self.verify_against_rest(session_id.clone(), cx);
+            _ => {
+                let (turn_over, maybe_over) = match &env.event {
+                    Event::StepEnded {
+                        session_id, finish, ..
+                    } if finish != "tool-calls" => (Some(session_id.clone()), None),
+                    // Usually another step follows, but not when the turn was
+                    // interrupted during a tool: ask the server.
+                    Event::StepEnded { session_id, .. } => (None, Some(session_id.clone())),
+                    Event::StepFailed { session_id, .. } => (Some(session_id.clone()), None),
+                    _ => (None, None),
+                };
+                self.store.update(cx, |s, cx| s.apply(env, cx));
+                if let Some(session_id) = turn_over {
+                    self.on_turn_over(session_id, cx);
                 }
-                // Verification hook for dev/teardown-test.sh: quit through
-                // the normal on_app_quit path once a turn finishes.
-                if matches!(ev, Event::SessionIdle { .. })
-                    && std::env::var_os("OCDESK_EXIT_ON_IDLE").is_some()
-                {
-                    cx.quit();
+                if let Some(session_id) = maybe_over {
+                    self.confirm_running(session_id, cx);
                 }
-                self.store.update(cx, |s, cx| s.apply(ev, cx));
             }
         }
     }
 
-    /// Debug check (OCDESK_VERIFY_ON_IDLE): the streamed state of a loaded
-    /// conversation must equal the server's REST history once it goes idle.
-    #[cfg(debug_assertions)]
-    fn verify_against_rest(&mut self, session_id: String, cx: &mut Context<Self>) {
+    /// v2 has no idle event. Where the step events are ambiguous, ask
+    /// `GET /api/session/active` shortly after and clear busy if the session
+    /// is no longer running.
+    fn confirm_running(&mut self, session_id: String, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
-        let sid = session_id.clone();
-        // The server persists the final text slightly after `session.idle`
-        // (seen on abort), so give it a moment before comparing.
         let fut = async move {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            api.messages(&sid).await
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            api.active().await
         };
         self.run(cx, fut, move |this, res, cx| {
-            let Ok(history) = res else { return };
-            let store = this.store.read(cx);
-            let Some(conv) = store.conversations.get(&session_id).filter(|c| c.loaded) else {
-                return;
-            };
-            let flatten = |parts: &[opencode_codes::protocol_generated::types::Part]| -> String {
-                parts
-                    .iter()
-                    .filter_map(crate::store::part_text)
-                    .collect::<Vec<_>>()
-                    .join("|")
-            };
-            let local: Vec<String> = conv.messages.iter().map(|m| flatten(&m.parts)).collect();
-            let remote: Vec<String> = history.iter().map(|m| flatten(&m.parts)).collect();
-            if local == remote {
-                tracing::info!(%session_id, messages = local.len(), "verify: store matches REST");
-            } else {
-                tracing::error!(%session_id, ?local, ?remote, "verify: store MISMATCH with REST");
+            let Ok(active) = res else { return };
+            let still_busy = this.store.read(cx).is_busy(&session_id);
+            if still_busy && !active.contains(&session_id) {
+                this.store
+                    .update(cx, |s, cx| s.set_busy(&session_id, false, cx));
+                this.on_turn_over(session_id, cx);
             }
         });
     }
 
+    /// A turn finished (v2 has no idle event; this is inferred from steps).
+    fn on_turn_over(&mut self, _session_id: String, cx: &mut Context<Self>) {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("OCDESK_VERIFY_ON_IDLE").is_some() {
+            self.verify_against_rest(_session_id, cx);
+        }
+        // Verification hook for dev/teardown-test.sh: quit through the normal
+        // on_app_quit path once a turn finishes.
+        if std::env::var_os("OCDESK_EXIT_ON_IDLE").is_some() {
+            cx.quit();
+        }
+    }
+
     /// After every (re)connect frames may have been missed: re-fetch the
-    /// session list, the busy states, and the selected conversation.
+    /// session list, busy states, and the selected conversation.
     fn resync(&mut self, cx: &mut Context<Self>) {
         let selected = self.store.read(cx).selected.clone();
         self.store
             .update(cx, |s, _| s.invalidate_except(selected.as_deref()));
         self.refresh_sessions(cx);
+        if let Some(api) = self.api.clone() {
+            self.run(
+                cx,
+                async move { api.active().await },
+                |this, res, cx| match res {
+                    Ok(active) => this.store.update(cx, |s, cx| s.set_active(active, cx)),
+                    Err(e) => tracing::warn!("could not read active sessions: {e:#}"),
+                },
+            );
+        }
         if let Some(id) = selected {
             self.load_messages(id, cx);
         }
+    }
+
+    /// Debug check (OCDESK_VERIFY_ON_IDLE): the streamed state of a loaded
+    /// conversation must equal the server's REST projection after a turn.
+    #[cfg(debug_assertions)]
+    fn verify_against_rest(&mut self, session_id: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else { return };
+        let Some(dir) = self
+            .store
+            .read(cx)
+            .session(&session_id)
+            .map(|s| s.directory.clone())
+        else {
+            return;
+        };
+        let sid = session_id.clone();
+        // The projection is written right after the terminal step event.
+        let fut = async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            api.messages(&sid, &dir).await
+        };
+        self.run(cx, fut, move |this, res, cx| {
+            let Ok((history, _)) = res else { return };
+            let store = this.store.read(cx);
+            let Some(conv) = store.conversations.get(&session_id).filter(|c| c.loaded) else { return };
+            if conv.messages == history {
+                tracing::info!(%session_id, messages = history.len(), "verify: store matches REST");
+            } else {
+                tracing::error!(%session_id, local = ?conv.messages, remote = ?history, "verify: store MISMATCH with REST");
+            }
+        });
     }
 
     // ── intents ──────────────────────────────────────────────────────────
@@ -350,14 +402,22 @@ impl Controller {
 
     fn load_messages(&mut self, session_id: String, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
+        let Some(dir) = self
+            .store
+            .read(cx)
+            .session(&session_id)
+            .map(|s| s.directory.clone())
+        else {
+            return;
+        };
         let sid = session_id.clone();
         self.run(
             cx,
-            async move { api.messages(&sid).await },
+            async move { api.messages(&sid, &dir).await },
             move |this, res, cx| match res {
-                Ok(history) => this
+                Ok((history, legacy)) => this
                     .store
-                    .update(cx, |s, cx| s.reconcile(&session_id, history, cx)),
+                    .update(cx, |s, cx| s.reconcile(&session_id, history, legacy, cx)),
                 Err(e) => this.notice(format!("Could not load messages: {e:#}"), cx),
             },
         );
@@ -370,21 +430,98 @@ impl Controller {
         }
     }
 
-    /// Codex-style: "New session" just clears the selection; the session is
-    /// created on the first prompt so empty sessions don't pile up.
-    pub fn new_session(&mut self, cx: &mut Context<Self>) {
+    /// Codex-style: "New session" clears the selection and picks the folder;
+    /// the session is created on the first prompt so empty sessions don't
+    /// pile up.
+    pub fn new_session(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
+        let folder = folder.or_else(|| self.store.read(cx).target_folder());
         self.select_session(None, cx);
+        if let Some(f) = folder {
+            self.store.update(cx, |s, cx| s.set_current_folder(f, cx));
+        }
+    }
+
+    /// Add a folder (validated by the server as an opencode location).
+    pub fn add_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
+        if !folder.is_dir() {
+            self.notice(format!("{} is not a folder", folder.display()), cx);
+            return;
+        }
+        let finish = |this: &mut Self, folder: PathBuf, cx: &mut Context<Self>| {
+            if !this.settings.folders.contains(&folder) {
+                this.settings.folders.push(folder.clone());
+                this.save_settings();
+            }
+            let folders = this.settings.folders.clone();
+            this.store.update(cx, |s, cx| {
+                s.set_folders(folders, cx);
+                s.collapsed.remove(&folder);
+            });
+            this.new_session(Some(folder), cx);
+        };
+        match self.api.clone() {
+            Some(api) => {
+                let f = folder.clone();
+                self.run(
+                    cx,
+                    async move { api.location(&f).await },
+                    move |this, res, cx| match res {
+                        Ok(dir) => finish(this, dir, cx),
+                        Err(e) => this.notice(
+                            format!("opencode can't open {}: {e:#}", folder.display()),
+                            cx,
+                        ),
+                    },
+                );
+            }
+            None => finish(self, folder, cx),
+        }
+    }
+
+    /// Hide a folder from the sidebar (its sessions are kept on the server).
+    pub fn remove_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        self.settings.folders.retain(|f| f != &folder);
+        self.settings.collapsed.retain(|f| f != &folder);
+        self.save_settings();
+        let folders = self.settings.folders.clone();
+        let selected_in_folder = {
+            let s = self.store.read(cx);
+            s.selected
+                .as_ref()
+                .and_then(|id| s.session(id))
+                .is_some_and(|s| s.directory == folder)
+        };
+        if selected_in_folder {
+            self.select_session(None, cx);
+        }
+        self.store.update(cx, |s, cx| s.set_folders(folders, cx));
+    }
+
+    pub fn toggle_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        self.store
+            .update(cx, |s, cx| s.toggle_collapsed(&folder, cx));
+        self.settings.collapsed = self.store.read(cx).collapsed.iter().cloned().collect();
+        self.save_settings();
     }
 
     pub fn delete_session(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(api) = self.api(cx) else { return };
+        let Some(dir) = self
+            .store
+            .read(cx)
+            .session(&id)
+            .map(|s| s.directory.clone())
+        else {
+            return;
+        };
         let sid = id.clone();
         self.run(
             cx,
-            async move { api.delete_session(&sid).await },
+            async move { api.delete_session(&sid, &dir).await },
             move |this, res, cx| match res {
-                Ok(_) => this.store.update(cx, |s, cx| {
-                    s.apply(Event::SessionDeleted { session_id: id }, cx)
+                Ok(()) => this.store.update(cx, |s, cx| {
+                    s.apply(Envelope::bare(Event::SessionDeleted { session_id: id }), cx)
                 }),
                 Err(e) => this.notice(format!("Could not delete session: {e:#}"), cx),
             },
@@ -397,32 +534,54 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
+        let Some(dir) = self
+            .store
+            .read(cx)
+            .session(&id)
+            .map(|s| s.directory.clone())
+        else {
+            return;
+        };
+        // The server confirms with session.updated on the stream.
         self.run(
             cx,
-            async move { api.rename_session(&id, &title).await },
-            |this, res, cx| match res {
-                Ok(session) => this
-                    .store
-                    .update(cx, |s, cx| s.apply(Event::SessionUpserted(session), cx)),
-                Err(e) => this.notice(format!("Could not rename session: {e:#}"), cx),
+            async move { api.rename_session(&id, &dir, &title).await },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    this.notice(format!("Could not rename session: {e:#}"), cx);
+                }
             },
         );
     }
 
-    /// Send a prompt to the selected session, creating one first if needed.
+    /// Send a prompt to the selected session, creating one in the target
+    /// folder first if nothing is selected.
     pub fn send_prompt(&mut self, text: String, cx: &mut Context<Self>) {
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        let selected = self.store.read(cx).selected.clone();
+        let store = self.store.read(cx);
+        let selected = store.selected.clone();
+        if selected
+            .as_ref()
+            .and_then(|id| store.conversations.get(id))
+            .is_some_and(|c| c.legacy)
+        {
+            self.notice("This session was created by an older opencode client and is read-only here. Start a new session to continue.", cx);
+            return;
+        }
+        let Some(folder) = store.target_folder() else {
+            self.notice("Add a folder first", cx);
+            return;
+        };
         if let Some(sid) = &selected {
             // Flip to busy right away so the composer shows Stop; the server
-            // confirms with session.status within milliseconds.
+            // confirms with session.next.prompted within milliseconds.
             self.store.update(cx, |s, cx| {
                 s.clear_error(sid);
-                s.set_status(sid, RunState::Busy, cx);
+                s.set_busy(sid, true, cx);
             });
         }
         self.run(
@@ -431,26 +590,25 @@ impl Controller {
                 let (sid, created) = match selected {
                     Some(sid) => (sid, None),
                     None => {
-                        let s = api.create_session().await?;
+                        let s = api.create_session(&folder).await?;
                         (s.id.clone(), Some(s))
                     }
                 };
-                api.prompt_text(&sid, &text).await?;
+                api.prompt(&sid, &text).await?;
                 Ok((sid, created))
             },
             |this, res, cx| match res {
                 Ok((sid, Some(session))) => {
                     this.store.update(cx, |s, cx| {
-                        s.apply(Event::SessionUpserted(session), cx);
-                        s.set_status(&sid, RunState::Busy, cx);
+                        s.apply(Envelope::bare(Event::SessionUpserted(session)), cx);
+                        s.set_busy(&sid, true, cx);
                     });
                     this.select_session(Some(sid), cx);
                 }
                 Ok(_) => {}
                 Err(e) => {
                     if let Some(sid) = this.store.read(cx).selected.clone() {
-                        this.store
-                            .update(cx, |s, cx| s.set_status(&sid, RunState::Idle, cx));
+                        this.store.update(cx, |s, cx| s.set_busy(&sid, false, cx));
                     }
                     this.notice(format!("Could not send prompt: {e:#}"), cx);
                 }
@@ -463,14 +621,21 @@ impl Controller {
             return;
         };
         let Some(api) = self.api(cx) else { return };
-        self.run(cx, async move { api.abort(&sid).await }, |this, res, cx| {
-            if let Err(e) = res {
-                this.notice(format!("Could not abort: {e:#}"), cx);
-            }
-        });
+        self.run(
+            cx,
+            {
+                let sid = sid.clone();
+                async move { api.interrupt(&sid).await }
+            },
+            move |this, res, cx| match res {
+                Ok(()) => this.confirm_running(sid, cx),
+                Err(e) => this.notice(format!("Could not stop: {e:#}"), cx),
+            },
+        );
     }
 
-    /// Debug/verification hook: send `text` once connected (OCDESK_PROBE_PROMPT).
+    /// Verification hook: send `text` in a new session once connected
+    /// (OCDESK_PROBE_PROMPT).
     pub fn probe_on_connect(&mut self, text: String, cx: &mut Context<Self>) {
         let store = self.store.clone();
         let mut text = Some(text);
@@ -491,9 +656,19 @@ impl Drop for Controller {
     }
 }
 
-pub fn default_working_dir() -> Result<PathBuf> {
-    Ok(match std::env::var_os("OCDESK_DIR") {
-        Some(d) => PathBuf::from(d),
-        None => std::env::current_dir()?,
-    })
+/// The folder to open at startup: `ocdesk <folder>`, else `OCDESK_DIR`.
+/// On first run only (no saved folders), the launch directory when started
+/// from a terminal; an app bundle starts in `/`.
+pub fn initial_folder(have_folders: bool) -> Option<PathBuf> {
+    if let Some(arg) = std::env::args_os().nth(1) {
+        return Some(PathBuf::from(arg));
+    }
+    if let Some(d) = std::env::var_os("OCDESK_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    if have_folders {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    (cwd != std::path::Path::new("/") && Some(&cwd) != dirs::home_dir().as_ref()).then_some(cwd)
 }

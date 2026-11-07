@@ -1,0 +1,143 @@
+{
+ "data": [
+  {
+   "id": "msg_1b57f1e7e001jtt9AZOCHVbmnS",
+   "time": {
+    "created": 1794046369406,
+    "completed": 1794046370059
+   },
+   "type": "assistant",
+   "agent": "build",
+   "model": {
+    "id": "mock-1",
+    "providerID": "mock",
+    "variant": "default"
+   },
+   "content": [
+    {
+     "type": "reasoning",
+     "id": "reasoning-0",
+     "text": "Thinking about the tool output.",
+     "time": {
+      "created": 1794046369410,
+      "completed": 1794046369569
+     }
+    },
+    {
+     "type": "text",
+     "id": "text-0",
+     "text": "The tool finished. Output was:\n\n```\nhello-from-bash\nopencode.json\n\nCommand exited with code 0.\n```\n"
+    }
+   ],
+   "snapshot": {
+    "start": "b6348aaef47e615edf6f2bd73ce518f521d1ffeb",
+    "end": "b6348aaef47e615edf6f2bd73ce518f521d1ffeb",
+    "files": []
+   },
+   "finish": "stop",
+   "cost": 0,
+   "tokens": {
+    "input": 10,
+    "output": 20,
+    "reasoning": 0,
+    "cache": {
+     "read": 0,
+     "write": 0
+    }
+   }
+  },
+  {
+   "id": "msg_1b57f197b001HtL7G8cQFhKz1e",
+   "time": {
+    "created": 1794046368123,
+    "completed": 1794046369087
+   },
+   "type": "assistant",
+   "agent": "build",
+   "model": {
+    "id": "mock-1",
+    "providerID": "mock",
+    "variant": "default"
+   },
+   "content": [
+    {
+     "type": "reasoning",
+     "id": "reasoning-0",
+     "text": "I should run a command.",
+     "time": {
+      "created": 1794046368126,
+      "completed": 1794046368271
+     }
+    },
+    {
+     "type": "text",
+     "id": "text-0",
+     "text": "Running a command.\n"
+    },
+    {
+     "type": "tool",
+     "id": "call_1794046368360",
+     "name": "bash",
+     "provider": {
+      "executed": false
+     },
+     "state": {
+      "status": "completed",
+      "input": {
+       "command": "echo hello-from-bash && ls | head -5",
+       "description": "Say hello and list files"
+      },
+      "content": [
+       {
+        "type": "text",
+        "text": "hello-from-bash\nopencode.json\n"
+       },
+       {
+        "type": "text",
+        "text": "Command exited with code 0."
+       }
+      ],
+      "outputPaths": [],
+      "structured": {
+       "exit": 0,
+       "truncated": false
+      }
+     },
+     "time": {
+      "created": 1794046368363,
+      "ran": 1794046368612,
+      "completed": 1794046369066
+     }
+    }
+   ],
+   "snapshot": {
+    "start": "b6348aaef47e615edf6f2bd73ce518f521d1ffeb",
+    "end": "b6348aaef47e615edf6f2bd73ce518f521d1ffeb",
+    "files": []
+   },
+   "finish": "tool-calls",
+   "cost": 0,
+   "tokens": {
+    "input": 10,
+    "output": 20,
+    "reasoning": 0,
+    "cache": {
+     "read": 0,
+     "write": 0
+    }
+   }
+  },
+  {
+   "id": "msg_1b57f17b30016Z1tc1ZlZat2HV",
+   "time": {
+    "created": 1794046367668
+   },
+   "text": "tool:bash please",
+   "type": "user"
+  }
+ ],
+ "cursor": {
+  "previous": "eyJpZCI6Im1zZ18xYjU3ZjFlN2UwMDFqdHQ5QVpPQ0hWYm1uUyIsIm9yZGVyIjoiZGVzYyIsImRpcmVjdGlvbiI6InByZXZpb3VzIn0",
+  "next": "eyJpZCI6Im1zZ18xYjU3ZjE3YjMwMDE2WjF0YzFabFphdDJIViIsIm9yZGVyIjoiZGVzYyIsImRpcmVjdGlvbiI6Im5leHQifQ"
+ }
+}

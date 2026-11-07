@@ -65,3 +65,9 @@ the new Zed rev.
 - `.SystemUIFont` falls back to DejaVu Sans on a bare Linux box.
 - A clean build of the gpui stack takes ~10 min in this container; keep
   `[profile.dev.package."*"] opt-level = 2` so dependencies are fast in debug.
+- `cx.prompt_for_paths(PathPromptOptions { directories: true, .. })` is the
+  native folder picker. On Linux it goes through xdg-desktop-portal over
+  D-Bus; without a session bus it fails with a ZBus error, so ocdesk falls
+  back to a typed-path dialog.
+- Theme: `Theme::change(ThemeMode::Dark, Some(window), cx)` at startup;
+  `Theme::sync_system_appearance` + `observe_window_appearance` to follow the OS.

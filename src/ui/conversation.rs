@@ -2,14 +2,16 @@
 //! With no session selected it shows a centered Codex-style start screen.
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::api::events::RunState;
 use crate::controller::Controller;
 use crate::store::{Store, StoreEvent};
 use crate::ui::composer::Composer;
+use crate::ui::folder_name;
 use crate::ui::message::{COLUMN_MAX_W, render_message};
 
 pub struct ConversationView {
@@ -57,7 +59,7 @@ impl ConversationView {
         let selected = self.store.read(cx).selected.clone();
         let is_selected = |sid: &String| selected.as_ref() == Some(sid);
         match ev {
-            StoreEvent::SelectionChanged => {
+            StoreEvent::SelectionChanged | StoreEvent::FoldersChanged => {
                 let n = self.row_count(cx);
                 self.scroller.update(cx, |s, cx| s.reset(n, cx));
                 Composer::focus(&self.composer, window, cx);
@@ -70,12 +72,6 @@ impl ConversationView {
                 let i = *index;
                 self.scroller.update(cx, |s, cx| {
                     s.splice(i..i, 1, cx);
-                });
-            }
-            StoreEvent::MessageRemoved { session_id, index } if is_selected(session_id) => {
-                let i = *index;
-                self.scroller.update(cx, |s, cx| {
-                    s.splice(i..i + 1, 0, cx);
                 });
             }
             StoreEvent::MessageChanged { session_id, index } if is_selected(session_id) => {
@@ -92,11 +88,50 @@ impl ConversationView {
 
     fn render_start(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let dir = self.controller.read(cx).working_dir().clone();
-        let project = dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| dir.display().to_string());
+        let store = self.store.read(cx);
+        let folders = store.folders.clone();
+        let current = store.target_folder();
+        let controller = self.controller.clone();
+
+        let chooser = if folders.is_empty() {
+            Button::new("start-add-folder")
+                .label("Add a folder to start")
+                .icon(IconName::Folder)
+                .primary()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    crate::ui::add_folder(this.controller.clone(), window, cx);
+                }))
+                .into_any_element()
+        } else {
+            Button::new("folder-chooser")
+                .label(current.as_deref().map(folder_name).unwrap_or_default())
+                .icon(IconName::Folder)
+                .ghost()
+                .small()
+                .dropdown_caret(true)
+                .dropdown_menu(move |mut menu, _, _| {
+                    for f in &folders {
+                        let (c, f2) = (controller.clone(), f.clone());
+                        menu = menu.item(
+                            PopupMenuItem::new(folder_name(f))
+                                .checked(current.as_ref() == Some(f))
+                                .on_click(move |_, _, cx| {
+                                    let f = f2.clone();
+                                    c.update(cx, |c, cx| c.new_session(Some(f), cx));
+                                }),
+                        );
+                    }
+                    let c = controller.clone();
+                    menu.separator()
+                        .item(
+                            PopupMenuItem::new("Add folder…").on_click(move |_, window, cx| {
+                                crate::ui::add_folder(c.clone(), window, cx);
+                            }),
+                        )
+                })
+                .into_any_element()
+        };
+
         v_flex()
             .size_full()
             .items_center()
@@ -114,27 +149,38 @@ impl ConversationView {
                             .child("What should we build?"),
                     )
                     .child(
-                        h_flex()
-                            .gap_1p5()
+                        div()
                             .text_sm()
                             .text_color(theme.muted_foreground)
-                            .child(Icon::new(IconName::Folder).xsmall())
-                            .child(project),
+                            .child(chooser),
                     ),
             )
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(COLUMN_MAX_W))
-                    .child(self.composer.clone()),
-            )
+            .when(store.target_folder().is_some(), |el| {
+                el.child(
+                    div()
+                        .w_full()
+                        .max_w(px(COLUMN_MAX_W))
+                        .child(self.composer.clone()),
+                )
+            })
     }
 
     fn render_status(&self, cx: &App) -> Option<AnyElement> {
         let theme = cx.theme();
         let s = self.store.read(cx);
         let sid = s.selected.as_ref()?;
-        if let Some(RunState::Retry { attempt, message }) = s.status.get(sid) {
+        if s.selected_conversation().is_some_and(|c| c.legacy) {
+            return Some(
+                h_flex()
+                    .gap_1p5()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(Icon::new(IconName::Info).xsmall())
+                    .child("Created by an older opencode client: read-only here. Start a new session to continue.")
+                    .into_any_element(),
+            );
+        }
+        if let Some((attempt, message)) = s.retry.get(sid) {
             return Some(
                 h_flex()
                     .gap_1p5()
@@ -146,9 +192,6 @@ impl ConversationView {
             );
         }
         let err = s.errors.get(sid)?;
-        if err == "Aborted" {
-            return None;
-        }
         Some(
             h_flex()
                 .gap_1p5()
@@ -166,11 +209,9 @@ impl Render for ConversationView {
         let theme = cx.theme().clone();
         let store = self.store.read(cx);
         let notice = store.notice.clone();
-        let title = store
-            .selected
-            .as_ref()
-            .and_then(|id| store.session(id))
-            .map(|s| s.title.clone());
+        let session = store.selected.as_ref().and_then(|id| store.session(id));
+        let title = session.map(|s| s.display_title());
+        let folder = session.map(|s| folder_name(&s.directory));
         let has_selection = store.selected.is_some();
 
         let notice_bar = notice.map(|n| {
@@ -251,6 +292,11 @@ impl Render for ConversationView {
                     .items_center()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
+                    .gap_1p5()
+                    .when_some(folder, |el, f| {
+                        el.child(div().text_color(theme.muted_foreground).child(f))
+                            .child(div().text_color(theme.muted_foreground).child("/"))
+                    })
                     .child(div().truncate().child(title.unwrap_or_default())),
             )
             .children(notice_bar)
