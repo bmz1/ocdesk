@@ -393,6 +393,7 @@ impl Sidebar {
         let store = self.store.read(cx);
         let id = s.id.clone();
         let is_selected = store.selected.as_deref() == Some(&id);
+        let unread = store.unread.contains(&id);
         let busy = store.is_busy(&id);
         let waiting = store.permissions.get(&id).map_or(0, Vec::len);
         let group: SharedString = format!("session-row-{key}").into();
@@ -423,6 +424,9 @@ impl Sidebar {
                 this.controller
                     .update(cx, |c, cx| c.select_session(Some(id), cx));
             }))
+            .when(unread, |el| {
+                el.child(div().text_color(theme.primary).child("●"))
+            })
             .child(div().flex_1().min_w_0().truncate().child(title))
             .child(if waiting > 0 {
                 div()
@@ -557,6 +561,7 @@ impl Render for Sidebar {
                         )
                     }),
             )
+            .child(Button::new("open-settings").label("Settings").ghost().small().on_click(cx.listener(|this,_,window,cx|crate::ui::settings::open(this.controller.clone(),window,cx))))
             .child(self.render_connection(cx))
     }
 }

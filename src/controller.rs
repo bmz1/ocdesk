@@ -6,6 +6,8 @@
 //! locations. All network work runs on the Tokio runtime; results come back
 //! to the GPUI thread through channels awaited in `cx.spawn` tasks.
 
+mod features;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -73,6 +75,10 @@ pub struct Controller {
     /// Bumped on every sidecar (re)start so stale callbacks can be ignored.
     generation: u64,
     connection_epoch: u64,
+    grant_requests: u64,
+    mode_requests: std::collections::HashMap<String, u64>,
+    usage_revision: std::collections::HashMap<String, u64>,
+    attention_seen: std::collections::HashSet<String>,
     diff_requests: std::collections::HashMap<String, u64>,
     pump: Option<(tokio::task::AbortHandle, Task<()>)>,
     exit_watch: Option<Task<()>>,
@@ -113,6 +119,8 @@ impl Controller {
         let (draft_model, draft_agent) =
             (settings.draft_model.clone(), settings.draft_agent.clone());
         store.update(cx, |s, cx| {
+            s.preferences = settings.clone();
+            s.unread = settings.unread.clone();
             s.collapsed = collapsed.into_iter().collect();
             s.draft_model = draft_model;
             s.draft_agent = draft_agent;
@@ -126,6 +134,10 @@ impl Controller {
             generation: 0,
             connection_epoch: 0,
             diff_requests: Default::default(),
+            mode_requests: Default::default(),
+            grant_requests: 0,
+            usage_revision: Default::default(),
+            attention_seen: Default::default(),
             pump: None,
             exit_watch: None,
             recent_crashes: Vec::new(),
@@ -135,6 +147,8 @@ impl Controller {
             restore_session,
             save_seq: 0,
         };
+        let folder = this.store.read(cx).target_folder();
+        this.apply_draft_defaults(folder.as_deref(), cx);
         this.save_settings();
         if let Some(turns) = crate::demo::turns() {
             this.demo = true;
@@ -175,6 +189,10 @@ impl Controller {
         if self.settings == before {
             return;
         }
+        self.store.update(cx, |s, cx| {
+            s.preferences = self.settings.clone();
+            cx.notify();
+        });
         self.save_seq += 1;
         let seq = self.save_seq;
         let exec = cx.background_executor().clone();
@@ -223,6 +241,10 @@ impl Controller {
             s.permission_sending.clear();
             s.form_sending.clear();
             s.diff_loading.clear();
+            s.mode_sending.clear();
+            s.usage_loading.clear();
+            s.grant_sending.clear();
+            s.saved_grants_loading = false;
             cx.notify();
         });
         self.stop_pump();
@@ -352,6 +374,7 @@ impl Controller {
     }
 
     fn on_event(&mut self, env: Envelope, cx: &mut Context<Self>) {
+        self.product_event(&env, cx);
         match env.event {
             Event::Connected => {
                 self.connection_epoch += 1;
@@ -394,6 +417,7 @@ impl Controller {
 
     /// A turn finished (`session.execution.succeeded|failed|interrupted`).
     fn on_turn_over(&mut self, _session_id: String, cx: &mut Context<Self>) {
+        self.refresh_usage(_session_id.clone(), cx);
         let reload = self
             .store
             .update(cx, |s, _| s.needs_reload.remove(&_session_id));
@@ -444,6 +468,8 @@ impl Controller {
             self.store.read(cx).permissions.keys().cloned().collect();
         pending_sessions.extend(self.store.read(cx).forms.keys().cloned());
         if let Some(id) = selected {
+            self.refresh_session_mode(id.clone(), cx);
+            self.refresh_usage(id.clone(), cx);
             pending_sessions.insert(id.clone());
             self.refresh_inbox(id.clone(), cx);
             self.refresh_tasks(id.clone(), cx);
@@ -1278,9 +1304,25 @@ impl Controller {
             cx.notify();
         });
         let id = sid.clone();
+        let mode = self
+            .store
+            .read(cx)
+            .review
+            .get(&sid)
+            .cloned()
+            .unwrap_or_default();
+        let base = self.store.read(cx).review_base.get(&sid).cloned();
+        let Some(dir) = self
+            .store
+            .read(cx)
+            .session(&sid)
+            .map(|s| s.directory.clone())
+        else {
+            return;
+        };
         self.run(
             cx,
-            async move { api.diff(&id).await },
+            async move { api.review_diff(&id, &dir, &mode, base.as_deref()).await },
             move |this, res, cx| {
                 if this.generation != generation || this.diff_requests.get(&sid) != Some(&request) {
                     return;
@@ -1326,7 +1368,10 @@ impl Controller {
         self.store.update(cx, |s, cx| s.select(id.clone(), cx));
         let last = id.clone();
         self.update_settings(cx, |s| s.last_session = last);
+        self.mark_selected_read(cx);
         if let Some(id) = id {
+            self.refresh_session_mode(id.clone(), cx);
+            self.refresh_usage(id.clone(), cx);
             self.refresh_permissions(id.clone(), cx);
             self.refresh_forms(id.clone(), cx);
             self.refresh_inbox(id.clone(), cx);
@@ -1341,6 +1386,7 @@ impl Controller {
     pub fn new_session(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
         let folder = folder.or_else(|| self.store.read(cx).target_folder());
         self.select_session(None, cx);
+        self.apply_draft_defaults(folder.as_deref(), cx);
         if let Some(f) = folder {
             self.store.update(cx, |s, cx| s.set_current_folder(f, cx));
         }
@@ -1451,7 +1497,7 @@ impl Controller {
     /// model/agent before its first prompt.
     pub fn send_prompt(&mut self, mut input: PromptInput, cx: &mut Context<Self>) {
         input.text = input.text.trim_end().to_string();
-        if input.text.trim().is_empty() {
+        if input.text.trim().is_empty() && input.attachments.is_empty() && input.files.is_empty() {
             return;
         }
         self.submit(Submission::Prompt(input), cx);
@@ -1493,6 +1539,9 @@ impl Controller {
             self.notice("Add a folder first", cx);
             return;
         };
+        let permission_mode = store
+            .draft_permission
+            .unwrap_or_else(|| self.settings.permission_for(&folder));
         let was_busy = selected.as_ref().is_some_and(|sid| store.is_busy(sid));
         if let Some(sid) = &selected
             && !was_busy
@@ -1511,6 +1560,7 @@ impl Controller {
                     Some(sid) => (sid, None),
                     None => {
                         let mut s = api.create_session(&folder).await?;
+                        api.set_session_mode(&s.id, permission_mode).await?;
                         if let Some(m) = &draft_model {
                             api.switch_model(&s.id, m).await?;
                             s.model = Some(m.clone());

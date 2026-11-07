@@ -121,6 +121,9 @@ impl MentionPopup {
 }
 
 pub struct Composer {
+    attachments: Vec<std::path::PathBuf>,
+    attachment_drafts: HashMap<Option<String>, Vec<std::path::PathBuf>>,
+    attachment_writes: usize,
     input: Entity<TextareaState>,
     controller: Entity<Controller>,
     store: Entity<Store>,
@@ -142,6 +145,15 @@ pub struct Composer {
     placeholder_busy: bool,
     _subs: Vec<Subscription>,
 }
+
+fn draft_scope(store: &Store) -> Option<String> {
+    store.selected.clone().or_else(|| {
+        store
+            .target_folder()
+            .map(|f| format!("draft:{}", f.display()))
+    })
+}
+mod attachments;
 
 impl Composer {
     pub fn new(
@@ -181,8 +193,11 @@ impl Composer {
                 cx.notify();
             }),
         ];
-        let draft_key = store.read(cx).selected.clone();
+        let draft_key = draft_scope(store.read(cx));
         Self {
+            attachments: Vec::new(),
+            attachment_drafts: HashMap::new(),
+            attachment_writes: 0,
             input,
             controller,
             store,
@@ -202,12 +217,15 @@ impl Composer {
     /// On selection change, park the box's text under the old session and
     /// bring back the new one's, so a draft never goes to the wrong session.
     fn swap_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selected = self.store.read(cx).selected.clone();
+        let selected = draft_scope(self.store.read(cx));
         if selected == self.draft_key {
             return;
         }
         let text = self.input.read(cx).value().to_string();
         let old = std::mem::replace(&mut self.draft_key, selected.clone());
+        self.attachment_drafts
+            .insert(old.clone(), std::mem::take(&mut self.attachments));
+        self.attachments = self.attachment_drafts.remove(&selected).unwrap_or_default();
         if text.trim().is_empty() {
             self.drafts.remove(&old);
         } else {
@@ -240,7 +258,11 @@ impl Composer {
             Delivery::Steer
         });
         let content = self.input.read(cx).content();
-        if content.text().trim().is_empty() {
+        if self.attachment_writes > 0 {
+            self.attachment_notice("Wait for the pasted attachment to finish saving", cx);
+            return;
+        }
+        if content.text().trim().is_empty() && self.attachments.is_empty() {
             return;
         }
         let Some(folder) = self.store.read(cx).target_folder() else {
@@ -255,7 +277,7 @@ impl Composer {
                 .and_then(|f| store.tooling.get(&f))
                 .is_some_and(|t| t.commands.iter().any(|c| c.name == name));
             let (name, rest) = (name.to_string(), rest.to_string());
-            if known || (name == "compact" && rest.is_empty()) {
+            if (known || (name == "compact" && rest.is_empty())) && self.attachments.is_empty() {
                 self.sent.push(text.trim().to_string());
                 self.history.reset();
                 self.close_mention(cx);
@@ -278,6 +300,21 @@ impl Composer {
                 .map(|t| (t.range(), t.token().id().as_ref())),
             &folder,
         );
+        if input.files.len() + self.attachments.len() > 100 {
+            self.attachment_notice(
+                "A prompt can contain at most 100 files, including @ mentions",
+                cx,
+            );
+            return;
+        }
+        if let Some(missing) = self.attachments.iter().find(|p| !p.is_file()) {
+            self.attachment_notice(
+                format!("Attachment is no longer readable: {}", missing.display()),
+                cx,
+            );
+            return;
+        }
+        input.attachments = std::mem::take(&mut self.attachments);
         input.delivery = delivery;
         self.sent.push(input.text.trim().to_string());
         self.history.reset();
@@ -323,6 +360,19 @@ impl Composer {
         } else {
             format!("{}\n{current}", item.text)
         };
+        let paths: Vec<_> = item.attachments.iter().filter_map(|a| a.path()).collect();
+        if paths.len() != item.attachments.len() {
+            self.attachment_notice(
+                "Cannot edit this queued prompt: some attachments have no local file URI",
+                cx,
+            );
+            return;
+        }
+        if paths.iter().any(|p| !p.is_file()) || paths.len() + self.attachments.len() > 100 {
+            self.attachment_notice("Cannot edit this queued prompt: files are missing or the draft would exceed 100 attachments",cx);
+            return;
+        }
+        self.add_attachments(paths, cx);
         self.set_text(&text, window, cx);
         self.controller
             .update(cx, |c, cx| c.cancel_inbox(sid, item.id, cx));
@@ -342,68 +392,75 @@ impl Composer {
             return None;
         }
         let theme = cx.theme().clone();
-        let rows = items.into_iter().enumerate().map(|(ix, item)| {
-            let queued = item.delivery == Delivery::Queue;
-            let (sid_s, sid_r) = (sid.clone(), sid.clone());
-            let (id_s, id_r) = (item.id.clone(), item.id.clone());
-            let edit_item = item.clone();
-            h_flex()
-                .id(SharedString::from(format!("pending-{ix}")))
-                .w_full()
-                .gap_2()
-                .px_2()
-                .py_1()
-                .rounded_lg()
-                .bg(theme.secondary.opacity(0.6))
-                .text_sm()
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(if queued {
-                            theme.muted_foreground
+        let rows =
+            items.into_iter().enumerate().map(|(ix, item)| {
+                let queued = item.delivery == Delivery::Queue;
+                let (sid_s, sid_r) = (sid.clone(), sid.clone());
+                let (id_s, id_r) = (item.id.clone(), item.id.clone());
+                let edit_item = item.clone();
+                h_flex()
+                    .id(SharedString::from(format!("pending-{ix}")))
+                    .w_full()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_lg()
+                    .bg(theme.secondary.opacity(0.6))
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(if queued {
+                                theme.muted_foreground
+                            } else {
+                                theme.primary
+                            })
+                            .child(if queued { "Queued" } else { "Steering" }),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(
+                        if item.attachments.is_empty() {
+                            item.text.clone()
                         } else {
-                            theme.primary
-                        })
-                        .child(if queued { "Queued" } else { "Steering" }),
-                )
-                .child(div().flex_1().min_w_0().truncate().child(item.text.clone()))
-                .when(queued, |el| {
-                    el.child(
-                        Button::new(SharedString::from(format!("pending-steer-{ix}")))
-                            .label("Steer now")
+                            format!("{} · {} attachments", item.text, item.attachments.len())
+                        },
+                    ))
+                    .when(queued, |el| {
+                        el.child(
+                            Button::new(SharedString::from(format!("pending-steer-{ix}")))
+                                .label("Steer now")
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Deliver at the next step instead of after the turn")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let (sid, id) = (sid_s.clone(), id_s.clone());
+                                    this.controller.update(cx, |c, cx| c.steer_now(sid, id, cx));
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new(SharedString::from(format!("pending-edit-{ix}")))
+                            .icon(crate::ui::icons::pencil())
                             .ghost()
                             .xsmall()
-                            .tooltip("Deliver at the next step instead of after the turn")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let (sid, id) = (sid_s.clone(), id_s.clone());
-                                this.controller.update(cx, |c, cx| c.steer_now(sid, id, cx));
+                            .tooltip("Edit (takes it back)")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_pending(edit_item.clone(), window, cx);
                             })),
                     )
-                })
-                .child(
-                    Button::new(SharedString::from(format!("pending-edit-{ix}")))
-                        .icon(crate::ui::icons::pencil())
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Edit (takes it back)")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.edit_pending(edit_item.clone(), window, cx);
-                        })),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("pending-remove-{ix}")))
-                        .icon(IconName::Close)
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Remove")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let (sid, id) = (sid_r.clone(), id_r.clone());
-                            this.controller
-                                .update(cx, |c, cx| c.cancel_inbox(sid, id, cx));
-                        })),
-                )
-        });
+                    .child(
+                        Button::new(SharedString::from(format!("pending-remove-{ix}")))
+                            .icon(IconName::Close)
+                            .ghost()
+                            .xsmall()
+                            .tooltip("Remove")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let (sid, id) = (sid_r.clone(), id_r.clone());
+                                this.controller
+                                    .update(cx, |c, cx| c.cancel_inbox(sid, id, cx));
+                            })),
+                    )
+            });
         Some(v_flex().gap_1().children(rows).into_any_element())
     }
 
@@ -704,7 +761,7 @@ impl Composer {
 
     fn render_mention(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let m = self.mention.as_ref()?;
-        let theme = cx.theme();
+        let theme = cx.theme().clone();
         let rows: Vec<AnyElement> = m
             .items()
             .enumerate()
@@ -815,6 +872,35 @@ impl Composer {
         let controller = self.controller.clone();
         let mut row = h_flex().gap_0p5().items_center().min_w_0();
 
+        let selected = store.selected.clone();
+        let mode = selected
+            .as_ref()
+            .and_then(|sid| store.session_modes.get(sid).copied().flatten());
+        let label = if let Some(sid) = &selected {
+            if store.mode_sending.contains(sid) {
+                "Saving permissions…"
+            } else if !store.session_modes.contains_key(sid) {
+                "Permissions…"
+            } else {
+                mode.map(|m| m.label()).unwrap_or("Custom permissions")
+            }
+        } else {
+            store
+                .draft_permission
+                .unwrap_or_else(|| {
+                    store
+                        .target_folder()
+                        .map(|f| store.preferences.permission_for(&f))
+                        .unwrap_or_default()
+                })
+                .label()
+        };
+        let c = controller.clone();
+        row=row.child(Button::new("permission-mode").label(label).ghost().xsmall().tooltip("Session permissions; saved project grants still apply. Manage saved grants in Settings.")
+            .disabled(selected.as_ref().is_some_and(|sid|store.mode_sending.contains(sid)) || store.connection()!=Connection::Connected)
+            .dropdown_menu(move|mut menu,_,_|{
+                for mode in crate::settings::PermissionMode::ALL{let c=c.clone();menu=menu.item(PopupMenuItem::new(mode.label()).on_click(move|_,_,cx|c.update(cx,|c,cx|c.set_permission_mode(mode,cx))));}menu
+            }));
         // Agent.
         let primary: Vec<_> = catalog
             .agents
@@ -969,7 +1055,7 @@ impl Render for Composer {
                 .update(cx, |i, cx| i.set_placeholder(text, window, cx));
         }
         let connected = self.store.read(cx).connection() == Connection::Connected;
-        let empty = self.input.read(cx).value().trim().is_empty();
+        let empty = self.input.read(cx).value().trim().is_empty() && self.attachments.is_empty();
         let focused = self
             .input
             .read(cx)
@@ -979,7 +1065,7 @@ impl Render for Composer {
         let popup = self.render_mention(cx);
         let pending = self.render_pending(cx);
         let pickers = self.render_pickers(cx);
-        let theme = cx.theme();
+        let theme = cx.theme().clone();
 
         let send = Button::new("send")
             .icon(IconName::ArrowUp)
@@ -991,7 +1077,7 @@ impl Render for Composer {
             } else {
                 "Send (Enter)"
             })
-            .disabled(empty || !connected)
+            .disabled(empty || !connected || self.attachment_writes > 0)
             .on_click(cx.listener(|this, _, window, cx| this.submit(false, window, cx)));
         let stop = busy.then(|| {
             Button::new("stop")
@@ -1013,7 +1099,12 @@ impl Render for Composer {
             None
         };
 
+        let paste_target = cx.weak_entity();
+        let attachment_chips = self.render_attachments(cx);
         v_flex()
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.add_attachments(paths.paths().to_vec(), cx);
+            }))
             .relative()
             .w_full()
             .rounded_3xl()
@@ -1074,19 +1165,55 @@ impl Render for Composer {
             // The textarea binds secondary-. to code actions (unused here);
             // claim it for the app-wide Stop shortcut.
             .capture_action(cx.listener(|this, _: &ToggleCodeActions, _, cx| {
-                this.controller.update(cx, |c, cx| c.abort_if_busy(cx));
-                cx.stop_propagation();
+                let prefs = &this.store.read(cx).preferences;
+                if prefs
+                    .keybindings
+                    .get("ocdesk::StopTurn")
+                    .is_none_or(|k| k == "secondary-.")
+                {
+                    this.controller.update(cx, |c, cx| c.abort_if_busy(cx));
+                    cx.stop_propagation();
+                }
             }))
             .capture_action(cx.listener(|this, _: &MoveLeft, _, cx| this.close_mention(cx)))
             .capture_action(cx.listener(|this, _: &MoveRight, _, cx| this.close_mention(cx)))
             .children(pending)
-            .child(Textarea::new(&self.input).appearance(false))
+            .child(crate::ui::usage::meter(
+                self.store.read(cx),
+                self.controller.clone(),
+                cx,
+            ))
+            .child(attachment_chips)
+            .child(
+                Textarea::new(&self.input)
+                    .appearance(false)
+                    .on_paste(move |item, _, cx| {
+                        paste_target
+                            .update(cx, |this, cx| this.paste_attachments(item, cx))
+                            .unwrap_or(false)
+                    }),
+            )
             .child(
                 h_flex()
                     .justify_between()
                     .items_center()
                     .gap_2()
-                    .child(pickers)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Button::new("attach-files")
+                                    .label("+")
+                                    .ghost()
+                                    .small()
+                                    .tooltip("Attach files or images (up to 100)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.pick_attachments(window, cx)
+                                    })),
+                            )
+                            .child(pickers),
+                    )
                     .child(
                         h_flex()
                             .gap_2()

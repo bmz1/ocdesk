@@ -158,6 +158,22 @@ impl Catalog {
 
 #[derive(Default)]
 pub struct Store {
+    pub saved_grants: Vec<crate::api::features::SavedGrant>,
+    pub saved_grants_loading: bool,
+    pub saved_grants_error: Option<String>,
+    pub grant_sending: HashSet<String>,
+    pub preferences: crate::settings::Settings,
+    pub unread: std::collections::BTreeSet<String>,
+    pub window_active: bool,
+    pub draft_permission: Option<crate::settings::PermissionMode>,
+    pub session_modes: HashMap<String, Option<crate::settings::PermissionMode>>,
+    pub mode_sending: HashSet<String>,
+    pub usage: HashMap<String, crate::api::features::UsageReport>,
+    pub usage_loading: HashSet<String>,
+    pub usage_errors: HashMap<String, String>,
+    pub review_base: HashMap<String, String>,
+    pub review: HashMap<String, crate::api::features::ReviewMode>,
+    pub commits: HashMap<String, Vec<crate::api::features::CommitSummary>>,
     /// The user's folders, in sidebar order. Each is an opencode location.
     pub folders: Vec<PathBuf>,
     pub collapsed: HashSet<PathBuf>,
@@ -514,6 +530,7 @@ impl Store {
                             session_id: sid,
                             message_id: id,
                             text: item.text,
+                            attachments: item.attachments,
                         };
                         M7::Continue(out)
                     }
@@ -1024,7 +1041,10 @@ impl Store {
 
         match env.event {
             Event::UserPrompt {
-                message_id, text, ..
+                message_id,
+                text,
+                attachments,
+                ..
             } => {
                 if let Err(index) = conv.index_of(&message_id) {
                     conv.messages.insert(
@@ -1032,6 +1052,7 @@ impl Store {
                         Message::User(UserMessage {
                             id: message_id,
                             text,
+                            attachments,
                         }),
                     );
                     out.push(changed(index, true));
@@ -1417,6 +1438,7 @@ mod tests {
             Message::User(UserMessage {
                 id: id.into(),
                 text: id.into(),
+                attachments: vec![],
             })
         };
         s.apply_inner(wire(r#"{"type":"session.step.started","data":{"sessionID":"ses_a","assistantMessageID":"msg_0_reply"}}"#));

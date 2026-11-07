@@ -11,9 +11,11 @@ pub mod mention;
 pub mod message;
 pub mod permission;
 pub mod prose;
+pub mod settings;
 pub mod sidebar;
 pub mod tasks;
 pub mod tool_card;
+pub mod usage;
 
 use std::path::PathBuf;
 

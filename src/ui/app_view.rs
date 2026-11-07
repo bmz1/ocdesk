@@ -86,7 +86,7 @@ impl AppView {
         let theme = std::env::var("OCDESK_THEME")
             .ok()
             .or_else(|| settings.theme.clone());
-        let follow_system = theme.as_deref() == Some("system");
+
         match theme.as_deref() {
             Some("light") => Theme::change(ThemeMode::Light, Some(window), cx),
             Some("system") => Theme::sync_system_appearance(Some(window), cx),
@@ -103,10 +103,57 @@ impl AppView {
         if let Ok(p) = std::env::var("OCDESK_PROBE_PROMPT") {
             controller.update(cx, |c, cx| c.probe_on_connect(p, cx));
         }
+        let notification_controller = controller.downgrade();
+        let notification_window = window.window_handle();
+        cx.on_system_notification_response(move |response, cx| {
+            let Some(sid) = response.tag.strip_prefix("ocdesk:").map(str::to_string) else {
+                return;
+            };
+            cx.activate(true);
+            let _ = notification_window.update(cx, |_, window, cx| {
+                window.activate_window();
+                let _ = notification_controller.update(cx, |c, cx| {
+                    c.set_window_active(true, cx);
+                    c.select_session(Some(sid), cx);
+                });
+            });
+        });
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), controller.clone(), cx));
         let conversation =
-            cx.new(|cx| ConversationView::new(store, controller.clone(), window, cx));
+            cx.new(|cx| ConversationView::new(store.clone(), controller.clone(), window, cx));
+        controller.update(cx, |c, cx| {
+            c.set_window_active(window.is_window_active(), cx)
+        });
+        let mut last_theme = controller.read(cx).preferences().theme;
+        let mut last_badge = usize::MAX;
         let mut subs = vec![
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.controller.update(cx, |c, cx| {
+                    c.set_window_active(window.is_window_active(), cx)
+                })
+            }),
+            cx.observe_in(&store, window, move |_, store, window, cx| {
+                let s = store.read(cx);
+                let theme = s.preferences.theme.clone();
+                let count = s.unread.len();
+                if theme != last_theme {
+                    last_theme = theme.clone();
+                    match theme.as_deref() {
+                        Some("light") => Theme::change(ThemeMode::Light, Some(window), cx),
+                        Some("system") => Theme::sync_system_appearance(Some(window), cx),
+                        _ => Theme::change(ThemeMode::Dark, Some(window), cx),
+                    }
+                }
+                if count != last_badge {
+                    last_badge = count;
+                    crate::notifications::badge(count);
+                    window.set_window_title(&if count == 0 {
+                        "ocdesk".into()
+                    } else {
+                        format!("ocdesk ({count} unread)")
+                    });
+                }
+            }),
             cx.observe_window_bounds(window, |this, window, cx| {
                 this.remember_placement(window, cx)
             }),
@@ -116,11 +163,11 @@ impl AppView {
                 async {}
             }),
         ];
-        if follow_system {
-            subs.push(cx.observe_window_appearance(window, |_, window, cx| {
+        subs.push(cx.observe_window_appearance(window, |this, window, cx| {
+            if this.controller.read(cx).preferences().theme.as_deref() == Some("system") {
                 Theme::sync_system_appearance(Some(window), cx);
-            }));
-        }
+            }
+        }));
         Self {
             focus: cx.focus_handle(),
             controller,
@@ -250,6 +297,9 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &keys::ToggleTasks, _, cx| {
                 this.conversation.update(cx, |c, cx| c.toggle_tasks(cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::OpenSettings, window, cx| {
+                crate::ui::settings::open(this.controller.clone(), window, cx)
             }))
             .on_action(|_: &keys::ShowShortcuts, window, cx| keys::show_shortcuts(window, cx))
             .on_action(|_: &keys::Quit, _, cx| cx.quit())

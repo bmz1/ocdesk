@@ -11,7 +11,7 @@ publish = false
 # gpui-kit 0.9.0 bundles gpui-pre =0.3.11 (snapshot of zed@f816e1f), the native
 # platform crate and gpui-component. Pinned exactly: any snapshot can change GPUI's API.
 gpui-kit = { version = "=0.9.0" }
-tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "signal"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "signal", "fs"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

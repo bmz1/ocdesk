@@ -13,10 +13,11 @@ ocdesk (Rust/GPUI) ──HTTP──▶ opencode serve   (child process, 127.0.0.
                    ◀──SSE───  GET /api/event   (one stream for every folder)
 ```
 
-**Status:** M1–M3: folders and sessions, streaming markdown, selectable text,
-collapsible reasoning, expandable tool cards, permission replies and latest-turn
-file diffs. Send/stop, reconnect, crash recovery and dark theme included.
-See *Roadmap* and [handoff.md](handoff.md).
+**Status:** M0–M7 plus attachments, permission modes, native notifications/unread,
+Settings, branch/commit diff review and usage/context details. The queue/steer,
+background-task and worktree controls are preserved. See
+[desktop features](docs/desktop-features.md) for behavior and API limitations,
+and [handoff.md](handoff.md) for current verification and next steps.
 
 ![ocdesk markdown](docs/screenshots/m2-markdown.png)
 
@@ -301,6 +302,8 @@ handoff.md                       state of the project for the next session
 - [x] **M4** Question forms, @mentions (files, subagents), model/variant/agent picker, prompt history
 - [x] **M5** Keyboard, persistence of window/sidebar, error states
 - [x] **M6** Packaging (.app, AppImage), CI
+- [x] **M7** Queue/steer, slash commands/skills, background tasks, branches/worktrees
+- [x] **Desktop feature batch** Attachments, permission modes, notifications/unread, Settings, full diff review, usage/context (items 4–8 and 10; Git write actions excluded)
 
 ## Design
 

@@ -3,7 +3,37 @@
 State of ocdesk for whoever picks it up next. Read this first, then
 [README.md](README.md) and [docs/protocol-notes.md](docs/protocol-notes.md).
 
-_Last updated: 2026-11-07, M6 + M7 pushed on `claude/loving-dirac-otenca`._
+_Last updated: 2026-11-07, desktop feature batch built on origin/master @ `9a2b04f`._
+
+## Current work: desktop feature batch
+
+Master now contains the M0–M7 work below. The owner requested design items 4–8
+and 10; **item 9 (commit/push/PR actions) is excluded**. This batch adds composer
+attachments (including image/large-text paste), session permission modes and
+saved-grant management, native notifications/unread/Dock badge, Settings with
+project defaults/editable keys, full branch/commit diff review, and usage/context.
+See [docs/desktop-features.md](docs/desktop-features.md) for exact semantics and
+API probe results. Existing queue/steer, commands/skills, tasks and worktrees stay.
+
+Permission caveat: saved project grants override session `ask` rules in 2.2.6.
+The UI states this and supports explicit project-wide grant revocation. A new
+thread's chosen mode is patched before the first prompt; pending approvals stay
+explicit. Context is a last-request estimate, and provider limits may be absent.
+
+Validation: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`,
+`cargo test --locked` (**59 passed**), and `cargo build --locked` pass on Linux.
+Existing M3 protocol smoke tests and `dev/desktop-features-test.py` pass against
+real opencode 2.2.6 with the mock provider. Native Xvfb checks covered large-text
+and PNG paste (including attachment-only Send), confirmed permission PATCH rules,
+usage/context details, working-tree review/viewed marks/commit controls, editor
+launch with safe file arguments, Settings
+save/theme changes, live shortcut remapping, background unread persistence and
+clearing the unread mark on thread selection.
+The check caught and fixed an older controller empty-text guard blocking
+attachment-only sends. macOS delivery/Dock behavior remains unverified locally;
+the existing macOS CI job builds/tests this code when a PR is opened.
+The older M6/M7 branch-status notes below describe the previous handoff.
+
 
 ## Where things are
 
