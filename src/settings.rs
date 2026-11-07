@@ -90,8 +90,8 @@ mod tests {
     #[test]
     fn old_files_still_load() {
         // A file written before M5 only had folders/collapsed/theme.
-        let s: Settings = serde_json::from_str(r#"{"folders":["/a"],"collapsed":[],"theme":null}"#)
-            .unwrap();
+        let s: Settings =
+            serde_json::from_str(r#"{"folders":["/a"],"collapsed":[],"theme":null}"#).unwrap();
         assert_eq!(s.folders, vec![PathBuf::from("/a")]);
         assert!(s.window.is_none() && !s.sidebar_hidden && s.draft_model.is_none());
     }
@@ -123,7 +123,13 @@ mod tests {
 
     #[test]
     fn placement_sanity() {
-        let ok = WindowPlacement { x: 0., y: 0., width: 800., height: 600., maximized: false };
+        let ok = WindowPlacement {
+            x: 0.,
+            y: 0.,
+            width: 800.,
+            height: 600.,
+            maximized: false,
+        };
         assert!(ok.is_sane());
         assert!(!WindowPlacement { width: 10., ..ok }.is_sane());
         assert!(!WindowPlacement { x: f32::NAN, ..ok }.is_sane());

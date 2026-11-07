@@ -496,7 +496,16 @@ impl Composer {
                 .map(|m| m.name.clone())
                 .or_else(|| model.as_ref().map(|m| m.id.clone()))
                 .unwrap_or_else(|| "Model".into());
-            let models = catalog.models.clone();
+            // The server lists models in no provider order; group each
+            // provider's models together (first-appearance order, stable).
+            let mut models = catalog.models.clone();
+            let mut providers: Vec<String> = Vec::new();
+            for m in &models {
+                if !providers.contains(&m.provider_id) {
+                    providers.push(m.provider_id.clone());
+                }
+            }
+            models.sort_by_key(|m| providers.iter().position(|p| *p == m.provider_id));
             let c = controller.clone();
             let current = model.clone();
             row = row.child(

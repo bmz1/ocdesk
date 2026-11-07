@@ -110,7 +110,8 @@ impl Controller {
             settings.folders.insert(0, f);
         }
         let (folders, collapsed) = (settings.folders.clone(), settings.collapsed.clone());
-        let (draft_model, draft_agent) = (settings.draft_model.clone(), settings.draft_agent.clone());
+        let (draft_model, draft_agent) =
+            (settings.draft_model.clone(), settings.draft_agent.clone());
         store.update(cx, |s, cx| {
             s.collapsed = collapsed.into_iter().collect();
             s.draft_model = draft_model;
@@ -166,18 +167,9 @@ impl Controller {
         .detach();
     }
 
-    /// Read-only view of the persisted settings (window placement etc.).
-    pub fn settings(&self) -> &Settings {
-        &self.settings
-    }
-
     /// Change settings and save them after a short quiet period, for values
     /// that change in bursts (window resizes, sidebar drags).
-    pub fn update_settings(
-        &mut self,
-        cx: &mut Context<Self>,
-        f: impl FnOnce(&mut Settings),
-    ) {
+    pub fn update_settings(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
         let before = self.settings.clone();
         f(&mut self.settings);
         if self.settings == before {

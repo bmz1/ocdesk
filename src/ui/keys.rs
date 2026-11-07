@@ -64,7 +64,10 @@ const COMPOSER_KEYS: &[(&str, &str)] = &[
     ("Enter", "Send"),
     ("Shift+Enter", "New line"),
     ("Esc", "Close the @ popup, else stop the running turn"),
-    ("Up / Down", "Earlier / later prompts (at the start of the box)"),
+    (
+        "Up / Down",
+        "Earlier / later prompts (at the start of the box)",
+    ),
     ("@", "Mention a file or subagent"),
 ];
 
@@ -81,9 +84,10 @@ pub fn show_shortcuts(window: &mut Window, cx: &mut App) {
                 .justify_between()
                 .gap_6()
                 .text_sm()
-                .child(div().child(*label))
+                .child(div().flex_1().min_w_0().child(*label))
                 .child(
                     div()
+                        .flex_none()
                         .px_1p5()
                         .rounded_md()
                         .bg(theme.secondary)

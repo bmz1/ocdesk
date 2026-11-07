@@ -144,28 +144,31 @@ impl AppView {
             maximized,
         };
         if placement.is_sane() {
-            self.controller
-                .update(cx, |c, cx| c.update_settings(cx, |s| s.window = Some(placement)));
+            self.controller.update(cx, |c, cx| {
+                c.update_settings(cx, |s| s.window = Some(placement))
+            });
         }
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_hidden = !self.sidebar_hidden;
         let hidden = self.sidebar_hidden;
-        self.controller
-            .update(cx, |c, cx| c.update_settings(cx, |s| s.sidebar_hidden = hidden));
+        self.controller.update(cx, |c, cx| {
+            c.update_settings(cx, |s| s.sidebar_hidden = hidden)
+        });
         cx.notify();
     }
 
     fn resize_sidebar(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let w = px(f32::from(x).clamp(SIDEBAR_MIN_W, SIDEBAR_MAX_W));
+        let w = px(f32::from(x).clamp(SIDEBAR_MIN_W, SIDEBAR_MAX_W).round());
         if w == self.sidebar_width {
             return;
         }
         self.sidebar_width = w;
         let saved: f32 = w.into();
-        self.controller
-            .update(cx, |c, cx| c.update_settings(cx, |s| s.sidebar_width = Some(saved)));
+        self.controller.update(cx, |c, cx| {
+            c.update_settings(cx, |s| s.sidebar_width = Some(saved))
+        });
         cx.notify();
     }
 
@@ -181,11 +184,7 @@ impl AppView {
             .cursor_col_resize()
             .child(
                 // The visible 1px border, highlighted while hovered.
-                div()
-                    .mx_auto()
-                    .w(px(1.))
-                    .h_full()
-                    .bg(theme.sidebar_border),
+                div().mx_auto().w(px(1.)).h_full().bg(theme.sidebar_border),
             )
             .hover(|s| s.bg(theme.sidebar_border.opacity(0.6)))
             .on_drag(SidebarResize, |_, _, _, cx| cx.new(|_| SidebarResize))
@@ -228,7 +227,8 @@ impl Render for AppView {
                 this.toggle_sidebar(cx);
             }))
             .on_action(cx.listener(|this, _: &keys::PreviousSession, _, cx| {
-                this.controller.update(cx, |c, cx| c.select_adjacent(-1, cx));
+                this.controller
+                    .update(cx, |c, cx| c.select_adjacent(-1, cx));
             }))
             .on_action(cx.listener(|this, _: &keys::NextSession, _, cx| {
                 this.controller.update(cx, |c, cx| c.select_adjacent(1, cx));
@@ -245,9 +245,11 @@ impl Render for AppView {
             }))
             .on_action(|_: &keys::ShowShortcuts, window, cx| keys::show_shortcuts(window, cx))
             .on_action(|_: &keys::Quit, _, cx| cx.quit())
-            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<SidebarResize>, _, cx| {
-                this.resize_sidebar(e.event.position.x - e.bounds.left(), cx);
-            }))
+            .on_drag_move(
+                cx.listener(|this, e: &DragMoveEvent<SidebarResize>, _, cx| {
+                    this.resize_sidebar(e.event.position.x - e.bounds.left(), cx);
+                }),
+            )
             .when(show_sidebar, |el| {
                 el.child(
                     div()

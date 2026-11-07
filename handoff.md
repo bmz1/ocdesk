@@ -3,7 +3,7 @@
 State of ocdesk for whoever picks it up next. Read this first, then
 [README.md](README.md) and [docs/protocol-notes.md](docs/protocol-notes.md).
 
-_Last updated: 2026-11-07, M4 pushed on `m4-models-agents-mentions`._
+_Last updated: 2026-11-07, M5 pushed on `claude/loving-dirac-otenca`._
 
 ## Where things are
 
@@ -13,20 +13,20 @@ _Last updated: 2026-11-07, M4 pushed on `m4-models-agents-mentions`._
   reasoning, frame-time probe, offline demo mode), M3 (expandable tool
   cards, session-scoped permission prompts/replies and latest-turn file
   diffs) and M4 (question forms, Codex-style tool cards, model/agent/variant
-  pickers, `@` mentions of files and subagents, prompt history), targeting
+  pickers, `@` mentions of files and subagents, prompt history) and M5
+  (keyboard shortcuts, persisted window/sidebar/last session/draft model,
+  error states), targeting
   **opencode 2.2.6 only**. Dark theme by default.
 - **Workflow the owner wants:** branch from `master` → feature PR → owner
   reviews → merge to `master`. Don't push to `master` directly; the owner
   opens/asks for PRs. M1–M3 are merged (PRs #1–#3).
-- **M4** landed in two parts: question forms + Codex-style tool cards went
-  directly to `master` (`75fe7d6`); pickers, `@` mentions and history are
-  pushed on `m4-models-agents-mentions` (`fd0ecbb`, branched from
-  `75fe7d6`). **No PR opened yet**; the owner asks for it
-  (github.com/bmz1/opencode-gui/pull/new/m4-models-agents-mentions).
+- M4 is merged (PR #4). **M5** is pushed on `claude/loving-dirac-otenca`
+  (branched from `master` @ `9f8e626`). **No PR opened yet**; the owner
+  asks for it.
 - The old `claude/friendly-lamport-ne3gxc` remote branch could not be deleted
   from the agent sandbox (git proxy 403); the owner was asked to delete it.
-- **Next:** hand-test M4's composer UI (see *M4 notes*), then **M5**
-  (keyboard, persistence of window/sidebar and model/agent draft, error states).
+- **Next:** owner review of M5, then **M6** (packaging: .app, AppImage; CI).
+  Running on macOS is still the biggest gap.
 
 ## Decisions already made (don't re-litigate)
 
@@ -125,7 +125,8 @@ src/api/model.rs       SessionInfo, Message, Block (lenient JSON)
 src/api/events.rs      /api/event → Event (execution lifecycle, blocks by ordinal)
 src/store.rs           Entity<Store>; apply(event), reconcile(REST snapshot)
 src/controller.rs      intents, sidecar lifecycle, auto-restart, pump, folders
-src/ui/*               app_view, sidebar (folders), conversation, message, composer
+src/ui/*               app_view (layout, window/sidebar persistence), keys (shortcuts),
+                       sidebar (folders), conversation, message, composer
 src/ui/prose.rs        ProseCache: one TextViewState per prose block, LRU-capped
 src/ui/frame_stats.rs  OCDESK_FRAME_LOG frame-time + peak-RSS probe
 src/ui/tool_card.rs    expandable input/output, errors and optional edit diffs
@@ -192,9 +193,12 @@ Data flow: view → `Controller` intent → `Api` on Tokio → result back via
   opencode 2.2.6: `types=chat`, `fs/find`, switch endpoints/events and
   `files`+`agents` attachments with UTF-16 mention offsets (scratch probe);
   app probe prompt → `verify: store matches REST`.
-- **Not yet driven by hand:** the `@` popup keyboard flow, picker menus and
-  history recall in the native window. Do that first (and screenshot) on a
-  box with Xvfb+xdotool or by hand.
+- Driven by hand in M5 (Xvfb+xdotool, real opencode 2.2.6 + mock model):
+  `@mai` → popup, ↓/Enter picks `README.md` as a chip, the reply shows the
+  attached content, `verify: store matches REST`; ↑ recalls the prompt; the
+  model menu opens. Found and fixed: the model menu repeated a provider
+  heading because the server doesn't list models grouped by provider (now
+  grouped stably by first appearance). Screenshot `docs/screenshots/m4-mention.png`.
 - Key interception: GPUI dispatches key *bindings* before key listeners, so
   the composer claims Up/Down/Enter/Tab/Escape with `capture_action` on the
   textarea's actions (`MoveUp`, `Enter`, `IndentInline`, …), not
@@ -206,5 +210,40 @@ Data flow: view → `Controller` intent → `Api` on Tokio → result back via
   is untested), restoring tokens on history recall, showing attached files
   as chips on sent user messages (the projection has `files[]`), `skills`
   attachments, persisting the draft model/agent in settings (M5).
-**M5/M6:** see README roadmap.
+**M5 notes**
+- Keys (`ui/keys.rs`, window-level bindings, no key context): Mod+N/O/B/L/./
+  /, Mod+Shift+D, Mod+Q, Alt+↑/↓. Inputs' context bindings win on conflict;
+  the only clash, `secondary-.` (gpui-base `ToggleCodeActions`), is claimed
+  in the composer with `capture_action`. Esc in the composer stops a running
+  turn when the `@` popup isn't open. `AppView` holds a fallback
+  `FocusHandle` and focuses it when nothing is focused, so shortcuts dispatch
+  after clicking non-focusable UI.
+- `Settings` gained `window`, `sidebar_width`, `sidebar_hidden`,
+  `last_session`, `draft_model`, `draft_agent` (all `#[serde(default)]`, old
+  files load). `Controller::update_settings` debounces writes by 500 ms;
+  `flush_settings` runs from `on_app_quit`. Window bounds come from
+  `observe_window_bounds` (restore bounds when maximized); a saved position
+  that's on no display falls back to centered. `last_session` is restored
+  after the first session list, only when no folder argument was given.
+- Error states: sidebar footer error is width-bounded and scrolls, with
+  Copy details (message + sidecar's last lines); a banner above the composer
+  when reconnecting or opencode isn't running (with Restart); a failed
+  history load shows the error + Retry in place of the list
+  (`Store::load_errors`), and "Loading conversation…" while empty and
+  unloaded. The not-installed hint pointed at the 1.x installer; now
+  `sidecar::INSTALL_HINT` (`npm i -g @opencode/cli@2.2.6`).
+- Verified (Linux/Xvfb/llvmpipe, real opencode 2.2.6 + mock model): fmt,
+  clippy `-D warnings`, `cargo test` **35 passed**, teardown **5/5**. By hand:
+  shortcuts sheet, Mod+B, Mod+N + send, Alt+↓, drag-resize of the sidebar,
+  Esc stops a `long` turn ("Stopped"), Mod+Q quits and kills the sidecar,
+  settings round-trip (window 1000×700 @ 50,60 restored; sidebar width; last
+  session reopened), missing-opencode state
+  (`docs/screenshots/m5-sidecar-missing.png`, `m5-shortcuts.png`).
+- Not driven: the history-load Retry panel (needs a failing
+  `GET /api/session/{id}/message`; logic is unit-tested), maximized restore
+  (no window manager under Xvfb), macOS Cmd bindings.
+- Ideas left: an "interrupted" marker for turns cut off by a sidecar crash;
+  a command palette; per-session composer drafts.
+
+**M6:** see README roadmap.
 

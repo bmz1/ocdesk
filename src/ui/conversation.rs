@@ -4,7 +4,9 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -292,7 +294,7 @@ impl ConversationView {
             Connection::SidecarDown { .. } => (
                 theme.danger,
                 IconName::CircleAlert,
-                "opencode stopped, so prompts can't be sent.",
+                "opencode isn't running, so prompts can't be sent.",
                 true,
             ),
         };

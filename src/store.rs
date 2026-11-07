@@ -1044,15 +1044,21 @@ mod tests {
 
     #[test]
     fn adjacent_session_follows_sidebar_order() {
-        let mut s = Store::default();
-        s.folders = vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")];
-        // Sidebar order: folders in order, sessions newest first.
-        s.sessions = vec![
-            session_in("a2", "/a", 2),
-            session_in("a1", "/a", 1),
-            session_in("b1", "/b", 1),
-            session_in("c1", "/c", 1),
-        ];
+        let mut s = Store {
+            folders: vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c"),
+            ],
+            // Sidebar order: folders in order, sessions newest first.
+            sessions: vec![
+                session_in("a2", "/a", 2),
+                session_in("a1", "/a", 1),
+                session_in("b1", "/b", 1),
+                session_in("c1", "/c", 1),
+            ],
+            ..Default::default()
+        };
         assert_eq!(s.adjacent_session(1).as_deref(), Some("a2"));
         assert_eq!(s.adjacent_session(-1).as_deref(), Some("c1"));
         s.selected = Some("a1".into());
@@ -1063,7 +1069,8 @@ mod tests {
         assert_eq!(s.adjacent_session(1).as_deref(), Some("c1"));
         s.selected = Some("c1".into());
         assert_eq!(s.adjacent_session(1).as_deref(), Some("a2"));
-        s.collapsed.extend([PathBuf::from("/a"), PathBuf::from("/c")]);
+        s.collapsed
+            .extend([PathBuf::from("/a"), PathBuf::from("/c")]);
         assert_eq!(s.adjacent_session(1), None);
     }
 
