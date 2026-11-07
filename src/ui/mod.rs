@@ -1,7 +1,9 @@
 pub mod app_view;
 pub mod composer;
 pub mod conversation;
+pub mod frame_stats;
 pub mod message;
+pub mod prose;
 pub mod sidebar;
 
 use std::path::PathBuf;

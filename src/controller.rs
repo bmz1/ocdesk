@@ -34,6 +34,8 @@ pub struct Controller {
     pump: Option<(tokio::task::AbortHandle, Task<()>)>,
     exit_watch: Option<Task<()>>,
     recent_crashes: Vec<Instant>,
+    /// Offline UI demo (`OCDESK_DEMO`): no sidecar; prompts get synthetic replies.
+    demo: bool,
 }
 
 impl Controller {
@@ -63,9 +65,15 @@ impl Controller {
             pump: None,
             exit_watch: None,
             recent_crashes: Vec::new(),
+            demo: false,
         };
         this.save_settings();
-        this.start_sidecar(cx);
+        if let Some(turns) = crate::demo::turns() {
+            this.demo = true;
+            crate::demo::start(&this.store, turns, cx);
+        } else {
+            this.start_sidecar(cx);
+        }
         this
     }
 
@@ -494,6 +502,10 @@ impl Controller {
     pub fn send_prompt(&mut self, text: String, cx: &mut Context<Self>) {
         let text = text.trim().to_string();
         if text.is_empty() {
+            return;
+        }
+        if self.demo {
+            crate::demo::stream_reply(self.store.clone(), text, cx);
             return;
         }
         let Some(api) = self.api(cx) else { return };

@@ -3,19 +3,22 @@
 State of ocdesk for whoever picks it up next. Read this first, then
 [README.md](README.md) and [docs/protocol-notes.md](docs/protocol-notes.md).
 
-_Last updated: 2026-11-07, end of M1 (PR #1, branch `m1-sessions-conversation`)._
+_Last updated: 2026-11-07, end of M2 (branch `claude/elegant-mccarthy-dymj86`, no PR opened yet)._
 
 ## Where things are
 
-- **Done:** M0 (spike) and M1 (folders + sessions, streaming conversation,
-  composer, reconnect, crash recovery), targeting **opencode 2.2.6 only**.
-  Dark theme by default.
+- **Done:** M0 (spike), M1 (folders + sessions, streaming conversation,
+  composer, reconnect, crash recovery) and M2 (incremental streaming
+  markdown, code-block copy buttons, links, selectable text, collapsible
+  reasoning, frame-time probe, offline demo mode), targeting **opencode
+  2.2.6 only**. Dark theme by default.
 - **Workflow the owner wants:** branch from `master` → feature PR → owner
-  reviews → merge to `master`. Don't push to `master` directly. PR #1 holds
-  M1 and was **not merged yet** at the time of writing; check its state first.
+  reviews → merge to `master`. Don't push to `master` directly. PR #1 (M1)
+  is merged. M2 is on `claude/elegant-mccarthy-dymj86`; a PR for it was not
+  opened yet (the owner opens/asks for PRs).
 - The old `claude/friendly-lamport-ne3gxc` remote branch could not be deleted
   from the agent sandbox (git proxy 403); the owner was asked to delete it.
-- **Next milestone: M2** (see *Next steps*).
+- **Next milestone: M3** (see *Next steps*).
 
 ## Decisions already made (don't re-litigate)
 
@@ -28,6 +31,8 @@ _Last updated: 2026-11-07, end of M1 (PR #1, branch `m1-sessions-conversation`).
 | Codex-style design, dark default | Owner preference. Take layout ideas, not branding. |
 | gpui-component `MessageScroller` for the message list | Virtualized, tail-follow, jump-to-latest built in. |
 | Folders persisted in `settings.json` (config dir) | Folders are ocdesk's concept; the server only knows locations/projects. |
+| Markdown = gpui-component `TextView`/`TextViewState`, one state per prose block (`ui/prose.rs`) | Its `set_text` → `push_str` already re-parses only the tail, off-thread; selection, copy, links, code-block actions built in. No custom parser. |
+| User prompts render as markdown too | Makes them selectable/copyable; the only alternative state format is HTML. |
 
 ## How to run and verify (Linux sandbox)
 
@@ -54,6 +59,23 @@ XDG_CONFIG_HOME=$PWD/dev/xdg cargo run -- /some/git/repo
 - Sandbox note: installing new npm packages may be blocked as "external
   code" until the owner approves (that happened for `@opencode/cli`).
 
+**Without opencode** (e.g. when npm installs are blocked): `OCDESK_DEMO=<turns>`
+runs the UI on synthetic history and streams replies locally (README,
+*Developing*). M2 was verified only this way: the sandbox refused to install
+`@opencode/cli`, so **M2 has not been run against a real opencode server**.
+Under Xvfb rendering also needs `mesa-vulkan-drivers` (else "Failed to create
+surface"); `xclip -o -selection clipboard` checks copy.
+
+Verified at the end of M2 (Linux/Xvfb/llvmpipe, demo mode, debug build):
+markdown (headings, emphasis, inline code, links, quotes, nested/ordered/task
+lists, tables, fenced code) streams in; code copy button and drag-select +
+Ctrl-C put the right text on the clipboard; reasoning rows start collapsed
+and expand in place. 500-message session: streaming a long reply 3–5 ms mean
+frame CPU time (p95 ≤12 ms); scrolling up through ~300 messages 5–6 ms mean,
+max <9 ms; peak RSS 180 MB idle, 210 MB after that scroll (see release number
+below if filled in). llvmpipe caps presentation at ~20–30 fps, so frame
+*rate* here says nothing; the CPU time is the number to compare.
+
 Verified at the end of M1 (Linux/Xvfb, mock model, opencode 2.2.6): tool turn and
 Stop match REST; two sessions in two folders streaming in parallel with
 switching; rename and delete via dialogs; `kill -9` of the sidecar recovers;
@@ -72,6 +94,9 @@ src/api/events.rs      /api/event → Event (execution lifecycle, blocks by ordi
 src/store.rs           Entity<Store>; apply(event), reconcile(REST snapshot)
 src/controller.rs      intents, sidecar lifecycle, auto-restart, pump, folders
 src/ui/*               app_view, sidebar (folders), conversation, message, composer
+src/ui/prose.rs        ProseCache: one TextViewState per prose block, LRU-capped
+src/ui/frame_stats.rs  OCDESK_FRAME_LOG frame-time + peak-RSS probe
+src/demo.rs            OCDESK_DEMO offline mode (synthetic history + streaming)
 tests/fixtures/        real 2.2.6 captures (events.jsonl + messages.json)
 ```
 
@@ -80,18 +105,20 @@ Data flow: view → `Controller` intent → `Api` on Tokio → result back via
 
 ## Next steps
 
-**M2 (make-or-break): markdown + text**
-1. Incremental streaming markdown in `ui/message.rs`: parse only the tail of
-   a streaming block (blocks have `done`; finished blocks can cache their
-   parsed form). gpui-component has `text::TextView` / markdown in 0.9.0 (see
-   the gpui-kit `examples/markdown`); check whether it can be fed
-   incrementally before writing our own.
-2. Fenced code blocks with a copy button; links open in the browser.
-3. Collapsible reasoning, collapsed by default (Codex-style "Thinking" row).
-4. Selectable, copyable text.
-5. Perf: a 500-message session at display refresh rate; log frame times in
-   debug builds; memory under 200 MB. Measure on real hardware: llvmpipe
-   numbers aren't representative.
+**M2 leftovers**
+- Run M2 against real opencode 2.2.6 (only demo mode was exercised) and on
+  macOS (primary target, nothing has run there yet). Measure frame times on
+  real hardware with `OCDESK_FRAME_LOG=1` in a release build.
+- No syntax highlighting in code blocks: gpui-kit's `syntect` feature
+  (or gpui-component's tree-sitter languages) would plug into `TextView`
+  automatically via its code-block highlighter; it costs build time and was
+  left out.
+- Each prose block is its own `TextViewState`. Selecting within a block is
+  verified; a drag across two messages was not tested (gpui-base's Copy
+  handler reads a window-level `TextSelection`, so it may already work).
+- `ProseCache` is cleared on session switch, so switching back re-parses the
+  visible rows (cheap: small replacements parse synchronously). It's capped
+  at 400 states with LRU eviction.
 
 **Small follow-ups found during M1**
 - The sidebar error footer doesn't wrap long paths (M5 error states).

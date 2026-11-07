@@ -13,12 +13,14 @@ ocdesk (Rust/GPUI) ──HTTP──▶ opencode serve   (child process, 127.0.0.
                    ◀──SSE───  GET /api/event   (one stream for every folder)
 ```
 
-**Status:** milestone M1: folders with their sessions, live plain-text
-streaming conversation, composer with send/stop, rename/delete, reconnect and
-sidecar crash recovery, dark theme by default. Markdown, tool cards and
-permissions come in M2/M3. See *Roadmap* and [handoff.md](handoff.md).
+**Status:** milestone M2: folders with their sessions, live streaming
+conversation rendered as incrementally parsed markdown (code blocks with
+copy buttons, tables, links that open in the browser, selectable text),
+collapsible reasoning, composer with send/stop, rename/delete, reconnect and
+sidecar crash recovery, dark theme by default. Tool cards and permissions
+come in M3. See *Roadmap* and [handoff.md](handoff.md).
 
-![ocdesk conversation](docs/screenshots/m1-conversation.png)
+![ocdesk markdown](docs/screenshots/m2-markdown.png)
 
 ## Pinned versions
 
@@ -88,9 +90,27 @@ python3 dev/mock_llm.py &                       # listens on 127.0.0.1:4555
 XDG_CONFIG_HOME=$PWD/dev/xdg cargo run -- /path/to/some/repo
 ```
 
-Prompt keywords: `tool:bash` (calls the `shell` tool), `tool:edit`, `long`;
+Prompt keywords: `tool:bash` (calls the `shell` tool), `tool:edit`, `long`,
+`rich` (every markdown construct, longer reasoning);
 anything else gets a short reply. For permission work (M3) add
 `"permission": {"shell": "ask", "edit": "ask"}` to `dev/xdg/opencode/opencode.json`.
+
+**Offline UI demo (no opencode, no model).** `OCDESK_DEMO=<turns>` skips the
+sidecar and seeds one session with synthetic history (`turns` × user +
+assistant, default 20); prompts get a streamed markdown reply through the
+same `Store::apply` path real events take. `OCDESK_DEMO=250` is the
+500-message perf case. `OCDESK_DEMO_DELAY_MS` sets the per-word delay
+(default 15), `OCDESK_DEMO_AUTOPLAY=<prompt>` sends one prompt at startup
+(`long` in it gives the long answer).
+
+```sh
+OCDESK_DEMO=250 OCDESK_DEMO_AUTOPLAY="long answer" OCDESK_FRAME_LOG=1 cargo run
+```
+
+**Frame times.** `OCDESK_FRAME_LOG=1` logs, once a second while frames are
+drawn, the CPU time per frame (root `render` to last `paint`: count, mean,
+p95, max) and peak RSS under the `ocdesk::frames` target. Debug builds also
+log it at `debug`.
 
 Verification hooks (env vars):
 
@@ -175,7 +195,7 @@ handoff.md                       state of the project for the next session
 
 - [x] **M0** Spike: pinned stack, window, sidecar lifecycle, prompt round-trip, protocol notes
 - [x] **M1** Folders + sessions sidebar, plain-text streaming conversation, composer, reconnect + reconcile, opencode 2.x, dark theme
-- [ ] **M2** Incremental streaming markdown, selectable text, collapsible reasoning (virtualized list already in)
+- [x] **M2** Incremental streaming markdown, code copy buttons, links, selectable text, collapsible reasoning, frame-time probe
 - [ ] **M3** Tool cards, permissions (`permission.asked`), diffs
 - [ ] **M4** @mentions, model/agent picker, history
 - [ ] **M5** Keyboard, persistence of window/sidebar, error states

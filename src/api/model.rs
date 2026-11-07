@@ -73,7 +73,7 @@ pub struct AssistantMessage {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlockKind {
     Reasoning = 0,
     Text = 1,

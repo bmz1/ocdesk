@@ -13,12 +13,14 @@ use crate::store::{Store, StoreEvent};
 use crate::ui::composer::Composer;
 use crate::ui::folder_name;
 use crate::ui::message::{COLUMN_MAX_W, render_message};
+use crate::ui::prose::{self, ProseCache};
 
 pub struct ConversationView {
     store: Entity<Store>,
     controller: Entity<Controller>,
     composer: Entity<Composer>,
     scroller: Entity<MessageScrollerState>,
+    prose: Entity<ProseCache>,
     _subs: Vec<Subscription>,
 }
 
@@ -30,7 +32,13 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> Self {
         let composer = cx.new(|cx| Composer::new(controller.clone(), store.clone(), window, cx));
-        let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
+        // The store may already hold a selected conversation (demo mode).
+        let rows = store
+            .read(cx)
+            .selected_conversation()
+            .map_or(0, |c| c.messages.len());
+        let scroller = cx.new(|cx| MessageScrollerState::new(rows, cx));
+        let prose = cx.new(|_| ProseCache::new(store.clone(), scroller.clone()));
         let subs = vec![cx.subscribe_in(&store, window, Self::on_store_event)];
         Composer::focus(&composer, window, cx);
         Self {
@@ -38,6 +46,7 @@ impl ConversationView {
             controller,
             composer,
             scroller,
+            prose,
             _subs: subs,
         }
     }
@@ -60,11 +69,15 @@ impl ConversationView {
         let is_selected = |sid: &String| selected.as_ref() == Some(sid);
         match ev {
             StoreEvent::SelectionChanged | StoreEvent::FoldersChanged => {
+                if matches!(ev, StoreEvent::SelectionChanged) {
+                    self.prose.update(cx, |p, _| p.clear());
+                }
                 let n = self.row_count(cx);
                 self.scroller.update(cx, |s, cx| s.reset(n, cx));
                 Composer::focus(&self.composer, window, cx);
             }
             StoreEvent::MessagesReset { session_id } if is_selected(session_id) => {
+                self.prose.update(cx, |p, _| p.invalidate());
                 let n = self.row_count(cx);
                 self.scroller.update(cx, |s, cx| s.reset(n, cx));
             }
@@ -233,12 +246,14 @@ impl Render for ConversationView {
             self.render_start(cx).into_any_element()
         } else {
             let store = self.store.clone();
+            let cache = self.prose.clone();
             let list = MessageScroller::new("messages", self.scroller.clone(), move |ix, _, cx| {
+                prose::sync_row(&store, &cache, ix, cx);
                 let s = store.read(cx);
                 let row = s
                     .selected_conversation()
                     .and_then(|c| c.messages.get(ix))
-                    .map(|m| render_message(m, cx))
+                    .map(|m| render_message(m, &cache, cx))
                     .unwrap_or_else(|| div().into_any_element());
                 h_flex()
                     .w_full()

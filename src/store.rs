@@ -45,7 +45,7 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    fn index_of(&self, id: &str) -> Result<usize, usize> {
+    pub fn index_of(&self, id: &str) -> Result<usize, usize> {
         self.messages.binary_search_by(|m| m.id().cmp(id))
     }
 

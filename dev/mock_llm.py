@@ -9,15 +9,17 @@ Behaviour is keyed on the last user message:
     contains "tool:bash"  -> calls the shell tool ("bash" on old servers), then summarizes
     contains "tool:edit"  -> calls the write tool on mock_note.txt, then summarizes
     contains "long"       -> streams a long markdown answer with code blocks
+    contains "rich"       -> long reasoning + every markdown construct (tables, quotes, lists, code)
     anything else         -> short reasoning + a short markdown answer
 """
 import json
+import os
 import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-DELAY = 0.03
+DELAY = float(os.environ.get("MOCK_DELAY", "0.03"))  # seconds per streamed word
 
 
 def last_user_text(messages):
@@ -47,6 +49,53 @@ LONG = "# A long answer\n\n" + "\n\n".join(
     f"```rust\nfn section_{i}() -> u32 {{\n    let x = {i};\n    x * 2\n}}\n```\n\n- item one\n- item two"
     for i in range(1, 9)
 )
+
+RICH_REASONING = (
+    "The user wants to see every **markdown** construct. I'll cover headings, "
+    "emphasis, `inline code`, lists, a table, a quote and a few code blocks.\n\n"
+    "- check the table renders\n- check copy buttons on code\n"
+)
+
+RICH = """## Rich markdown
+
+Plain text with **bold**, *italic*, ~~strike~~, `inline code` and a [link to opencode](https://opencode.ai).
+
+> A blockquote that spans
+> two lines, with `code` inside.
+
+1. First ordered item
+2. Second, with a nested list:
+   - nested bullet
+   - another one
+3. Third
+
+- [x] done task
+- [ ] open task
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | string | primary key |
+| `created` | u64 | ms since epoch |
+
+```rust
+fn main() {
+    println!("hello from rust");
+}
+```
+
+```python
+def greet(name: str) -> str:
+    return f"hello {name}"
+```
+
+```
+plain fenced block without a language
+```
+
+---
+
+That's all.
+"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -137,6 +186,10 @@ class Handler(BaseHTTPRequestHandler):
             elif "tool:edit" in user:
                 stream_text("Writing a file.\n")
                 tool_call(pick("write", "edit"), {"filePath": "mock_note.txt", "content": "line one\nline two\n"})
+            elif "rich" in user:
+                stream_text(RICH_REASONING, "reasoning_content")
+                stream_text(RICH)
+                chunk({}, "stop")
             elif "long" in user:
                 stream_text("Planning a long answer with many sections.", "reasoning_content")
                 stream_text(LONG)
