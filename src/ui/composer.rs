@@ -11,7 +11,7 @@ use std::time::Duration;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     Enter, Escape, IndentInline, InlineToken, InputEvent, MoveDown, MoveLeft, MoveRight, MoveUp,
-    Textarea, TextareaState,
+    Textarea, TextareaState, ToggleCodeActions,
 };
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
@@ -496,7 +496,16 @@ impl Composer {
                 .map(|m| m.name.clone())
                 .or_else(|| model.as_ref().map(|m| m.id.clone()))
                 .unwrap_or_else(|| "Model".into());
-            let models = catalog.models.clone();
+            // The server lists models in no provider order; group each
+            // provider's models together (first-appearance order, stable).
+            let mut models = catalog.models.clone();
+            let mut providers: Vec<String> = Vec::new();
+            for m in &models {
+                if !providers.contains(&m.provider_id) {
+                    providers.push(m.provider_id.clone());
+                }
+            }
+            models.sort_by_key(|m| providers.iter().position(|p| *p == m.provider_id));
             let c = controller.clone();
             let current = model.clone();
             row = row.child(
@@ -657,7 +666,17 @@ impl Render for Composer {
                 if this.mention.is_some() {
                     this.close_mention(cx);
                     cx.stop_propagation();
+                } else if this.busy(cx) {
+                    // Esc interrupts, as in opencode's TUI.
+                    this.controller.update(cx, |c, cx| c.abort_if_busy(cx));
+                    cx.stop_propagation();
                 }
+            }))
+            // The textarea binds secondary-. to code actions (unused here);
+            // claim it for the app-wide Stop shortcut.
+            .capture_action(cx.listener(|this, _: &ToggleCodeActions, _, cx| {
+                this.controller.update(cx, |c, cx| c.abort_if_busy(cx));
+                cx.stop_propagation();
             }))
             .capture_action(cx.listener(|this, _: &MoveLeft, _, cx| this.close_mention(cx)))
             .capture_action(cx.listener(|this, _: &MoveRight, _, cx| this.close_mention(cx)))

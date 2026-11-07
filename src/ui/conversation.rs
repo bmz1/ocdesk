@@ -4,12 +4,14 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::controller::Controller;
-use crate::store::{Store, StoreEvent};
+use crate::store::{Connection, Store, StoreEvent};
 use crate::ui::composer::Composer;
 use crate::ui::folder_name;
 use crate::ui::message::{COLUMN_MAX_W, render_message};
@@ -127,6 +129,22 @@ impl ConversationView {
         wanted
     }
 
+    pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        Composer::focus(&self.composer, window, cx);
+    }
+
+    /// Switch between the conversation and the latest turn's changes.
+    pub fn toggle_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.store.read(cx).selected.clone() else {
+            return;
+        };
+        self.show_changes = !self.show_changes;
+        if self.show_changes {
+            self.controller.update(cx, |c, cx| c.refresh_diff(sid, cx));
+        }
+        cx.notify();
+    }
+
     fn row_count(&self, cx: &App) -> usize {
         self.store
             .read(cx)
@@ -178,6 +196,7 @@ impl ConversationView {
     }
 
     fn render_start(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let banner = self.render_connection_banner(cx);
         let theme = cx.theme();
         let store = self.store.read(cx);
         let folders = store.folders.clone();
@@ -248,12 +267,117 @@ impl ConversationView {
             )
             .when(store.target_folder().is_some(), |el| {
                 el.child(
-                    div()
+                    v_flex()
                         .w_full()
                         .max_w(px(COLUMN_MAX_W))
+                        .gap_2()
+                        .children(banner)
                         .child(self.composer.clone()),
                 )
             })
+    }
+
+    /// Why prompts can't be sent right now, above the composer. The
+    /// sidebar footer carries the details and the Restart button.
+    fn render_connection_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = cx.theme();
+        let (color, icon, text, restart) = match self.store.read(cx).connection() {
+            Connection::Connected => return None,
+            // Startup is brief and the sidebar already says so.
+            Connection::Starting | Connection::Connecting => return None,
+            Connection::Reconnecting => (
+                theme.warning,
+                IconName::TriangleAlert,
+                "Reconnecting to opencode… prompts are paused.",
+                false,
+            ),
+            Connection::SidecarDown { .. } => (
+                theme.danger,
+                IconName::CircleAlert,
+                "opencode isn't running, so prompts can't be sent.",
+                true,
+            ),
+        };
+        Some(
+            h_flex()
+                .gap_2()
+                .text_sm()
+                .text_color(color)
+                .child(Icon::new(icon).xsmall())
+                .child(div().flex_1().min_w_0().child(text))
+                .when(restart, |el| {
+                    el.child(
+                        Button::new("banner-restart")
+                            .label("Restart")
+                            .icon(IconName::RefreshCw)
+                            .xsmall()
+                            .outline()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.controller.update(cx, |c, cx| c.restart(cx));
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// In place of the message list while history is loading or failed.
+    fn render_placeholder(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = cx.theme();
+        let store = self.store.read(cx);
+        let sid = store.selected.clone()?;
+        let has_messages = store
+            .selected_conversation()
+            .is_some_and(|c| !c.messages.is_empty());
+        if has_messages {
+            return None;
+        }
+        let centered = || {
+            v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .px_6()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+        };
+        if let Some(err) = store.load_errors.get(&sid) {
+            let connected = store.connection() == Connection::Connected;
+            return Some(
+                centered()
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .text_color(theme.danger)
+                            .child(Icon::new(IconName::CircleAlert).xsmall())
+                            .child("Couldn't load this conversation"),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(COLUMN_MAX_W))
+                            .text_xs()
+                            .text_center()
+                            .child(err.clone()),
+                    )
+                    .child(
+                        Button::new("retry-load")
+                            .label("Retry")
+                            .icon(IconName::RefreshCw)
+                            .small()
+                            .outline()
+                            .disabled(!connected)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let sid = sid.clone();
+                                this.controller.update(cx, |c, cx| c.load_messages(sid, cx));
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        store
+            .selected_is_loading()
+            .then(|| centered().child("Loading conversation…").into_any_element())
     }
 
     fn render_status(&self, cx: &App) -> Option<AnyElement> {
@@ -361,7 +485,10 @@ impl Render for ConversationView {
                     .child(div().w_full().max_w(px(COLUMN_MAX_W)).child(row))
             })
             .with_bottom_fade(theme.background);
-            let content = if self.show_changes {
+            let placeholder = self.render_placeholder(cx);
+            let content = if let Some(p) = placeholder.filter(|_| !self.show_changes) {
+                p
+            } else if self.show_changes {
                 div()
                     .id("changes-scroll")
                     .size_full()
@@ -402,6 +529,7 @@ impl Render for ConversationView {
                                     self.controller.clone(),
                                     cx,
                                 ))
+                                .children(self.render_connection_banner(cx))
                                 .children(self.render_status(cx))
                                 .child(self.composer.clone()),
                         ),
@@ -421,6 +549,20 @@ impl Render for ConversationView {
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .gap_1p5()
+                    .child(
+                        Button::new("toggle-sidebar")
+                            .icon(IconName::PanelLeft)
+                            .ghost()
+                            .small()
+                            .tooltip_with_action(
+                                "Toggle sidebar",
+                                &super::keys::ToggleSidebar,
+                                None,
+                            )
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(super::keys::ToggleSidebar), cx)
+                            }),
+                    )
                     .when_some(folder, |el, f| {
                         el.child(div().text_color(theme.muted_foreground).child(f))
                             .child(div().text_color(theme.muted_foreground).child("/"))
@@ -442,15 +584,7 @@ impl Render for ConversationView {
                                 })
                                 .ghost()
                                 .small()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_changes = !this.show_changes;
-                                    if this.show_changes
-                                        && let Some(sid) = this.store.read(cx).selected.clone()
-                                    {
-                                        this.controller.update(cx, |c, cx| c.refresh_diff(sid, cx));
-                                    }
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_changes(cx))),
                         )
                     }),
             )

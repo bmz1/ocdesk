@@ -32,6 +32,8 @@ const LOCATION_RETRIES: usize = 3;
 const LOCATION_BACKOFF: Duration = Duration::from_millis(400);
 /// `model.updated`/`agent.updated` arrive in bursts (startup, config reload).
 const CATALOG_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Quiet period before bursty settings changes (resizes, drags) are written.
+const SETTINGS_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// A 404 on `permission`/`form` reads right after startup usually means the
 /// session's location has not been registered server-side yet — retry, don't
@@ -81,6 +83,11 @@ pub struct Controller {
     catalog_seq: u64,
     /// Offline UI demo (`OCDESK_DEMO`): no sidecar; prompts get synthetic replies.
     demo: bool,
+    /// Session to reopen once the first session list arrives (last one open
+    /// when ocdesk quit). Taken on first use.
+    restore_session: Option<String>,
+    /// Bumped per debounced settings save.
+    save_seq: u64,
 }
 
 impl Controller {
@@ -91,14 +98,24 @@ impl Controller {
         initial_folder: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // An explicit folder argument means "start there", not "where I was".
+        let restore_session = if initial_folder.is_none() {
+            settings.last_session.clone()
+        } else {
+            None
+        };
         if let Some(f) = initial_folder
             && !settings.folders.contains(&f)
         {
             settings.folders.insert(0, f);
         }
         let (folders, collapsed) = (settings.folders.clone(), settings.collapsed.clone());
+        let (draft_model, draft_agent) =
+            (settings.draft_model.clone(), settings.draft_agent.clone());
         store.update(cx, |s, cx| {
             s.collapsed = collapsed.into_iter().collect();
+            s.draft_model = draft_model;
+            s.draft_agent = draft_agent;
             s.set_folders(folders, cx);
         });
         let mut this = Self {
@@ -115,6 +132,8 @@ impl Controller {
             notice_seq: 0,
             catalog_seq: 0,
             demo: false,
+            restore_session,
+            save_seq: 0,
         };
         this.save_settings();
         if let Some(turns) = crate::demo::turns() {
@@ -146,6 +165,36 @@ impl Controller {
             }
         })
         .detach();
+    }
+
+    /// Change settings and save them after a short quiet period, for values
+    /// that change in bursts (window resizes, sidebar drags).
+    pub fn update_settings(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
+        let before = self.settings.clone();
+        f(&mut self.settings);
+        if self.settings == before {
+            return;
+        }
+        self.save_seq += 1;
+        let seq = self.save_seq;
+        let exec = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            exec.timer(SETTINGS_DEBOUNCE).await;
+            let _ = this.update(cx, |this, _| {
+                if this.save_seq == seq {
+                    this.save_settings();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Write pending settings now (on quit).
+    pub fn flush_settings(&mut self) {
+        self.save_seq += 1;
+        if let Err(e) = self.settings.save() {
+            tracing::warn!("could not save settings: {e:#}");
+        }
     }
 
     fn save_settings(&self) {
@@ -189,8 +238,9 @@ impl Controller {
             async move {
                 let binary = sidecar::find_binary().ok_or_else(|| {
                     anyhow!(
-                        "opencode is not installed or not on PATH.\n\
-                         Install it with: curl -fsSL https://opencode.ai/install | bash"
+                        "opencode 2.x is not installed or not on PATH. \
+                         Install it with: {}",
+                        sidecar::INSTALL_HINT
                     )
                 })?;
                 sidecar::spawn(SidecarConfig {
@@ -471,6 +521,8 @@ impl Controller {
         self.store.update(cx, |s, cx| {
             s.set_draft_choice(Some(model.clone()), None, cx)
         });
+        let draft = Some(model.clone());
+        self.update_settings(cx, |s| s.draft_model = draft);
         let Some(sid) = self.store.read(cx).selected.clone() else {
             return;
         };
@@ -521,6 +573,8 @@ impl Controller {
         self.store.update(cx, |s, cx| {
             s.set_draft_choice(None, Some(agent.clone()), cx)
         });
+        let draft = Some(agent.clone());
+        self.update_settings(cx, |s| s.draft_agent = draft);
         let Some(sid) = self.store.read(cx).selected.clone() else {
             return;
         };
@@ -635,14 +689,22 @@ impl Controller {
                     for id in ids {
                         this.refresh_permissions(id, cx);
                     }
+                    this.restore_last_session(cx);
                 }
                 Err(e) => this.notice(format!("Could not list sessions: {e:#}"), cx),
             },
         );
     }
 
-    fn load_messages(&mut self, session_id: String, cx: &mut Context<Self>) {
+    /// Fetch a session's history. Failures are shown in the conversation
+    /// with a Retry button (see `ConversationView`), not as a notice.
+    pub fn load_messages(&mut self, session_id: String, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
+        self.store.update(cx, |s, cx| {
+            if s.load_errors.remove(&session_id).is_some() {
+                cx.notify();
+            }
+        });
         let sid = session_id.clone();
         self.run(
             cx,
@@ -651,7 +713,13 @@ impl Controller {
                 Ok(history) => this
                     .store
                     .update(cx, |s, cx| s.reconcile(&session_id, history, cx)),
-                Err(e) => this.notice(format!("Could not load messages: {e:#}"), cx),
+                Err(e) => {
+                    tracing::warn!(%session_id, "could not load messages: {e:#}");
+                    this.store.update(cx, |s, cx| {
+                        s.load_errors.insert(session_id, format!("{e:#}"));
+                        cx.notify();
+                    });
+                }
             },
         );
     }
@@ -961,8 +1029,30 @@ impl Controller {
         );
     }
 
+    /// Reopen the session that was open at quit, once, if it still exists
+    /// and the user hasn't picked something else meanwhile.
+    fn restore_last_session(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.restore_session.take() else {
+            return;
+        };
+        let store = self.store.read(cx);
+        if store.selected.is_none() && store.session(&id).is_some() {
+            self.select_session(Some(id), cx);
+        }
+    }
+
+    /// Keyboard navigation, see [`Store::adjacent_session`].
+    pub fn select_adjacent(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(id) = self.store.read(cx).adjacent_session(delta) {
+            self.select_session(Some(id), cx);
+        }
+    }
+
     pub fn select_session(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.restore_session = None;
         self.store.update(cx, |s, cx| s.select(id.clone(), cx));
+        let last = id.clone();
+        self.update_settings(cx, |s| s.last_session = last);
         if let Some(id) = id {
             self.refresh_permissions(id.clone(), cx);
             self.refresh_forms(id.clone(), cx);
@@ -1163,6 +1253,15 @@ impl Controller {
                 }
             },
         );
+    }
+
+    /// Keyboard stop: only interrupts when the selected session is running,
+    /// so a stray shortcut never sends a request (or shows a notice).
+    pub fn abort_if_busy(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        if store.selected.as_ref().is_some_and(|id| store.is_busy(id)) {
+            self.abort(cx);
+        }
     }
 
     /// Verification hook: send `text` in a new session once connected

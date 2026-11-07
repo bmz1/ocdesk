@@ -51,7 +51,9 @@ impl SessionInfo {
 }
 
 /// `Model.Ref`: which model (and optional variant, e.g. reasoning effort).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// The serde derive is for `settings.json` only; the wire shape is
+/// [`ModelRef::from_json`] / `to_json`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ModelRef {
     pub provider_id: String,
     pub id: String,

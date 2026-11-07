@@ -57,9 +57,33 @@ with **+** next to *Folders* (native folder picker; on Linux without an
 xdg-desktop-portal it asks for a path instead), or start ocdesk with a folder
 argument or `OCDESK_DIR`. On first run the launch directory is added. One
 opencode sidecar serves all folders: each session is pinned to its
-folder. Folders, collapsed state and theme are saved in
+folder. Folders, collapsed state, theme, window size/position (and whether it
+was maximized), sidebar width and visibility, the last open session and the
+model/agent picked for new sessions are saved in
 `~/.config/ocdesk/settings.json` (Linux) or
-`~/Library/Application Support/ocdesk/settings.json` (macOS).
+`~/Library/Application Support/ocdesk/settings.json` (macOS). The last open
+session is reopened on start unless a folder is passed on the command line.
+Drag the sidebar's right edge to resize it (double-click resets it).
+
+**Keyboard.** `Mod` is Cmd on macOS and Ctrl elsewhere; `Mod+/` shows the list.
+
+| Keys | Action |
+|---|---|
+| `Mod+N` | New session |
+| `Mod+O` | Add folder… |
+| `Mod+B` | Show/hide sidebar |
+| `Alt+↑` / `Alt+↓` | Previous / next session (sidebar order, expanded folders) |
+| `Mod+L` | Focus the prompt |
+| `Mod+.` or `Esc` in the prompt | Stop the running turn |
+| `Mod+Shift+D` | Toggle Changes / Conversation |
+| `Mod+/` | Keyboard shortcuts |
+| `Mod+Q` | Quit |
+
+**Errors.** If opencode is missing, too old or crashes, the sidebar footer
+shows why, with **Restart opencode** and **Copy details** (the error plus
+opencode's last output lines); a banner above the composer explains why
+prompts are paused. A conversation whose history can't be loaded shows the
+error with a **Retry** button.
 
 **Theme.** Dark by default. Set `"theme": "light"` or `"system"` in
 `settings.json`, or `OCDESK_THEME=light|system`.
@@ -164,13 +188,14 @@ Before every commit: `cargo fmt && cargo clippy --all-targets -- -D warnings`.
 src/
   main.rs            bootstrap: logging, tokio runtime thread, signals, window
   sidecar.rs         spawn / health-check / kill `opencode serve`
-  settings.rs        folders, collapsed folders, theme (JSON in the config dir)
+  settings.rs        folders, theme, window/sidebar, last session, draft model/agent (JSON)
   api/mod.rs         thin HTTP client + SSE reader (the only place that does HTTP)
   api/model.rs       our view of sessions/messages/blocks (lenient JSON parsing)
   api/events.rs      server events → our normalized Event enum
   store.rs           Entity<Store>: folders, sessions, conversations, busy; folds events
   controller.rs      intents → API calls; folders, sidecar lifecycle, auto-restart, SSE pump
-  ui/app_view.rs     root layout: sidebar | conversation; theme
+  ui/app_view.rs     root layout: sidebar | conversation; theme; window/sidebar persistence
+  ui/keys.rs         app-wide shortcuts and the shortcuts sheet
   ui/sidebar.rs      folders with their sessions; new / rename / delete; connection
   ui/conversation.rs virtualized message list (MessageScroller), start screen
   ui/message.rs      one message: plain text, reasoning, tool cards
@@ -230,7 +255,7 @@ handoff.md                       state of the project for the next session
 - [x] **M2** Incremental streaming markdown, code copy buttons, links, selectable text, collapsible reasoning, frame-time probe
 - [x] **M3** Tool cards, permissions (`permission.asked`), diffs
 - [x] **M4** Question forms, @mentions (files, subagents), model/variant/agent picker, prompt history
-- [ ] **M5** Keyboard, persistence of window/sidebar, error states
+- [x] **M5** Keyboard, persistence of window/sidebar, error states
 - [ ] **M6** Packaging (.app, AppImage), CI
 
 ## Design

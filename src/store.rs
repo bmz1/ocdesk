@@ -140,6 +140,8 @@ pub struct Store {
     /// Last error per session, cleared when a new prompt is sent.
     pub errors: HashMap<String, String>,
     pub conversations: HashMap<String, Conversation>,
+    /// Why a session's history couldn't be fetched (cleared on success).
+    pub load_errors: HashMap<String, String>,
     pub connection: Option<Connection>,
     pub opencode_version: Option<String>,
     /// A transient, app-level problem shown as a dismissible banner.
@@ -376,6 +378,45 @@ impl Store {
         self.busy.contains(session_id)
     }
 
+    /// The session `delta` rows above (-1) or below (+1) the selected one,
+    /// in sidebar order (sessions of expanded folders), wrapping around.
+    /// With nothing selected, +1 picks the first and -1 the last.
+    pub fn adjacent_session(&self, delta: isize) -> Option<String> {
+        let order: Vec<&str> = self
+            .folders
+            .iter()
+            .filter(|f| !self.collapsed.contains(*f))
+            .flat_map(|f| self.sessions_in(f).map(|s| s.id.as_str()))
+            .collect();
+        if order.is_empty() {
+            return None;
+        }
+        let n = order.len() as isize;
+        let current = self
+            .selected
+            .as_deref()
+            .and_then(|id| order.iter().position(|o| *o == id));
+        let next = match current {
+            Some(i) => (i as isize + delta).rem_euclid(n),
+            None if delta < 0 => n - 1,
+            None => 0,
+        };
+        Some(order[next as usize].to_string())
+    }
+
+    /// The selected session's history hasn't arrived yet and there's nothing
+    /// cached to show meanwhile.
+    pub fn selected_is_loading(&self) -> bool {
+        let Some(id) = self.selected.as_ref() else {
+            return false;
+        };
+        !self.load_errors.contains_key(id)
+            && self
+                .conversations
+                .get(id)
+                .is_none_or(|c| !c.loaded && c.messages.is_empty())
+    }
+
     pub fn selected_conversation(&self) -> Option<&Conversation> {
         self.conversations.get(self.selected.as_ref()?)
     }
@@ -478,6 +519,7 @@ impl Store {
     /// Replace a conversation with the authoritative REST projection,
     /// merging so that text streamed after the snapshot was taken survives.
     pub fn reconcile(&mut self, session_id: &str, history: Vec<Message>, cx: &mut Context<Self>) {
+        self.load_errors.remove(session_id);
         let events = self.reconcile_inner(session_id, history);
         self.emit_all(events, cx);
     }
@@ -985,6 +1027,64 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    fn session_in(id: &str, dir: &str, updated: u64) -> SessionInfo {
+        SessionInfo {
+            id: id.into(),
+            title: String::new(),
+            directory: PathBuf::from(dir),
+            created: updated,
+            updated,
+            parent_id: None,
+            model: None,
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn adjacent_session_follows_sidebar_order() {
+        let mut s = Store {
+            folders: vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c"),
+            ],
+            // Sidebar order: folders in order, sessions newest first.
+            sessions: vec![
+                session_in("a2", "/a", 2),
+                session_in("a1", "/a", 1),
+                session_in("b1", "/b", 1),
+                session_in("c1", "/c", 1),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(s.adjacent_session(1).as_deref(), Some("a2"));
+        assert_eq!(s.adjacent_session(-1).as_deref(), Some("c1"));
+        s.selected = Some("a1".into());
+        assert_eq!(s.adjacent_session(1).as_deref(), Some("b1"));
+        assert_eq!(s.adjacent_session(-1).as_deref(), Some("a2"));
+        // Collapsed folders are skipped; the ends wrap around.
+        s.collapsed.insert(PathBuf::from("/b"));
+        assert_eq!(s.adjacent_session(1).as_deref(), Some("c1"));
+        s.selected = Some("c1".into());
+        assert_eq!(s.adjacent_session(1).as_deref(), Some("a2"));
+        s.collapsed
+            .extend([PathBuf::from("/a"), PathBuf::from("/c")]);
+        assert_eq!(s.adjacent_session(1), None);
+    }
+
+    #[test]
+    fn loading_and_load_errors() {
+        let mut s = Store::default();
+        assert!(!s.selected_is_loading());
+        s.selected = Some("x".into());
+        assert!(s.selected_is_loading());
+        s.load_errors.insert("x".into(), "boom".into());
+        assert!(!s.selected_is_loading());
+        s.load_errors.clear();
+        s.reconcile_inner("x", vec![]);
+        assert!(!s.selected_is_loading());
     }
 
     fn loaded_store() -> Store {
