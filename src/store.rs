@@ -46,7 +46,20 @@ pub struct Conversation {
     pub loaded: bool,
     /// Highest durable sequence number folded in.
     pub last_seq: Option<u64>,
+    /// A history fetch is in flight (see [`Store::begin_load`]).
+    pub fetching: bool,
+    /// Bumped per fetch; only the latest fetch's snapshot is applied.
+    pub load_seq: u64,
+    /// Messages that events touched while the fetch was in flight: the only
+    /// local messages missing from the snapshot that survive it (others were
+    /// reverted, compacted away or deleted on the server).
+    pub live: HashSet<String>,
+    /// Events for a not-yet-loaded conversation, replayed after its snapshot.
+    pub pending: Vec<Envelope>,
 }
+
+/// Events buffered per loading conversation, at most.
+const MAX_PENDING: usize = 20_000;
 
 impl Conversation {
     /// `Ok(index)` of message `id`, else `Err(len)`: new messages append.
@@ -812,6 +825,48 @@ impl Store {
         self.emit_all(events, cx);
     }
 
+    /// A history fetch for `session_id` starts; returns its ticket for
+    /// [`Store::finish_load`]. Events that arrive meanwhile are tracked (and,
+    /// for an unloaded conversation, buffered) so the snapshot can be merged
+    /// without losing or resurrecting anything.
+    pub fn begin_load(&mut self, session_id: &str) -> u64 {
+        let conv = self
+            .conversations
+            .entry(session_id.to_string())
+            .or_default();
+        conv.load_seq += 1;
+        conv.fetching = true;
+        conv.live.clear();
+        conv.pending.clear();
+        conv.load_seq
+    }
+
+    /// Apply the snapshot of fetch `ticket`, unless a newer fetch started.
+    pub fn finish_load(
+        &mut self,
+        session_id: &str,
+        ticket: u64,
+        history: anyhow::Result<Vec<Message>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conv) = self.conversations.get_mut(session_id) else {
+            return;
+        };
+        if conv.load_seq != ticket {
+            return;
+        }
+        match history {
+            Ok(history) => self.reconcile(session_id, history, cx),
+            Err(e) => {
+                conv.fetching = false;
+                conv.pending.clear();
+                self.load_errors
+                    .insert(session_id.to_string(), format!("{e:#}"));
+                cx.notify();
+            }
+        }
+    }
+
     /// Forget fetched history for every session except `keep`, so it is
     /// re-fetched when next selected (used after a reconnect).
     pub fn invalidate_except(&mut self, keep: Option<&str>) {
@@ -1019,9 +1074,21 @@ impl Store {
         let Some(session_id) = event_session(&env.event).map(str::to_string) else {
             return out;
         };
-        let Some(conv) = self.conversations.get_mut(&session_id).filter(|c| c.loaded) else {
+        let Some(conv) = self.conversations.get_mut(&session_id) else {
             return out;
         };
+        if !conv.loaded {
+            // Replayed onto the snapshot when it lands.
+            if conv.fetching && conv.pending.len() < MAX_PENDING {
+                conv.pending.push(env);
+            }
+            return out;
+        }
+        if conv.fetching
+            && let Some(id) = event_message(&env.event)
+        {
+            conv.live.insert(id.to_string());
+        }
         if let Some(seq) = env.seq {
             conv.last_seq = Some(conv.last_seq.map_or(seq, |s| s.max(seq)));
         }
@@ -1256,15 +1323,97 @@ impl Store {
                 snap
             })
             .collect();
-        // Messages streamed after the snapshot was taken survive, after it,
-        // in the order they arrived.
-        merged.extend(newer);
+        // Messages streamed while the fetch was in flight survive, after the
+        // snapshot, in the order they arrived; other local-only messages are
+        // gone on the server (reverted, compacted, deleted).
+        merged.extend(newer.into_iter().filter(|m| conv.live.contains(m.id())));
         conv.messages = merged;
         conv.loaded = true;
+        conv.fetching = false;
+        conv.live.clear();
+        let pending = std::mem::take(&mut conv.pending);
+        // Prose blocks the snapshot has: buffered deltas for them partly
+        // overlap its text, so they are joined by overlap, not appended.
+        let in_snapshot: HashSet<(String, BlockKind, u64)> = conv
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => Some(a),
+                _ => None,
+            })
+            .flat_map(|a| {
+                a.blocks.iter().filter_map(|b| match b {
+                    Block::Prose { kind, ordinal, .. } => Some((a.id.clone(), *kind, *ordinal)),
+                    _ => None,
+                })
+            })
+            .collect();
+        let mut joined: Vec<((String, BlockKind, u64), String)> = Vec::new();
+        for env in pending {
+            if let Event::BlockDelta {
+                message_id,
+                kind,
+                ordinal,
+                delta,
+                ..
+            } = &env.event
+            {
+                let key = (message_id.clone(), *kind, *ordinal);
+                if in_snapshot.contains(&key) {
+                    match joined.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, d)) => d.push_str(delta),
+                        None => joined.push((key, delta.clone())),
+                    }
+                    continue;
+                }
+            }
+            self.apply_inner(env);
+        }
+        if let Some(conv) = self.conversations.get_mut(session_id) {
+            for ((message_id, kind, ordinal), deltas) in joined {
+                if let Ok(i) = conv.index_of(&message_id)
+                    && let Message::Assistant(a) = &mut conv.messages[i]
+                {
+                    let (text, _, _) = prose_mut(a, kind, ordinal);
+                    append_overlapping(text, &deltas);
+                }
+            }
+        }
         vec![StoreEvent::MessagesReset {
             session_id: session_id.to_string(),
         }]
     }
+}
+
+/// Append `deltas` to `text`, skipping the prefix of `deltas` that `text`
+/// already ends with (the part the snapshot captured).
+fn append_overlapping(text: &mut String, deltas: &str) {
+    let max = deltas.len().min(text.len());
+    let k = (0..=max)
+        .rev()
+        .filter(|&k| deltas.is_char_boundary(k))
+        .find(|&k| text.ends_with(&deltas[..k]))
+        .unwrap_or(0);
+    text.push_str(&deltas[k..]);
+}
+
+/// The message a transcript event is about.
+fn event_message(e: &Event) -> Option<&str> {
+    Some(match e {
+        Event::UserPrompt { message_id, .. }
+        | Event::StepStarted { message_id, .. }
+        | Event::BlockStarted { message_id, .. }
+        | Event::BlockDelta { message_id, .. }
+        | Event::BlockEnded { message_id, .. }
+        | Event::ToolStarted { message_id, .. }
+        | Event::ToolCalled { message_id, .. }
+        | Event::ToolProgress { message_id, .. }
+        | Event::ToolSucceeded { message_id, .. }
+        | Event::ToolFailed { message_id, .. }
+        | Event::StepEnded { message_id, .. }
+        | Event::StepFailed { message_id, .. } => message_id,
+        _ => return None,
+    })
 }
 
 fn event_session(e: &Event) -> Option<&str> {
@@ -1487,9 +1636,59 @@ mod tests {
                 meta: Default::default(),
             })
         };
+        s.begin_load("ses_a");
         s.apply_inner(wire(r#"{"type":"session.step.started","data":{"sessionID":"ses_a","assistantMessageID":"msg_0_reply"}}"#));
         s.reconcile_inner("ses_a", vec![user("msg_2_steer"), user("msg_1_queue")]);
         assert_eq!(ids(&s), ["msg_2_steer", "msg_1_queue", "msg_0_reply"]);
+        // Local messages no event touched during the fetch are gone on the
+        // server (an undo): the next snapshot drops them.
+        s.begin_load("ses_a");
+        s.reconcile_inner("ses_a", vec![user("msg_2_steer")]);
+        assert_eq!(ids(&s), ["msg_2_steer"]);
+    }
+
+    #[test]
+    fn deltas_buffered_during_a_load_join_the_snapshot_without_gaps_or_repeats() {
+        let mut s = Store::default();
+        let sid = "ses_b";
+        s.begin_load(sid);
+        let delta = |d: &str| {
+            wire(&format!(
+                r#"{{"type":"session.text.delta","data":{{"sessionID":"{sid}","assistantMessageID":"msg_a","ordinal":0,"delta":"{d}"}}}}"#
+            ))
+        };
+        // Arrive while the fetch is in flight; the snapshot saw "Hel".
+        for d in ["He", "l", "lo", " world"] {
+            s.apply_inner(delta(d));
+        }
+        let snap = Message::Assistant(AssistantMessage {
+            id: "msg_a".into(),
+            blocks: vec![Block::Prose {
+                kind: BlockKind::Text,
+                ordinal: 0,
+                text: "Hel".into(),
+                done: true,
+                time: Default::default(),
+            }],
+            ..Default::default()
+        });
+        s.reconcile_inner(sid, vec![snap]);
+        let Message::Assistant(a) = &s.conversations[sid].messages[0] else {
+            panic!()
+        };
+        let Block::Prose { text, .. } = &a.blocks[0] else {
+            panic!()
+        };
+        assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn a_stale_load_is_ignored() {
+        let mut s = Store::default();
+        let first = s.begin_load("ses_c");
+        let second = s.begin_load("ses_c");
+        assert_ne!(first, second);
+        assert_eq!(s.conversations["ses_c"].load_seq, second);
     }
 
     #[test]

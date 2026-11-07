@@ -27,8 +27,8 @@ pub struct ToolCtx<'a> {
     pub open_task: &'a super::tasks::OpenTask,
     pub scrolls: &'a ScrollHandles,
     pub density: crate::settings::Density,
-    /// The find bar's query, lowercased: calls that match open up.
-    pub find: Option<&'a str>,
+    /// Calls (ids) that match the find bar's query: they open up.
+    pub found: Option<&'a HashSet<String>>,
 }
 
 impl ToolCtx<'_> {
@@ -40,17 +40,37 @@ impl ToolCtx<'_> {
     }
 
     fn found(&self, t: &ToolCall) -> bool {
-        self.find.is_some_and(|q| tool_matches(t, q))
+        self.found.is_some_and(|f| f.contains(&t.call_id))
     }
 }
 
-/// Whether a call's input, output or error contains `q` (lowercase).
+/// Whether `hay` contains `needle_lower` (already lowercase), ignoring
+/// ASCII case, without allocating.
+pub fn contains_ci(hay: &str, needle_lower: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle_lower.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// Whether a call's input strings, output or error contain `q` (lowercase).
 pub fn tool_matches(t: &ToolCall, q: &str) -> bool {
-    let has = |s: &str| s.to_lowercase().contains(q);
-    has(&t.name)
-        || has(&t.input.to_string())
-        || has(&t.output)
-        || t.error.as_deref().is_some_and(has)
+    fn in_json(v: &serde_json::Value, q: &str) -> bool {
+        match v {
+            serde_json::Value::String(s) => contains_ci(s, q),
+            serde_json::Value::Array(a) => a.iter().any(|x| in_json(x, q)),
+            serde_json::Value::Object(o) => o.values().any(|x| in_json(x, q)),
+            _ => false,
+        }
+    }
+    contains_ci(&t.name, q)
+        || in_json(&t.input, q)
+        || contains_ci(&t.output, q)
+        || t.error.as_deref().is_some_and(|e| contains_ci(e, q))
 }
 
 /// Successful, finished calls are left out in the quiet density.

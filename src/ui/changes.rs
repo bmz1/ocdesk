@@ -365,7 +365,8 @@ pub fn parse_patch(patch: &str) -> Vec<PatchLine> {
             let o = parts.next().unwrap_or("-0");
             let n = parts.next().unwrap_or("+0");
             let start = |s: &str| {
-                s[1..]
+                s.get(1..)
+                    .unwrap_or("")
                     .split(',')
                     .next()
                     .and_then(|x| x.parse::<u32>().ok())
@@ -445,6 +446,36 @@ impl SideHighlights {
     }
 }
 
+type Prepared = std::rc::Rc<(Vec<PatchLine>, Option<SideHighlights>)>;
+
+thread_local! {
+    /// Parsed and highlighted patches by (patch, language): rendering runs
+    /// every frame, parsing and highlighting only when the patch changes.
+    static PREPARED: std::cell::RefCell<std::collections::HashMap<u64, Prepared>> =
+        Default::default();
+}
+
+fn prepare(patch: &str, language: Option<&str>) -> Prepared {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (patch, language).hash(&mut h);
+    let key = h.finish();
+    if let Some(hit) = PREPARED.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let parsed = parse_patch(patch);
+    let colours = side_highlights(&parsed, language);
+    let prepared: Prepared = std::rc::Rc::new((parsed, colours));
+    PREPARED.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 128 {
+            c.clear();
+        }
+        c.insert(key, prepared.clone());
+    });
+    prepared
+}
+
 fn side_highlights(parsed: &[PatchLine], language: Option<&str>) -> Option<SideHighlights> {
     let lang = language.filter(|l| super::syntax::supported(l))?;
     let (mut old, mut new) = (String::new(), String::new());
@@ -492,10 +523,10 @@ pub fn patch_view_with(id: &str, patch: &str, opts: PatchOpts, cx: &App) -> AnyE
     const MAX_LINES: usize = 800;
     let theme = cx.theme();
     let copy = patch.to_string();
-    let parsed = parse_patch(patch);
+    let prepared = prepare(patch, opts.language.as_deref());
+    let (parsed, colours) = (&prepared.0, &prepared.1);
     let total = parsed.len();
     let mut below = opts.below_line;
-    let colours = side_highlights(&parsed, opts.language.as_deref());
     let gutter = |n: Option<u32>| {
         div()
             .w(px(34.))
@@ -509,7 +540,7 @@ pub fn patch_view_with(id: &str, patch: &str, opts: PatchOpts, cx: &App) -> AnyE
         .w_full()
         .font_family(theme.mono_font_family.clone())
         .text_xs();
-    for (i, line) in parsed.into_iter().take(MAX_LINES).enumerate() {
+    for (i, line) in parsed.iter().take(MAX_LINES).cloned().enumerate() {
         let (old, new, sign, text, bg, fg) = match line {
             PatchLine::Hunk(ctx) => {
                 lines = lines.child(

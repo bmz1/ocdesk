@@ -73,11 +73,14 @@ pub fn render_message(
                 .next()
                 .and_then(|(k, _)| prose.state(&k).map(|s| markdown(&k, s)));
             let group = SharedString::from(format!("user-{}", user.id));
-            let undo = row.idle.then(|| {
+            let undo = Some({
                 let on_action = row.on_action.clone();
                 let message_id = user.id.clone();
+                // Always laid out (invisible while busy) so the row's height
+                // doesn't change when a turn starts or ends.
                 h_flex()
                     .gap_1()
+                    .when(!row.idle, |el| el.invisible())
                     .opacity(0.)
                     .group_hover(group.clone(), |s| s.opacity(1.))
                     .child(
