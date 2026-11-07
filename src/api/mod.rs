@@ -130,14 +130,111 @@ impl Api {
 
     /// `POST /api/session/{id}/prompt`. Returns once the input is admitted;
     /// the turn itself is observed on the event stream.
-    pub async fn prompt(&self, session_id: &str, text: &str) -> Result<()> {
-        let body = json!({ "text": text });
+    pub async fn prompt(&self, session_id: &str, input: &model::PromptInput) -> Result<()> {
         self.send(
             self.req(
                 Method::POST,
                 &format!("/api/session/{}/prompt", id(session_id)),
             )
-            .json(&body),
+            .json(&input.to_json()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Enabled models for a folder (`GET /api/model`), chat models only.
+    pub async fn models(&self, directory: &Path) -> Result<Vec<model::ModelInfo>> {
+        let v = self
+            .send(
+                self.req(Method::GET, "/api/model")
+                    .query(&[("location[directory]", directory)])
+                    .query(&[("types", "chat")]),
+            )
+            .await?;
+        let data = v["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("invalid models response"))?;
+        Ok(data
+            .iter()
+            .filter_map(model::ModelInfo::from_json)
+            .collect())
+    }
+
+    /// The folder's configured default model (`GET /api/model/default`).
+    pub async fn default_model(&self, directory: &Path) -> Result<Option<model::ModelRef>> {
+        let v = self
+            .send(
+                self.req(Method::GET, "/api/model/default")
+                    .query(&[("location[directory]", directory)]),
+            )
+            .await?;
+        Ok(model::ModelInfo::from_json(&v["data"]).map(|m| m.as_ref()))
+    }
+
+    /// Agents for a folder (`GET /api/agent`).
+    pub async fn agents(&self, directory: &Path) -> Result<Vec<model::AgentInfo>> {
+        let v = self
+            .send(
+                self.req(Method::GET, "/api/agent")
+                    .query(&[("location[directory]", directory)]),
+            )
+            .await?;
+        let data = v["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("invalid agents response"))?;
+        Ok(data
+            .iter()
+            .filter_map(model::AgentInfo::from_json)
+            .collect())
+    }
+
+    /// Fuzzy file search in a folder (`GET /api/fs/find`).
+    pub async fn find_files(
+        &self,
+        directory: &Path,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<model::FsEntry>> {
+        let v = self
+            .send(
+                self.req(Method::GET, "/api/fs/find")
+                    .query(&[("location[directory]", directory)])
+                    .query(&[("query", query), ("limit", &limit.to_string())]),
+            )
+            .await?;
+        let data = v["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("invalid find response"))?;
+        Ok(data
+            .iter()
+            .filter_map(|e| {
+                let path = e["path"].as_str()?;
+                // "/" is the location root itself.
+                (path != "/").then(|| model::FsEntry {
+                    path: path.to_string(),
+                    is_dir: e["type"].as_str() == Some("directory"),
+                })
+            })
+            .collect())
+    }
+
+    /// `POST /api/session/{id}/model` → 204; confirmed by `session.model.selected`.
+    pub async fn switch_model(&self, session_id: &str, model: &model::ModelRef) -> Result<()> {
+        let path = format!("/api/session/{}/model", id(session_id));
+        self.send(
+            self.req(Method::POST, &path)
+                .json(&json!({ "model": model.to_json() })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `POST /api/session/{id}/agent` → 204; confirmed by `session.agent.selected`.
+    pub async fn switch_agent(&self, session_id: &str, agent: &str) -> Result<()> {
+        let path = format!("/api/session/{}/agent", id(session_id));
+        self.send(
+            self.req(Method::POST, &path)
+                .json(&json!({ "agent": agent })),
         )
         .await?;
         Ok(())
@@ -429,63 +526,16 @@ mod tests {
     use super::{Api, SseParser};
     use crate::api::model::PermissionDecision;
 
-    /// Exercise the actual reqwest wire requests, including empty 204 replies.
-    #[tokio::test]
-    async fn permission_and_diff_http_contract() {
+    type Exchange = (&'static str, &'static str, &'static str, &'static str);
+
+    /// A one-connection-per-request HTTP server that checks each request
+    /// line and body in order and answers with the scripted response.
+    fn scripted_server(script: Vec<Exchange>) -> (Api, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            for (path, body, response, status) in [
-                (
-                    "GET /api/session/ses_a/permission ",
-                    "",
-                    r#"{"data":[{"id":"perm_a","sessionID":"ses_a","action":"shell","resources":["ls"]}]}"#,
-                    "200 OK",
-                ),
-                (
-                    "POST /api/session/ses_a/permission/perm_a/reply ",
-                    r#"{"decision":"once"}"#,
-                    "",
-                    "204 No Content",
-                ),
-                (
-                    "POST /api/session/ses_a/permission/perm_a/reply ",
-                    r#"{"decision":"always"}"#,
-                    "",
-                    "204 No Content",
-                ),
-                (
-                    "POST /api/session/ses_a/permission/perm_a/reply ",
-                    r#"{"decision":"reject"}"#,
-                    "denied",
-                    "500 Internal Server Error",
-                ),
-                (
-                    "GET /api/session/ses_a/diff?context=3 ",
-                    "",
-                    r#"{"data":[{"file":"a.rs","patch":"+new","status":"added","additions":1,"deletions":0}]}"#,
-                    "200 OK",
-                ),
-                (
-                    "GET /api/session/ses_a/form ",
-                    "",
-                    r#"{"data":[{"id":"frm_a","sessionID":"ses_a","title":"Questions","fields":[{"key":"q0","type":"string","description":"Pick one","options":[{"value":"y","label":"Yes"}],"custom":true}]}]}"#,
-                    "200 OK",
-                ),
-                (
-                    "POST /api/session/ses_a/form/frm_a/reply ",
-                    r#"{"answer":{"q0":"y"}}"#,
-                    "",
-                    "204 No Content",
-                ),
-                (
-                    "DELETE /api/session/ses_a/form/frm_a ",
-                    "",
-                    "",
-                    "204 No Content",
-                ),
-            ] {
+            for (path, body, response, status) in script {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -509,7 +559,14 @@ mod tests {
                     .unwrap_or(0);
                 let mut payload = vec![0; len];
                 stream.read_exact(&mut payload).unwrap();
-                assert_eq!(String::from_utf8(payload).unwrap(), body);
+                let payload = String::from_utf8(payload).unwrap();
+                if body.is_empty() {
+                    assert_eq!(payload, body);
+                } else {
+                    // Compare as JSON: key order is an implementation detail.
+                    let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+                    assert_eq!(parse(&payload), parse(body), "{path}");
+                }
                 write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{response}", response.len()).unwrap();
             }
         });
@@ -518,6 +575,62 @@ mod tests {
             base: format!("http://{address}"),
             password: "test".into(),
         };
+        (api, server)
+    }
+
+    /// Exercise the actual reqwest wire requests, including empty 204 replies.
+    #[tokio::test]
+    async fn permission_and_diff_http_contract() {
+        let (api, server) = scripted_server(vec![
+            (
+                "GET /api/session/ses_a/permission ",
+                "",
+                r#"{"data":[{"id":"perm_a","sessionID":"ses_a","action":"shell","resources":["ls"]}]}"#,
+                "200 OK",
+            ),
+            (
+                "POST /api/session/ses_a/permission/perm_a/reply ",
+                r#"{"decision":"once"}"#,
+                "",
+                "204 No Content",
+            ),
+            (
+                "POST /api/session/ses_a/permission/perm_a/reply ",
+                r#"{"decision":"always"}"#,
+                "",
+                "204 No Content",
+            ),
+            (
+                "POST /api/session/ses_a/permission/perm_a/reply ",
+                r#"{"decision":"reject"}"#,
+                "denied",
+                "500 Internal Server Error",
+            ),
+            (
+                "GET /api/session/ses_a/diff?context=3 ",
+                "",
+                r#"{"data":[{"file":"a.rs","patch":"+new","status":"added","additions":1,"deletions":0}]}"#,
+                "200 OK",
+            ),
+            (
+                "GET /api/session/ses_a/form ",
+                "",
+                r#"{"data":[{"id":"frm_a","sessionID":"ses_a","title":"Questions","fields":[{"key":"q0","type":"string","description":"Pick one","options":[{"value":"y","label":"Yes"}],"custom":true}]}]}"#,
+                "200 OK",
+            ),
+            (
+                "POST /api/session/ses_a/form/frm_a/reply ",
+                r#"{"answer":{"q0":"y"}}"#,
+                "",
+                "204 No Content",
+            ),
+            (
+                "DELETE /api/session/ses_a/form/frm_a ",
+                "",
+                "",
+                "204 No Content",
+            ),
+        ]);
         assert_eq!(api.permissions("ses_a").await.unwrap()[0].id, "perm_a");
         api.reply_permission("ses_a", "perm_a", PermissionDecision::Once)
             .await
@@ -538,6 +651,93 @@ mod tests {
             .await
             .unwrap();
         api.cancel_form("ses_a", "frm_a").await.unwrap();
+        server.join().unwrap();
+    }
+
+    /// Models, agents, file search, switching and prompt attachments.
+    #[tokio::test]
+    async fn models_agents_and_mentions_http_contract() {
+        use crate::api::model::{Mention, ModelRef, PromptInput};
+        let (api, server) = scripted_server(vec![
+            (
+                "GET /api/model?location%5Bdirectory%5D=%2Frepo&types=chat ",
+                "",
+                r#"{"data":[{"id":"m1","providerID":"p","name":"M One","enabled":true,"variants":[{"id":"high"}]},{"id":"off","providerID":"p","enabled":false}]}"#,
+                "200 OK",
+            ),
+            (
+                "GET /api/model/default?location%5Bdirectory%5D=%2Frepo ",
+                "",
+                r#"{"data":{"id":"m1","providerID":"p","name":"M One"}}"#,
+                "200 OK",
+            ),
+            (
+                "GET /api/agent?location%5Bdirectory%5D=%2Frepo ",
+                "",
+                r#"{"data":[{"id":"build","name":"Build","mode":"primary","hidden":false},{"id":"general","name":"General","mode":"subagent","hidden":false},{"id":"title","name":"Title","mode":"primary","hidden":true}]}"#,
+                "200 OK",
+            ),
+            (
+                "GET /api/fs/find?location%5Bdirectory%5D=%2Frepo&query=ma&limit=20 ",
+                "",
+                r#"{"data":[{"path":"src/main.rs","type":"file"},{"path":"/","type":"directory"},{"path":"src/","type":"directory"}]}"#,
+                "200 OK",
+            ),
+            (
+                "POST /api/session/ses_a/model ",
+                r#"{"model":{"id":"m1","providerID":"p","variant":"high"}}"#,
+                "",
+                "204 No Content",
+            ),
+            (
+                "POST /api/session/ses_a/agent ",
+                r#"{"agent":"plan"}"#,
+                "",
+                "204 No Content",
+            ),
+            (
+                "POST /api/session/ses_a/prompt ",
+                r#"{"agents":[{"mention":{"end":17,"start":9,"text":"@general"},"name":"general"}],"files":[{"mention":{"end":8,"start":0,"text":"@main.rs"},"name":"main.rs","uri":"file:///repo/main.rs"}],"text":"@main.rs @general"}"#,
+                r#"{"data":{"id":"msg_1"}}"#,
+                "200 OK",
+            ),
+        ]);
+        let dir = std::path::Path::new("/repo");
+        let models = api.models(dir).await.unwrap();
+        assert_eq!(models.len(), 1, "disabled models are dropped");
+        assert_eq!(models[0].variants, ["high"]);
+        let default = api.default_model(dir).await.unwrap().unwrap();
+        assert_eq!(
+            (default.provider_id.as_str(), default.id.as_str()),
+            ("p", "m1")
+        );
+        let agents = api.agents(dir).await.unwrap();
+        assert!(agents[0].is_primary() && !agents[0].is_subagent());
+        assert!(agents[1].is_subagent() && !agents[1].is_primary());
+        assert!(!agents[2].is_primary(), "hidden agents aren't offered");
+        let found = api.find_files(dir, "ma", 20).await.unwrap();
+        assert_eq!(found.len(), 2, "the location root is dropped");
+        assert!(!found[0].is_dir && found[1].is_dir);
+        let model = ModelRef {
+            provider_id: "p".into(),
+            id: "m1".into(),
+            variant: Some("high".into()),
+        };
+        api.switch_model("ses_a", &model).await.unwrap();
+        api.switch_agent("ses_a", "plan").await.unwrap();
+        let text = "@main.rs @general";
+        let input = PromptInput {
+            text: text.into(),
+            files: vec![(
+                "/repo/main.rs".into(),
+                Mention::from_byte_range(text, 0..8).unwrap(),
+            )],
+            agents: vec![(
+                "general".into(),
+                Mention::from_byte_range(text, 9..17).unwrap(),
+            )],
+        };
+        api.prompt("ses_a", &input).await.unwrap();
         server.join().unwrap();
     }
 

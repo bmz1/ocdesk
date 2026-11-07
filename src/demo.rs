@@ -45,6 +45,8 @@ pub fn start(store: &Entity<Store>, turns: usize, cx: &mut App) {
         created: now,
         updated: now,
         parent_id: None,
+        model: None,
+        agent: None,
     };
     let history: Vec<Message> = (0..turns).flat_map(turn).collect();
     tracing::info!(messages = history.len(), "demo mode: seeded history");

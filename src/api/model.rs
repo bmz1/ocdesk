@@ -16,6 +16,11 @@ pub struct SessionInfo {
     pub created: u64,
     pub updated: u64,
     pub parent_id: Option<String>,
+    /// Chosen with `POST /api/session/{id}/model`; `None` until the session
+    /// has one (the folder's default model applies).
+    pub model: Option<ModelRef>,
+    /// Primary agent (`build`, `plan`, …); `None` means the server default.
+    pub agent: Option<String>,
 }
 
 impl SessionInfo {
@@ -39,8 +44,204 @@ impl SessionInfo {
             created: u64_at(v, "/time/created").unwrap_or(0),
             updated: u64_at(v, "/time/updated").unwrap_or(0),
             parent_id: str_at(v, "/parentID"),
+            model: v.get("model").and_then(ModelRef::from_json),
+            agent: str_at(v, "/agent"),
         })
     }
+}
+
+/// `Model.Ref`: which model (and optional variant, e.g. reasoning effort).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ModelRef {
+    pub provider_id: String,
+    pub id: String,
+    /// The server reports `"default"` when none was picked.
+    pub variant: Option<String>,
+}
+
+impl ModelRef {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            provider_id: str_at(v, "/providerID")?,
+            id: str_at(v, "/id")?,
+            variant: str_at(v, "/variant").filter(|s| s != "default"),
+        })
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mut v = serde_json::json!({ "providerID": self.provider_id, "id": self.id });
+        if let Some(var) = &self.variant {
+            v["variant"] = Value::from(var.clone());
+        }
+        v
+    }
+
+    /// Same model, ignoring the variant.
+    pub fn same_model(&self, other: &ModelRef) -> bool {
+        self.provider_id == other.provider_id && self.id == other.id
+    }
+}
+
+/// One entry of `GET /api/model` (`Model.Info`), trimmed to what the picker needs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelInfo {
+    pub provider_id: String,
+    pub id: String,
+    pub name: String,
+    /// Variant ids (`low`, `high`, …), in server order.
+    pub variants: Vec<String>,
+}
+
+impl ModelInfo {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        if v.get("enabled").and_then(Value::as_bool) == Some(false) {
+            return None;
+        }
+        let id = str_at(v, "/id")?;
+        Some(Self {
+            provider_id: str_at(v, "/providerID")?,
+            name: str_at(v, "/name").unwrap_or_else(|| id.clone()),
+            id,
+            variants: v
+                .get("variants")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|x| str_at(x, "/id")).collect())
+                .unwrap_or_default(),
+        })
+    }
+
+    pub fn as_ref(&self) -> ModelRef {
+        ModelRef {
+            provider_id: self.provider_id.clone(),
+            id: self.id.clone(),
+            variant: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMode {
+    Primary,
+    Subagent,
+    All,
+}
+
+/// One entry of `GET /api/agent` (`Agent.Info`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentInfo {
+    pub id: String,
+    pub name: String,
+    pub mode: AgentMode,
+    pub hidden: bool,
+}
+
+impl AgentInfo {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let id = str_at(v, "/id")?;
+        Some(Self {
+            name: str_at(v, "/name").unwrap_or_else(|| id.clone()),
+            id,
+            mode: match v.get("mode").and_then(Value::as_str) {
+                Some("subagent") => AgentMode::Subagent,
+                Some("primary") => AgentMode::Primary,
+                _ => AgentMode::All,
+            },
+            hidden: v.get("hidden").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+
+    /// Can be the session's agent (the agent picker).
+    pub fn is_primary(&self) -> bool {
+        !self.hidden && self.mode != AgentMode::Subagent
+    }
+
+    /// Can be @-mentioned to delegate to (`agents` prompt attachment).
+    pub fn is_subagent(&self) -> bool {
+        !self.hidden && self.mode != AgentMode::Primary
+    }
+}
+
+/// A `GET /api/fs/find` hit, relative to the location.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FsEntry {
+    pub path: String,
+    pub is_dir: bool,
+}
+
+/// Where a mention sits in the prompt text (`Prompt.Mention`). Offsets are
+/// UTF-16 code units, as JavaScript string indices.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mention {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+impl Mention {
+    /// From a UTF-8 byte range of `text`.
+    pub fn from_byte_range(text: &str, range: std::ops::Range<usize>) -> Option<Self> {
+        let piece = text.get(range.clone())?;
+        let start = text[..range.start].encode_utf16().count();
+        Some(Self {
+            start,
+            end: start + piece.encode_utf16().count(),
+            text: piece.to_string(),
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        serde_json::json!({ "start": self.start, "end": self.end, "text": self.text })
+    }
+}
+
+/// `POST /api/session/{id}/prompt` body.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PromptInput {
+    pub text: String,
+    /// Absolute paths; the server reads and inlines them (`file://` URIs).
+    pub files: Vec<(std::path::PathBuf, Mention)>,
+    /// Subagent ids to delegate to.
+    pub agents: Vec<(String, Mention)>,
+}
+
+impl PromptInput {
+    pub fn to_json(&self) -> Value {
+        let mut v = serde_json::json!({ "text": self.text });
+        if !self.files.is_empty() {
+            v["files"] = self
+                .files
+                .iter()
+                .map(|(path, m)| {
+                    serde_json::json!({
+                        "uri": file_uri(path),
+                        "name": m.text.trim_start_matches('@'),
+                        "mention": m.to_json(),
+                    })
+                })
+                .collect();
+        }
+        if !self.agents.is_empty() {
+            v["agents"] = self
+                .agents
+                .iter()
+                .map(|(name, m)| serde_json::json!({ "name": name, "mention": m.to_json() }))
+                .collect();
+        }
+        v
+    }
+}
+
+/// `file://` URI with the path percent-encoded where a URI requires it.
+pub fn file_uri(path: &std::path::Path) -> String {
+    let mut out = String::from("file://");
+    for b in path.to_string_lossy().bytes() {
+        if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq)]

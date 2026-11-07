@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use super::model::{
-    BlockKind, FormRequest, PermissionRequest, SessionInfo, content_text, error_text, str_at,
-    u64_at,
+    BlockKind, FormRequest, ModelRef, PermissionRequest, SessionInfo, content_text, error_text,
+    str_at, u64_at,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,6 +50,18 @@ pub enum Event {
     SessionRemoved {
         session_id: String,
     },
+    /// `session.model.selected`
+    ModelSelected {
+        session_id: String,
+        model: ModelRef,
+    },
+    /// `session.agent.selected`
+    AgentSelected {
+        session_id: String,
+        agent: String,
+    },
+    /// Models, agents or providers changed (config edit, login, …).
+    CatalogChanged,
     /// The session started working on its inbox.
     ExecutionStarted {
         session_id: String,
@@ -207,7 +219,19 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
             created,
             updated: created,
             parent_id: str_at(d, "/parentID"),
+            model: None,
+            agent: None,
         }),
+        "session.model.selected" => Event::ModelSelected {
+            session_id: sid()?,
+            model: ModelRef::from_json(d.get("model")?)?,
+        },
+        "session.agent.selected" => Event::AgentSelected {
+            session_id: sid()?,
+            agent: str_at(d, "/agent")?,
+        },
+        // Config changes: the model/agent lists may have changed.
+        "model.updated" | "agent.updated" | "provider.updated" => Event::CatalogChanged,
         "session.renamed" => Event::SessionRenamed {
             session_id: sid()?,
             title: str_at(d, "/title")?,
@@ -339,6 +363,36 @@ mod tests {
             .lines()
             .map(|l| Envelope::from_json(l).expect("every captured frame decodes"))
             .collect()
+    }
+
+    #[test]
+    fn decodes_model_and_agent_selection() {
+        // Shapes captured from opencode 2.2.6.
+        let m = Envelope::from_json(r#"{"type":"session.model.selected","data":{"sessionID":"ses_a","model":{"id":"mock-2","providerID":"mock"}},"durable":{"aggregateID":"ses_a","seq":1,"version":1}}"#).unwrap();
+        assert_eq!(
+            m.event,
+            Event::ModelSelected {
+                session_id: "ses_a".into(),
+                model: ModelRef {
+                    provider_id: "mock".into(),
+                    id: "mock-2".into(),
+                    variant: None
+                },
+            }
+        );
+        let a = Envelope::from_json(
+            r#"{"type":"session.agent.selected","data":{"sessionID":"ses_a","agent":"plan"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            a.event,
+            Event::AgentSelected {
+                session_id: "ses_a".into(),
+                agent: "plan".into()
+            }
+        );
+        let c = Envelope::from_json(r#"{"type":"agent.updated","data":{}}"#).unwrap();
+        assert_eq!(c.event, Event::CatalogChanged);
     }
 
     #[test]

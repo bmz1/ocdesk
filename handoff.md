@@ -3,7 +3,7 @@
 State of ocdesk for whoever picks it up next. Read this first, then
 [README.md](README.md) and [docs/protocol-notes.md](docs/protocol-notes.md).
 
-_Last updated: 2026-11-07, M3 built on M2 (`m3-tools-permissions-diffs`)._
+_Last updated: 2026-11-07, M4 (`m4-models-agents-mentions`, branched from `master` @ `75fe7d6`)._
 
 ## Where things are
 
@@ -20,7 +20,10 @@ _Last updated: 2026-11-07, M3 built on M2 (`m3-tools-permissions-diffs`)._
   No M3 PR was opened; the owner opens/asks for PRs.
 - The old `claude/friendly-lamport-ne3gxc` remote branch could not be deleted
   from the agent sandbox (git proxy 403); the owner was asked to delete it.
-- **Next milestone: M4** (see *Next steps*).
+- **M4** is split in two: question forms + Codex-style tool cards landed
+  directly on `master` (`75fe7d6`); model/agent/variant pickers, `@`
+  mentions and prompt history are on `m4-models-agents-mentions`
+  (uncommitted until the owner asks). Next milestone after that: **M5**.
 
 ## Decisions already made (don't re-litigate)
 
@@ -178,7 +181,27 @@ Data flow: view → `Controller` intent → `Api` on Tokio → result back via
   reject permission flow, restoring pending requests and an edit diff in a
   temporary repository with isolated config/data.
 
-**M4:** model picker (`/api/model`, `/api/model/default`, `POST /api/session/{id}/model`),
-agents (`/api/agent`), `@` mentions (`/api/fs/find`), prompt `files`.
+**M4 notes**
+- Verified on Fedora/Wayland (real GPU, not Xvfb; no xdotool here):
+  `cargo fmt --check`, `clippy -D warnings`, `cargo test` **30 passed**
+  (incl. an HTTP contract test for model/agent/find/switch/prompt-attachment
+  wire shapes, mention/history unit tests, store precedence test). Real
+  opencode 2.2.6: `types=chat`, `fs/find`, switch endpoints/events and
+  `files`+`agents` attachments with UTF-16 mention offsets (scratch probe);
+  app probe prompt → `verify: store matches REST`.
+- **Not yet driven by hand:** the `@` popup keyboard flow, picker menus and
+  history recall in the native window. Do that first (and screenshot) on a
+  box with Xvfb+xdotool or by hand.
+- Key interception: GPUI dispatches key *bindings* before key listeners, so
+  the composer claims Up/Down/Enter/Tab/Escape with `capture_action` on the
+  textarea's actions (`MoveUp`, `Enter`, `IndentInline`, …), not
+  `on_key_down`.
+- Mentions are gpui-base inline tokens (`replace_range_with_token`), id
+  `file:<rel>` / `agent:<id>`; `ui/mention.rs::build_prompt` turns
+  `content().tokens()` into attachments.
+- Ideas left: directory mentions (server behavior for a dir `file://` URI
+  is untested), restoring tokens on history recall, showing attached files
+  as chips on sent user messages (the projection has `files[]`), `skills`
+  attachments, persisting the draft model/agent in settings (M5).
 **M5/M6:** see README roadmap.
 

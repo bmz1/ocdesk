@@ -47,6 +47,11 @@ what `curl https://opencode.ai/install` installs) is rejected at startup.
 | Validate a folder | `GET /api/location?location[directory]=…` | `{directory, project: {id, directory, canonical}}` |
 | Events (all folders) | `GET /api/event` | one SSE stream; `?types=` filter exists |
 | Permissions | `GET /api/session/{id}/permission`, `POST …/permission/{id}/reply {decision}` | 204 |
+| Models | `GET /api/model?location[directory]=…&types=chat` | `{data: [Model.Info]}`: `id`, `providerID`, `name`, `enabled`, `variants: [{id, settings}]`; includes the built-in `opencode` provider's free models |
+| Default model | `GET /api/model/default?location[directory]=…` | `{data: Model.Info}` |
+| Agents | `GET /api/agent?location[directory]=…` | `{data: [{id, name, mode: primary\|subagent\|all, hidden, model?}]}`; `build`/`plan` primary, `general`/`explore` subagents, `title`/`summary`/`compaction` hidden |
+| Switch model / agent | `POST /api/session/{id}/model {model: {providerID, id, variant?}}`, `POST …/agent {agent}` | 204, then `session.model.selected` / `session.agent.selected`; `Session.Info` gains `model` (`variant: "default"` when none) and `agent` |
+| File search | `GET /api/fs/find?location[directory]=…&query=&limit=` | `{data: [{path, type: file\|directory}]}`, paths relative, directories end in `/`, the root is `"/"` |
 | Latest-turn file changes | `GET /api/session/{id}/diff?context=3` | `{data: [{file, patch, status, additions, deletions, more?}]}`; omitting `from` selects the latest user turn |
 
 `Session.Info`:
@@ -201,3 +206,22 @@ old/new tool arguments. `context=3` bounds unchanged context. `more: true`
 means opencode truncated the patch; Copy cannot restore data the server omitted.
 The UI also bounds its own preview, while Copy retains the returned patch.
 `form.*` question events remain outside this milestone.
+
+## M4 client behavior
+
+- **Prompt attachments.** `files: [{uri: "file:///abs/path", name, mention:
+  {start, end, text}}]` makes the server read and inline the file (the user
+  message stores `data` base64 + `mime`). `agents: [{name, mention}]`
+  delegates to a subagent. Mention offsets are **UTF-16 code units** (JS
+  string indices); verified with a non-ASCII prefix on 2.2.6.
+- **Model/agent choice.** The composer shows the selected session's
+  `model`/`agent`, else the last pick ("draft", sticky across new sessions),
+  else the folder default (`/api/model/default`, agent `build`). A new
+  session gets the draft via the switch endpoints *before* its first prompt.
+  Switching emits `model-switched` / `agent-switched` (and, for `plan`, a
+  `synthetic` reminder) entries in the message projection; they're skipped
+  like other non-chat types.
+- **Catalog refresh.** Models/agents are re-read per folder after every
+  (re)connect, after adding a folder, and (debounced 300 ms) on
+  `model.updated` / `agent.updated` / `provider.updated`, which arrive in a
+  burst at sidecar startup.
