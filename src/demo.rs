@@ -77,14 +77,15 @@ fn turn(i: usize) -> [Message; 2] {
         done: true,
     }];
     if i % 3 == 1 {
-        blocks.push(Block::Tool(ToolCall {
+        blocks.push(Block::Tool(Box::new(ToolCall {
             call_id: format!("call_{i}"),
             name: "shell".into(),
             status: ToolStatus::Completed,
             input: serde_json::json!({ "command": "cargo test --quiet" }),
             output: "test result: ok".into(),
             error: None,
-        }));
+            metadata: serde_json::Value::Null,
+        })));
     }
     blocks.push(Block::Prose {
         kind: BlockKind::Text,

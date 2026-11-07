@@ -15,6 +15,7 @@ use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use gpui_kit::{Context, Entity, Task};
 
+use crate::api::model::PermissionDecision;
 use crate::api::{Api, Envelope, Event};
 use crate::settings::Settings;
 use crate::sidecar::{self, SidecarConfig};
@@ -31,6 +32,8 @@ pub struct Controller {
     api: Option<Api>,
     /// Bumped on every sidecar (re)start so stale callbacks can be ignored.
     generation: u64,
+    connection_epoch: u64,
+    diff_requests: std::collections::HashMap<String, u64>,
     pump: Option<(tokio::task::AbortHandle, Task<()>)>,
     exit_watch: Option<Task<()>>,
     recent_crashes: Vec<Instant>,
@@ -62,6 +65,8 @@ impl Controller {
             settings,
             api: None,
             generation: 0,
+            connection_epoch: 0,
+            diff_requests: Default::default(),
             pump: None,
             exit_watch: None,
             recent_crashes: Vec::new(),
@@ -121,6 +126,11 @@ impl Controller {
         self.generation += 1;
         let generation = self.generation;
         self.api = None;
+        self.store.update(cx, |s, cx| {
+            s.permission_sending.clear();
+            s.diff_loading.clear();
+            cx.notify();
+        });
         self.stop_pump();
         self.exit_watch = None;
         self.store
@@ -249,6 +259,7 @@ impl Controller {
     fn on_event(&mut self, env: Envelope, cx: &mut Context<Self>) {
         match env.event {
             Event::Connected => {
+                self.connection_epoch += 1;
                 #[cfg(debug_assertions)]
                 if std::env::var_os("OCDESK_DEBUG_PANIC").is_some() {
                     panic!("OCDESK_DEBUG_PANIC: deliberate panic to test sidecar teardown");
@@ -258,6 +269,11 @@ impl Controller {
                 self.resync(cx);
             }
             Event::Disconnected => {
+                self.connection_epoch += 1;
+                self.store.update(cx, |s, cx| {
+                    s.permission_sending.clear();
+                    cx.notify();
+                });
                 self.store.update(cx, |s, cx| {
                     if s.connection() == Connection::Connected {
                         s.set_connection(Connection::Reconnecting, cx);
@@ -279,6 +295,10 @@ impl Controller {
 
     /// A turn finished (`session.execution.succeeded|failed|interrupted`).
     fn on_turn_over(&mut self, _session_id: String, cx: &mut Context<Self>) {
+        self.refresh_permissions(_session_id.clone(), cx);
+        if self.store.read(cx).diffs.contains_key(&_session_id) {
+            self.refresh_diff(_session_id.clone(), cx);
+        }
         #[cfg(debug_assertions)]
         if std::env::var_os("OCDESK_VERIFY_ON_IDLE").is_some() {
             self.verify_against_rest(_session_id, cx);
@@ -307,8 +327,17 @@ impl Controller {
                 },
             );
         }
+        let mut pending_sessions: std::collections::HashSet<String> =
+            self.store.read(cx).permissions.keys().cloned().collect();
         if let Some(id) = selected {
-            self.load_messages(id, cx);
+            pending_sessions.insert(id.clone());
+            self.load_messages(id.clone(), cx);
+            if self.store.read(cx).diffs.contains_key(&id) {
+                self.refresh_diff(id, cx);
+            }
+        }
+        for sid in pending_sessions {
+            self.refresh_permissions(sid, cx);
         }
     }
 
@@ -359,7 +388,13 @@ impl Controller {
             cx,
             async move { api.list_sessions().await },
             |this, res, cx| match res {
-                Ok(list) => this.store.update(cx, |s, cx| s.set_sessions(list, cx)),
+                Ok(list) => {
+                    let ids: Vec<_> = list.iter().map(|s| s.id.clone()).collect();
+                    this.store.update(cx, |s, cx| s.set_sessions(list, cx));
+                    for id in ids {
+                        this.refresh_permissions(id, cx);
+                    }
+                }
                 Err(e) => this.notice(format!("Could not list sessions: {e:#}"), cx),
             },
         );
@@ -380,9 +415,136 @@ impl Controller {
         );
     }
 
+    pub fn refresh_permissions(&mut self, sid: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else { return };
+        let (generation, epoch) = (self.generation, self.connection_epoch);
+        let revision = self.store.read(cx).permission_revision(&sid);
+        let id = sid.clone();
+        self.run(
+            cx,
+            async move { api.permissions(&id).await },
+            move |this, res, cx| {
+                if this.generation != generation || this.connection_epoch != epoch {
+                    return;
+                }
+                match res {
+                    Ok(requests) => {
+                        // A live asked/replied event (or newer snapshot) wins over this read.
+                        if this.store.read(cx).permission_revision(&sid) == revision {
+                            this.store
+                                .update(cx, |s, cx| s.set_permissions(&sid, requests, cx));
+                        } else {
+                            this.refresh_permissions(sid, cx);
+                        }
+                    }
+                    Err(e) => this.notice(format!("Could not load permission requests: {e:#}"), cx),
+                }
+            },
+        );
+    }
+
+    pub fn reply_permission(
+        &mut self,
+        sid: String,
+        rid: String,
+        decision: PermissionDecision,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(api) = self.api(cx) else { return };
+        let key = (sid.clone(), rid.clone());
+        let store = self.store.read(cx);
+        let exists = store
+            .permissions
+            .get(&sid)
+            .is_some_and(|rs| rs.iter().any(|r| r.id == rid));
+        if !exists
+            || store.permission_sending.contains(&key)
+            || store.connection() != Connection::Connected
+        {
+            return;
+        }
+        let (generation, epoch) = (self.generation, self.connection_epoch);
+        self.store.update(cx, |s, cx| {
+            s.permission_sending.insert(key.clone());
+            s.permission_errors.remove(&key);
+            cx.notify();
+        });
+        let (session, request) = (sid.clone(), rid.clone());
+        self.run(
+            cx,
+            async move { api.reply_permission(&session, &request, decision).await },
+            move |this, res, cx| {
+                if this.generation != generation || this.connection_epoch != epoch {
+                    return;
+                }
+                this.store.update(cx, |s, cx| {
+                    s.permission_sending.remove(&key);
+                    match res {
+                        Ok(()) => s.apply(
+                            Envelope::bare(Event::PermissionReplied {
+                                session_id: sid.clone(),
+                                request_id: rid,
+                            }),
+                            cx,
+                        ),
+                        Err(e) => {
+                            // Keep the request visible and retryable after an HTTP failure.
+                            if s.permissions
+                                .get(&sid)
+                                .is_some_and(|rs| rs.iter().any(|r| r.id == rid))
+                            {
+                                s.permission_errors
+                                    .insert(key, format!("Could not reply: {e:#}"));
+                            }
+                            cx.notify();
+                        }
+                    }
+                });
+                this.refresh_permissions(sid, cx);
+            },
+        );
+    }
+
+    pub fn refresh_diff(&mut self, sid: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        let generation = self.generation;
+        let request = self.diff_requests.entry(sid.clone()).or_default();
+        *request += 1;
+        let request = *request;
+        self.store.update(cx, |s, cx| {
+            s.diff_loading.insert(sid.clone());
+            s.diff_errors.remove(&sid);
+            cx.notify();
+        });
+        let id = sid.clone();
+        self.run(
+            cx,
+            async move { api.diff(&id).await },
+            move |this, res, cx| {
+                if this.generation != generation || this.diff_requests.get(&sid) != Some(&request) {
+                    return;
+                }
+                this.store.update(cx, |s, cx| {
+                    s.diff_loading.remove(&sid);
+                    match res {
+                        Ok(files) => {
+                            s.diffs.insert(sid, files);
+                        }
+                        Err(e) => {
+                            s.diff_errors
+                                .insert(sid, format!("Could not load changes: {e:#}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        );
+    }
+
     pub fn select_session(&mut self, id: Option<String>, cx: &mut Context<Self>) {
         self.store.update(cx, |s, cx| s.select(id.clone(), cx));
         if let Some(id) = id {
+            self.refresh_permissions(id.clone(), cx);
             self.load_messages(id, cx);
         }
     }

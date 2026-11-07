@@ -9,7 +9,9 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use super::model::{BlockKind, SessionInfo, content_text, error_text, str_at, u64_at};
+use super::model::{
+    BlockKind, PermissionRequest, SessionInfo, content_text, error_text, str_at, u64_at,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Envelope {
@@ -98,17 +100,31 @@ pub enum Event {
         call_id: String,
         input: Value,
     },
+    ToolProgress {
+        session_id: String,
+        message_id: String,
+        call_id: String,
+        metadata: Value,
+    },
+    PermissionAsked(PermissionRequest),
+    PermissionReplied {
+        session_id: String,
+        request_id: String,
+    },
     ToolSucceeded {
         session_id: String,
         message_id: String,
         call_id: String,
         output: String,
+        metadata: Value,
     },
     ToolFailed {
         session_id: String,
         message_id: String,
         call_id: String,
         error: String,
+        output: String,
+        metadata: Value,
     },
     /// `finish` is "stop", "tool-calls", "length", …
     StepEnded {
@@ -246,13 +262,27 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
             call_id: str_at(d, "/id")?,
             input: d.get("input").cloned().unwrap_or(Value::Null),
         },
+        "permission.asked" => Event::PermissionAsked(PermissionRequest::from_json(d)?),
+        "permission.replied" => Event::PermissionReplied {
+            session_id: sid()?,
+            request_id: str_at(d, "/requestID")?,
+        },
+        "session.tool.progress" => Event::ToolProgress {
+            session_id: sid()?,
+            message_id: mid()?,
+            call_id: str_at(d, "/id")?,
+            metadata: d.get("metadata").cloned().unwrap_or(Value::Null),
+        },
         "session.tool.success" => Event::ToolSucceeded {
             session_id: sid()?,
             message_id: mid()?,
             call_id: str_at(d, "/id")?,
             output: content_text(d.get("content")),
+            metadata: d.get("metadata").cloned().unwrap_or(Value::Null),
         },
         "session.tool.failed" => Event::ToolFailed {
+            output: content_text(d.get("content")),
+            metadata: d.get("metadata").cloned().unwrap_or(Value::Null),
             session_id: sid()?,
             message_id: mid()?,
             call_id: str_at(d, "/id")?,
@@ -287,6 +317,22 @@ mod tests {
             .lines()
             .map(|l| Envelope::from_json(l).expect("every captured frame decodes"))
             .collect()
+    }
+
+    #[test]
+    fn decodes_permissions_and_progress() {
+        let asked = Envelope::from_json(r#"{"type":"permission.asked","data":{"id":"perm_a","sessionID":"ses_a","action":"shell","resources":["ls"]}}"#).unwrap();
+        assert!(
+            matches!(asked.event, Event::PermissionAsked(r) if r.id == "perm_a" && r.session_id == "ses_a")
+        );
+        let replied = Envelope::from_json(r#"{"type":"permission.replied","data":{"sessionID":"ses_a","requestID":"perm_a","reply":"once"}}"#).unwrap();
+        assert!(
+            matches!(replied.event, Event::PermissionReplied { request_id, .. } if request_id == "perm_a")
+        );
+        let progress = Envelope::from_json(r#"{"type":"session.tool.progress","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","id":"call_a","metadata":{"diff":"+hello"}}}"#).unwrap();
+        assert!(
+            matches!(progress.event, Event::ToolProgress { metadata, .. } if metadata["diff"] == "+hello")
+        );
     }
 
     #[test]

@@ -185,7 +185,7 @@ class Handler(BaseHTTPRequestHandler):
                 tool_call(pick("shell", "bash"), {"command": "echo hello-from-bash && ls | head -5", "description": "Say hello and list files"})
             elif "tool:edit" in user:
                 stream_text("Writing a file.\n")
-                tool_call(pick("write", "edit"), {"filePath": "mock_note.txt", "content": "line one\nline two\n"})
+                tool_call(pick("write", "edit"), {"path": "mock_note.txt", "content": "line one\nline two\n"})
             elif "rich" in user:
                 stream_text(RICH_REASONING, "reasoning_content")
                 stream_text(RICH)
@@ -210,3 +210,4 @@ if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 4555
     print(f"mock_llm listening on http://127.0.0.1:{port}/v1", flush=True)
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+

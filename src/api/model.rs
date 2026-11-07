@@ -89,7 +89,7 @@ pub enum Block {
         text: String,
         done: bool,
     },
-    Tool(ToolCall),
+    Tool(Box<ToolCall>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +108,84 @@ pub struct ToolCall {
     pub input: Value,
     pub output: String,
     pub error: Option<String>,
+    pub metadata: Value,
+}
+
+/// Pending requests are session-owned, including while their history is unloaded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PermissionRequest {
+    pub id: String,
+    pub session_id: String,
+    pub action: String,
+    pub resources: Vec<String>,
+    pub save: Vec<String>,
+    pub message: Option<String>,
+    pub metadata: Value,
+}
+
+impl PermissionRequest {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let strings = |key: &str| {
+            v.get(key)
+                .and_then(Value::as_array)
+                .map(|xs| {
+                    xs.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Some(Self {
+            id: str_at(v, "/id")?,
+            session_id: str_at(v, "/sessionID")?,
+            action: str_at(v, "/action")?,
+            resources: strings("resources"),
+            save: strings("save"),
+            message: str_at(v, "/message"),
+            metadata: v.get("metadata").cloned().unwrap_or(Value::Null),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Once,
+    Always,
+    Reject,
+}
+
+impl PermissionDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Always => "always",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileDiff {
+    pub file: String,
+    pub patch: String,
+    pub status: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub more: bool,
+}
+
+impl FileDiff {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            file: str_at(v, "/file")?,
+            patch: str_at(v, "/patch").unwrap_or_default(),
+            status: str_at(v, "/status").unwrap_or_default(),
+            additions: u64_at(v, "/additions").unwrap_or_default(),
+            deletions: u64_at(v, "/deletions").unwrap_or_default(),
+            more: v.get("more").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
 }
 
 impl Message {
@@ -154,7 +232,7 @@ impl Block {
             "text" => BlockKind::Text,
             "tool" => {
                 let state = v.get("state");
-                return Some(Block::Tool(ToolCall {
+                return Some(Block::Tool(Box::new(ToolCall {
                     call_id: str_at(v, "/id")?,
                     name: str_at(v, "/name").unwrap_or_default(),
                     status: tool_status(
@@ -166,7 +244,11 @@ impl Block {
                         .unwrap_or(Value::Null),
                     output: content_text(state.and_then(|s| s.get("content"))),
                     error: error_text(state.and_then(|s| s.get("error"))),
-                }));
+                    metadata: state
+                        .and_then(|s| s.get("metadata"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                })));
             }
             _ => return None,
         };
@@ -231,6 +313,22 @@ pub fn u64_at(v: &Value, ptr: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_and_diff_parse_server_shapes() {
+        let request = PermissionRequest::from_json(&serde_json::json!({
+            "id":"perm_a","sessionID":"ses_a","action":"edit","resources":["/tmp/a"],
+            "save":["/tmp/*"],"source":{"type":"tool","id":"call_a","messageID":"msg_a"}
+        }))
+        .unwrap();
+        assert_eq!(request.resources, ["/tmp/a"]);
+        assert_eq!(request.save, ["/tmp/*"]);
+        assert!(PermissionRequest::from_json(&serde_json::json!({"id":"perm_a"})).is_none());
+        let diff = FileDiff::from_json(&serde_json::json!({"file":"a.rs","patch":"@@ -1 +1 @@\n-old\n+new", "status":"modified","additions":1,"deletions":1,"more":true})).unwrap();
+        assert!(diff.more);
+        assert_eq!(diff.additions, 1);
+        assert_eq!(diff.deletions, 1);
+    }
 
     #[test]
     fn parses_real_message_list() {

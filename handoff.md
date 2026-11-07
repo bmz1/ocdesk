@@ -3,22 +3,24 @@
 State of ocdesk for whoever picks it up next. Read this first, then
 [README.md](README.md) and [docs/protocol-notes.md](docs/protocol-notes.md).
 
-_Last updated: 2026-11-07, end of M2 (branch `claude/elegant-mccarthy-dymj86`, no PR opened yet)._
+_Last updated: 2026-11-07, M3 built on M2 (`m3-tools-permissions-diffs`)._
 
 ## Where things are
 
 - **Done:** M0 (spike), M1 (folders + sessions, streaming conversation,
   composer, reconnect, crash recovery) and M2 (incremental streaming
   markdown, code-block copy buttons, links, selectable text, collapsible
-  reasoning, frame-time probe, offline demo mode), targeting **opencode
-  2.2.6 only**. Dark theme by default.
+  reasoning, frame-time probe, offline demo mode), plus M3 (expandable tool
+  cards, session-scoped permission prompts/replies and latest-turn file diffs),
+  targeting **opencode 2.2.6 only**. Dark theme by default.
 - **Workflow the owner wants:** branch from `master` → feature PR → owner
   reviews → merge to `master`. Don't push to `master` directly. PR #1 (M1)
-  is merged. M2 is on `claude/elegant-mccarthy-dymj86`; a PR for it was not
-  opened yet (the owner opens/asks for PRs).
+  is merged. M2 is on `claude/elegant-mccarthy-dymj86` (latest picked up:
+  `bb26e4e`); M3 branches from that commit on `m3-tools-permissions-diffs`.
+  No M3 PR was opened; the owner opens/asks for PRs.
 - The old `claude/friendly-lamport-ne3gxc` remote branch could not be deleted
   from the agent sandbox (git proxy 403); the owner was asked to delete it.
-- **Next milestone: M3** (see *Next steps*).
+- **Next milestone: M4** (see *Next steps*).
 
 ## Decisions already made (don't re-litigate)
 
@@ -89,6 +91,23 @@ switching; rename and delete via dialogs; `kill -9` of the sidecar recovers;
 teardown 5/5; a 1.x binary is refused with an install hint. **Nothing has run
 on macOS yet**, and macOS is the primary target.
 
+Verified at the end of M3 (Rust 1.99.1, Linux/Xvfb/llvmpipe,
+real opencode 2.2.6 + deterministic mock model):
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
+  `cargo test`: **21 passed** (including M2's prose tests and an HTTP wire
+  test for permission paths, all reply decisions, 204s, failure and diffs).
+- `python3 dev/m3-protocol-test.py <opencode2>`: once / reject / always,
+  pending-permission recovery via REST, rejected tool history, edit + diff.
+- Native UI: Allow once and Reject shell requests; Always allow an edit;
+  tool input/output expansion, Copy output pasted back into the composer;
+  a colored edit preview with visible actions; latest-turn file diff.
+- `OCDESK_VERIFY_ON_IDLE=1`: store matches REST after shell approval,
+  rejection and edit approval. `dev/teardown-test.sh`: **5/5**.
+- Screenshots: `docs/screenshots/m3-{tool,permission,changes}.png`.
+- macOS remains untested. M3's full UI reconnect/failure scenarios were
+  not driven manually; protocol/store tests cover request recovery and
+  revisions, while existing M1 reconnect behavior is preserved.
+
 ## Code map
 
 ```
@@ -103,6 +122,9 @@ src/controller.rs      intents, sidecar lifecycle, auto-restart, pump, folders
 src/ui/*               app_view, sidebar (folders), conversation, message, composer
 src/ui/prose.rs        ProseCache: one TextViewState per prose block, LRU-capped
 src/ui/frame_stats.rs  OCDESK_FRAME_LOG frame-time + peak-RSS probe
+src/ui/tool_card.rs    expandable input/output, errors and optional edit diffs
+src/ui/permission.rs   pending permission queue and explicit reply controls
+src/ui/changes.rs      read-only latest-turn file diffs
 src/demo.rs            OCDESK_DEMO offline mode (synthetic history + streaming)
 tests/fixtures/        real 2.2.6 captures (events.jsonl + messages.json)
 ```
@@ -136,9 +158,27 @@ Data flow: view → `Controller` intent → `Api` on Tokio → result back via
 - The sidebar list isn't virtualized (fine for hundreds of sessions).
 - `RetryScheduled` is decoded but the payload shape wasn't captured live.
 
-**M3:** tool cards; permissions via `permission.asked` and
-`POST /api/session/{id}/permission/{requestID}/reply {decision}`; diffs.
-2.x also has `form.*` events (questions to the user).
+**M3 notes**
+- Tool input/output is expandable and copyable. Preview sizes are bounded;
+  copying keeps the full returned text. Terminal error output, exit codes,
+  server truncation flags and optional `metadata.diff` are preserved.
+- Permissions are independent of loaded history, so background sessions get
+  waiting badges. Explicit once/always/reject replies use the session-owned
+  endpoint. Save rules are displayed for Always allow. Failed replies remain
+  retryable; disconnected replies are disabled. No automatic approvals.
+- Reconnect/selection restores pending requests through REST. Per-session
+  revisions reject stale snapshots, and sidecar generations/stream epochs
+  reject stale reply callbacks. A reply from another client removes the card.
+- Changes displays the latest turn's per-file patches (`context=3`), counts,
+  server truncation and copy. Refresh during a turn; an opened view refreshes
+  when the turn ends. It is not a full-session/repository diff.
+- `form.*` questions remain unimplemented (separate from permissions).
+- The mock write tool now sends `path`, as required by 2.2.6, rather than the
+  old `filePath` argument. `dev/m3-protocol-test.py` checks real once/always/
+  reject permission flow, restoring pending requests and an edit diff in a
+  temporary repository with isolated config/data.
+
 **M4:** model picker (`/api/model`, `/api/model/default`, `POST /api/session/{id}/model`),
 agents (`/api/agent`), `@` mentions (`/api/fs/find`), prompt `files`.
 **M5/M6:** see README roadmap.
+

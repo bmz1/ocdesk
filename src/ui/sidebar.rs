@@ -257,6 +257,7 @@ impl Sidebar {
         let id = s.id.clone();
         let is_selected = store.selected.as_deref() == Some(&id);
         let busy = store.is_busy(&id);
+        let waiting = store.permissions.get(&id).map_or(0, Vec::len);
         let group: SharedString = format!("session-row-{key}").into();
         let title = s.display_title();
         let controller = self.controller.clone();
@@ -285,7 +286,13 @@ impl Sidebar {
                     .update(cx, |c, cx| c.select_session(Some(id), cx));
             }))
             .child(div().flex_1().min_w_0().truncate().child(title))
-            .child(if busy {
+            .child(if waiting > 0 {
+                div()
+                    .text_xs()
+                    .text_color(theme.warning)
+                    .child(format!("! {waiting}"))
+                    .into_any_element()
+            } else if busy {
                 Spinner::new()
                     .xsmall()
                     .color(theme.muted_foreground)

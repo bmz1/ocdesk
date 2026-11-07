@@ -167,6 +167,53 @@ impl Api {
         Ok(msgs)
     }
 
+    pub async fn permissions(&self, session_id: &str) -> Result<Vec<model::PermissionRequest>> {
+        let path = format!("/api/session/{}/permission", id(session_id));
+        let v = self.send(self.req(Method::GET, &path)).await?;
+        let data = v["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("invalid permissions response"))?;
+        data.iter()
+            .map(|v| {
+                model::PermissionRequest::from_json(v)
+                    .ok_or_else(|| anyhow!("invalid permission request"))
+            })
+            .collect()
+    }
+
+    pub async fn reply_permission(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: model::PermissionDecision,
+    ) -> Result<()> {
+        let path = format!(
+            "/api/session/{}/permission/{}/reply",
+            id(session_id),
+            id(request_id)
+        );
+        self.send(
+            self.req(Method::POST, &path)
+                .json(&json!({"decision": decision.as_str()})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Latest turn, with bounded context; the server marks truncated patches with `more`.
+    pub async fn diff(&self, session_id: &str) -> Result<Vec<model::FileDiff>> {
+        let path = format!("/api/session/{}/diff", id(session_id));
+        let v = self
+            .send(self.req(Method::GET, &path).query(&[("context", "3")]))
+            .await?;
+        let data = v["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("invalid diff response"))?;
+        data.iter()
+            .map(|v| model::FileDiff::from_json(v).ok_or_else(|| anyhow!("invalid file diff")))
+            .collect()
+    }
+
     /// `POST /api/session/{id}/interrupt`. The turn ends with
     /// `session.execution.interrupted {reason: "user"}`.
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {
@@ -340,7 +387,95 @@ impl SseParser {
 
 #[cfg(test)]
 mod tests {
-    use super::SseParser;
+    use super::{Api, SseParser};
+    use crate::api::model::PermissionDecision;
+
+    /// Exercise the actual reqwest wire requests, including empty 204 replies.
+    #[tokio::test]
+    async fn permission_and_diff_http_contract() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (path, body, response, status) in [
+                (
+                    "GET /api/session/ses_a/permission ",
+                    "",
+                    r#"{"data":[{"id":"perm_a","sessionID":"ses_a","action":"shell","resources":["ls"]}]}"#,
+                    "200 OK",
+                ),
+                (
+                    "POST /api/session/ses_a/permission/perm_a/reply ",
+                    r#"{"decision":"once"}"#,
+                    "",
+                    "204 No Content",
+                ),
+                (
+                    "POST /api/session/ses_a/permission/perm_a/reply ",
+                    r#"{"decision":"always"}"#,
+                    "",
+                    "204 No Content",
+                ),
+                (
+                    "POST /api/session/ses_a/permission/perm_a/reply ",
+                    r#"{"decision":"reject"}"#,
+                    "denied",
+                    "500 Internal Server Error",
+                ),
+                (
+                    "GET /api/session/ses_a/diff?context=3 ",
+                    "",
+                    r#"{"data":[{"file":"a.rs","patch":"+new","status":"added","additions":1,"deletions":0}]}"#,
+                    "200 OK",
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let headers = String::from_utf8(request).unwrap();
+                assert!(headers.starts_with(path), "{headers}");
+                assert!(headers.to_lowercase().contains("authorization: basic "));
+                let len: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|n| n.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut payload = vec![0; len];
+                stream.read_exact(&mut payload).unwrap();
+                assert_eq!(String::from_utf8(payload).unwrap(), body);
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{response}", response.len()).unwrap();
+            }
+        });
+        let api = Api {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base: format!("http://{address}"),
+            password: "test".into(),
+        };
+        assert_eq!(api.permissions("ses_a").await.unwrap()[0].id, "perm_a");
+        api.reply_permission("ses_a", "perm_a", PermissionDecision::Once)
+            .await
+            .unwrap();
+        api.reply_permission("ses_a", "perm_a", PermissionDecision::Always)
+            .await
+            .unwrap();
+        assert!(
+            api.reply_permission("ses_a", "perm_a", PermissionDecision::Reject)
+                .await
+                .is_err()
+        );
+        assert_eq!(api.diff("ses_a").await.unwrap()[0].file, "a.rs");
+        server.join().unwrap();
+    }
 
     #[test]
     fn sse_frames_split_across_chunks() {
