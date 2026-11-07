@@ -1,5 +1,6 @@
 mod api;
 mod controller;
+mod demo;
 mod settings;
 mod sidecar;
 mod store;

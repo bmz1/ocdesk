@@ -46,6 +46,19 @@ the new Zed rev.
 - Hover-revealed controls: `.group(name)` on the row, then
   `.invisible().group_hover(name, |s| s.visible())` on the child.
 
+- **Markdown:** `gpui_component::text::{TextView, TextViewState}` (implemented in
+  `gpui-base::text`). Keep one `Entity<TextViewState>` per block and call
+  `set_text(full_text)`: when the new text extends the old one it becomes
+  `push_str`, which re-parses only the document tail on a background thread
+  (small *replacements* parse synchronously). `.selectable(true)` gives
+  drag-select and Cmd/Ctrl-C (key context `TextView`); links default to
+  `App::open_url`; `.code_block_actions(|block, _, _| ...)` renders an element
+  in each fenced block's corner (`block.code()`, `block.span`).
+- **Virtualized list + async content:** `gpui::list` re-renders and re-measures
+  every *visible* row each frame, and an entity's `notify` redraws the window
+  that read it during paint. So a background parse committing needs no
+  `remeasure_items`; only off-screen rows go stale (re-measured when shown).
+
 ## Surprises
 
 - Rows in a scrolling `v_flex` **shrink** below their `h_8()` once the list
@@ -54,6 +67,12 @@ the new Zed rev.
   left-aligned sidebar item build an `h_flex` row with `.on_click` instead.
 - Not GPUI, but bit us: dropping a tokio `AbortHandle` does **not** cancel the
   task. Call `.abort()`.
+- `use gpui_kit::*` imports a `test` macro (gpui's) that shadows the
+  built-in: a plain `#[test]` in such a module fails with "recursion limit
+  reached". Import names explicitly, or write `#[::core::prelude::v1::test]`.
+- Italic markdown text renders upright in the Linux sandbox: the only
+  installed sans faces are DejaVu Sans Book/Bold (no Oblique), so it's the
+  font, not the markdown.
 - Under Xvfb the theme can't detect the system appearance and stays light.
 
 - Linux build needs `libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev

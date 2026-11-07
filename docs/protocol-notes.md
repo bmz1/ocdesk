@@ -46,7 +46,8 @@ what `curl https://opencode.ai/install` installs) is rejected at startup.
 | Delete | `DELETE /api/session/{id}` | → 204, then `session.deleted` |
 | Validate a folder | `GET /api/location?location[directory]=…` | `{directory, project: {id, directory, canonical}}` |
 | Events (all folders) | `GET /api/event` | one SSE stream; `?types=` filter exists |
-| Permissions (M3) | `GET /api/session/{id}/permission`, `POST …/permission/{id}/reply {decision}` | 204 |
+| Permissions | `GET /api/session/{id}/permission`, `POST …/permission/{id}/reply {decision}` | 204 |
+| Latest-turn file changes | `GET /api/session/{id}/diff?context=3` | `{data: [{file, patch, status, additions, deletions, more?}]}`; omitting `from` selects the latest user turn |
 
 `Session.Info`:
 
@@ -176,3 +177,27 @@ checks the result equals this projection.
   reconcile keeps local text that strictly extends the snapshot's.
 - `session.created` has no title and no timestamps (use the envelope's
   `created`); the title arrives later via `session.renamed`.
+
+
+## M3 client behavior
+
+`permission.asked.data` is a `Permission.Request`: `{id, sessionID, action,
+resources, save?, message?, metadata?, source?}`. `permission.replied.data`
+uses `{sessionID, requestID, reply}`, not `id`. Replies send
+`{decision: "once" | "always" | "reject"}` and accept the empty 204 response.
+Pending requests belong to sessions independently of loaded message history.
+After reconnect/selection they are restored from the session permission list;
+a per-session revision prevents an in-flight REST snapshot from overwriting
+newer asked/replied events. Outdated reads are re-fetched. Sidecar generations
+and stream epochs fence off stale permission callbacks.
+
+Tool progress carries metadata only; it is not output text. Terminal success
+and failure metadata replaces progress metadata, matching the message REST
+projection. Failed tools can have both `content` and `error`. The UI retains
+both, together with exit codes, truncation markers, and optional edit diffs.
+
+Session diffs come from the server's snapshot comparison, never from guessed
+old/new tool arguments. `context=3` bounds unchanged context. `more: true`
+means opencode truncated the patch; Copy cannot restore data the server omitted.
+The UI also bounds its own preview, while Copy retains the returned patch.
+`form.*` question events remain outside this milestone.

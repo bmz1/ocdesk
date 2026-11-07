@@ -7,12 +7,14 @@ use crate::controller::{self, Controller};
 use crate::settings::Settings;
 use crate::store::Store;
 use crate::ui::conversation::ConversationView;
+use crate::ui::frame_stats::FrameStats;
 use crate::ui::sidebar::Sidebar;
 
 pub struct AppView {
     sidebar: Entity<Sidebar>,
     conversation: Entity<ConversationView>,
     first_frame_logged: bool,
+    frames: FrameStats,
     _subs: Vec<Subscription>,
 }
 
@@ -47,6 +49,7 @@ impl AppView {
             sidebar,
             conversation,
             first_frame_logged: false,
+            frames: FrameStats::new(),
             _subs: subs,
         }
     }
@@ -54,6 +57,7 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.frames.begin();
         if !self.first_frame_logged {
             self.first_frame_logged = true;
             if let Some(t) = crate::STARTED.get() {
@@ -72,5 +76,6 @@ impl Render for AppView {
                     .h_full()
                     .child(self.conversation.clone()),
             )
+            .children(self.frames.end_marker())
     }
 }

@@ -14,7 +14,8 @@ use gpui_kit::{Context, EventEmitter};
 
 use crate::api::events::Outcome;
 use crate::api::model::{
-    AssistantMessage, Block, BlockKind, Message, SessionInfo, ToolCall, ToolStatus, UserMessage,
+    AssistantMessage, Block, BlockKind, FileDiff, Message, PermissionRequest, SessionInfo,
+    ToolCall, ToolStatus, UserMessage,
 };
 use crate::api::{Envelope, Event};
 
@@ -45,7 +46,7 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    fn index_of(&self, id: &str) -> Result<usize, usize> {
+    pub fn index_of(&self, id: &str) -> Result<usize, usize> {
         self.messages.binary_search_by(|m| m.id().cmp(id))
     }
 
@@ -114,6 +115,14 @@ pub struct Store {
     pub opencode_version: Option<String>,
     /// A transient, app-level problem shown as a dismissible banner.
     pub notice: Option<String>,
+    pub permissions: HashMap<String, Vec<PermissionRequest>>,
+    /// Changed by both live events and snapshots, to reject stale in-flight reads.
+    pub permission_revision: HashMap<String, u64>,
+    pub permission_sending: HashSet<(String, String)>,
+    pub permission_errors: HashMap<(String, String), String>,
+    pub diffs: HashMap<String, Vec<FileDiff>>,
+    pub diff_loading: HashSet<String>,
+    pub diff_errors: HashMap<String, String>,
 }
 
 impl EventEmitter<StoreEvent> for Store {}
@@ -129,6 +138,50 @@ impl Store {
             cx.emit(StoreEvent::ConnectionChanged);
             cx.notify();
         }
+    }
+
+    pub fn permission_revision(&self, sid: &str) -> u64 {
+        self.permission_revision
+            .get(sid)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn set_permissions(
+        &mut self,
+        sid: &str,
+        requests: Vec<PermissionRequest>,
+        cx: &mut Context<Self>,
+    ) {
+        self.permissions.insert(
+            sid.to_string(),
+            requests
+                .into_iter()
+                .filter(|r| r.session_id == sid)
+                .collect(),
+        );
+        let requests = &self.permissions[sid];
+        self.permission_sending.retain(|(session, request)| {
+            session != sid || requests.iter().any(|r| &r.id == request)
+        });
+        self.permission_errors.retain(|(session, request), _| {
+            session != sid || requests.iter().any(|r| &r.id == request)
+        });
+        *self.permission_revision.entry(sid.to_string()).or_default() += 1;
+        cx.emit(StoreEvent::StatusChanged {
+            session_id: sid.to_string(),
+        });
+        cx.notify();
+    }
+
+    fn remove_permission(&mut self, sid: &str, rid: &str) {
+        if let Some(requests) = self.permissions.get_mut(sid) {
+            requests.retain(|r| r.id != rid);
+        }
+        let key = (sid.to_string(), rid.to_string());
+        self.permission_sending.remove(&key);
+        self.permission_errors.remove(&key);
+        *self.permission_revision.entry(sid.to_string()).or_default() += 1;
     }
 
     pub fn session(&self, id: &str) -> Option<&SessionInfo> {
@@ -327,12 +380,37 @@ impl Store {
                 self.sessions.retain(|x| &x.id != session_id);
                 self.conversations.remove(session_id);
                 self.busy.remove(session_id);
+                self.permissions.remove(session_id);
+                self.permission_revision.remove(session_id);
+                self.permission_sending.retain(|(sid, _)| sid != session_id);
+                self.permission_errors
+                    .retain(|(sid, _), _| sid != session_id);
+                self.diffs.remove(session_id);
+                self.diff_loading.remove(session_id);
+                self.diff_errors.remove(session_id);
                 out.push(StoreEvent::SessionsChanged);
                 if self.selected.as_ref() == Some(session_id) {
                     self.selected = None;
                     out.push(StoreEvent::SelectionChanged);
                 }
                 return out;
+            }
+            Event::PermissionAsked(request) => {
+                let sid = request.session_id.clone();
+                let requests = self.permissions.entry(sid.clone()).or_default();
+                requests.retain(|r| r.id != request.id);
+                requests.push(request.clone());
+                *self.permission_revision.entry(sid.clone()).or_default() += 1;
+                return vec![StoreEvent::StatusChanged { session_id: sid }];
+            }
+            Event::PermissionReplied {
+                session_id,
+                request_id,
+            } => {
+                self.remove_permission(session_id, request_id);
+                return vec![StoreEvent::StatusChanged {
+                    session_id: session_id.clone(),
+                }];
             }
             Event::ExecutionStarted { session_id } => {
                 self.errors.remove(session_id);
@@ -465,24 +543,47 @@ impl Store {
                 message_id,
                 call_id,
                 output,
+                metadata,
                 ..
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
                 let t = tool_mut(msg, &call_id);
                 t.status = ToolStatus::Completed;
                 t.output = output;
+                t.metadata = metadata;
+                out.push(changed(index, inserted));
+            }
+            Event::ToolProgress {
+                message_id,
+                call_id,
+                metadata,
+                ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                let t = tool_mut(msg, &call_id);
+                if let (Some(current), Some(update)) =
+                    (t.metadata.as_object_mut(), metadata.as_object())
+                {
+                    current.extend(update.clone());
+                } else {
+                    t.metadata = metadata;
+                }
                 out.push(changed(index, inserted));
             }
             Event::ToolFailed {
                 message_id,
                 call_id,
                 error,
+                output,
+                metadata,
                 ..
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
                 let t = tool_mut(msg, &call_id);
                 t.status = ToolStatus::Error;
                 t.error = Some(error);
+                t.output = output;
+                t.metadata = metadata;
                 out.push(changed(index, inserted));
             }
             Event::StepEnded {
@@ -550,6 +651,7 @@ fn event_session(e: &Event) -> Option<&str> {
         | Event::BlockEnded { session_id, .. }
         | Event::ToolStarted { session_id, .. }
         | Event::ToolCalled { session_id, .. }
+        | Event::ToolProgress { session_id, .. }
         | Event::ToolSucceeded { session_id, .. }
         | Event::ToolFailed { session_id, .. }
         | Event::StepEnded { session_id, .. }
@@ -587,14 +689,15 @@ fn tool_mut<'a>(msg: &'a mut AssistantMessage, call_id: &str) -> &'a mut ToolCal
         .iter()
         .position(|b| matches!(b, Block::Tool(t) if t.call_id == call_id));
     let pos = pos.unwrap_or_else(|| {
-        msg.blocks.push(Block::Tool(ToolCall {
+        msg.blocks.push(Block::Tool(Box::new(ToolCall {
             call_id: call_id.to_string(),
             name: String::new(),
             status: ToolStatus::Pending,
             input: serde_json::Value::Null,
             output: String::new(),
             error: None,
-        }));
+            metadata: serde_json::Value::Null,
+        })));
         msg.blocks.len() - 1
     });
     match &mut msg.blocks[pos] {
@@ -680,6 +783,93 @@ mod tests {
                 .chain(a.error.clone())
                 .collect(),
         }
+    }
+
+    fn permission(sid: &str, rid: &str) -> PermissionRequest {
+        PermissionRequest::from_json(&serde_json::json!({
+            "id":rid, "sessionID":sid, "action":"shell", "resources":["echo hello"],
+            "save":["echo *"], "metadata":{"command":"echo hello"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn permissions_are_session_scoped_and_survive_unloaded_history() {
+        let mut s = Store::default();
+        for (sid, rid) in [
+            ("ses_a", "perm_1"),
+            ("ses_b", "perm_2"),
+            ("ses_a", "perm_1"),
+        ] {
+            s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(sid, rid))));
+        }
+        assert_eq!(
+            s.permissions["ses_a"].len(),
+            1,
+            "duplicate frames must not duplicate cards"
+        );
+        assert_eq!(s.permissions["ses_b"].len(), 1);
+        let before = s.permission_revision("ses_a");
+        s.apply_inner(Envelope::bare(Event::PermissionReplied {
+            session_id: "ses_a".into(),
+            request_id: "perm_1".into(),
+        }));
+        assert!(s.permissions["ses_a"].is_empty());
+        assert!(
+            s.permission_revision("ses_a") > before,
+            "in-flight snapshots must be invalidated"
+        );
+        assert_eq!(s.permissions["ses_b"].len(), 1);
+        assert!(s.conversations.is_empty());
+    }
+
+    #[test]
+    fn deleting_session_cleans_pending_replies_and_diffs() {
+        let mut s = Store::default();
+        s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(
+            "ses_a", "perm_1",
+        ))));
+        s.permission_sending
+            .insert(("ses_a".into(), "perm_1".into()));
+        s.diffs.insert("ses_a".into(), vec![]);
+        s.apply_inner(Envelope::bare(Event::SessionRemoved {
+            session_id: "ses_a".into(),
+        }));
+        assert!(!s.permissions.contains_key("ses_a"));
+        assert!(s.permission_sending.is_empty());
+        assert!(s.diffs.is_empty());
+    }
+
+    #[test]
+    fn tool_failure_preserves_output_and_metadata_from_wire() {
+        let mut s = loaded_store();
+        let sid = sid();
+        let wire = serde_json::json!({"type":"session.tool.failed", "data":{
+            "sessionID":sid, "assistantMessageID":"msg_z", "id":"call_z",
+            "error":{"type":"shell","message":"Command failed"},
+            "content":[{"type":"text","text":"stderr output"}],
+            "metadata":{"exit":2,"truncated":true}
+        }});
+        s.apply_inner(Envelope::from_json(&wire.to_string()).unwrap());
+        let Message::Assistant(a) = s.conversations[&sid].messages.last().unwrap() else {
+            panic!()
+        };
+        let Block::Tool(t) = &a.blocks[0] else {
+            panic!()
+        };
+        assert_eq!(t.status, ToolStatus::Error);
+        assert_eq!(t.output, "stderr output");
+        assert_eq!(t.metadata["exit"], 2);
+        assert_eq!(t.error.as_deref(), Some("Command failed"));
+        let projected = Message::from_v2_json(&serde_json::json!({
+            "id":"msg_z","type":"assistant","content":[{"type":"tool","id":"call_z","name":"",
+            "state":{"status":"error","input":null,"error":{"message":"Command failed"},
+            "content":[{"type":"text","text":"stderr output"}],"metadata":{"exit":2,"truncated":true}}}]
+        })).unwrap();
+        let Message::Assistant(remote) = projected else {
+            panic!()
+        };
+        assert_eq!(a.blocks, remote.blocks);
     }
 
     #[test]

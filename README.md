@@ -13,12 +13,16 @@ ocdesk (Rust/GPUI) ──HTTP──▶ opencode serve   (child process, 127.0.0.
                    ◀──SSE───  GET /api/event   (one stream for every folder)
 ```
 
-**Status:** milestone M1: folders with their sessions, live plain-text
-streaming conversation, composer with send/stop, rename/delete, reconnect and
-sidecar crash recovery, dark theme by default. Markdown, tool cards and
-permissions come in M2/M3. See *Roadmap* and [handoff.md](handoff.md).
+**Status:** M1–M3: folders and sessions, streaming markdown, selectable text,
+collapsible reasoning, expandable tool cards, permission replies and latest-turn
+file diffs. Send/stop, reconnect, crash recovery and dark theme included.
+See *Roadmap* and [handoff.md](handoff.md).
 
-![ocdesk conversation](docs/screenshots/m1-conversation.png)
+![ocdesk markdown](docs/screenshots/m2-markdown.png)
+
+![ocdesk tool details](docs/screenshots/m3-tool.png)
+
+![ocdesk changes](docs/screenshots/m3-changes.png)
 
 ## Pinned versions
 
@@ -88,9 +92,39 @@ python3 dev/mock_llm.py &                       # listens on 127.0.0.1:4555
 XDG_CONFIG_HOME=$PWD/dev/xdg cargo run -- /path/to/some/repo
 ```
 
-Prompt keywords: `tool:bash` (calls the `shell` tool), `tool:edit`, `long`;
-anything else gets a short reply. For permission work (M3) add
+Prompt keywords: `tool:bash` (calls the `shell` tool), `tool:edit`, `long`, `rich`;
+anything else gets a short reply. To exercise permission prompts, add
 `"permission": {"shell": "ask", "edit": "ask"}` to `dev/xdg/opencode/opencode.json`.
+
+**Tools and permissions.** Click a tool card to expand its complete input and
+output. Copy keeps the full text even when a large preview is shortened.
+Pending permission requests appear above the composer, with a waiting badge in
+the sidebar. Choose **Allow once**, **Always allow** (when the server supplies
+save rules), or **Reject**. The exact rules being saved are shown beside the
+actions. Failed replies stay visible and retryable. Reconnecting and selecting a
+session re-fetch pending requests; ocdesk never replies automatically.
+
+**Changes.** The conversation header's **Changes** button shows the latest
+turn's files, addition/deletion counts, and colored unified patches. Use
+**Refresh** during an active turn; opened diffs refresh when a turn finishes.
+**Conversation** returns to the message list.
+
+**Offline UI demo (no opencode, no model).** `OCDESK_DEMO=<turns>` skips the
+sidecar and seeds one session with synthetic history (`turns` × user +
+assistant, default 20); prompts get a streamed markdown reply through the
+same `Store::apply` path real events take. `OCDESK_DEMO=250` is the
+500-message perf case. `OCDESK_DEMO_DELAY_MS` sets the per-word delay
+(default 15), `OCDESK_DEMO_AUTOPLAY=<prompt>` sends one prompt at startup
+(`long` in it gives the long answer).
+
+```sh
+OCDESK_DEMO=250 OCDESK_DEMO_AUTOPLAY="long answer" OCDESK_FRAME_LOG=1 cargo run
+```
+
+**Frame times.** `OCDESK_FRAME_LOG=1` logs, once a second while frames are
+drawn, the CPU time per frame (root `render` to last `paint`: count, mean,
+p95, max) and peak RSS under the `ocdesk::frames` target. Debug builds also
+log it at `debug`.
 
 Verification hooks (env vars):
 
@@ -105,6 +139,11 @@ Unit tests (`cargo test`) replay real captured opencode 2.2.6 events
 (`tests/fixtures/`) through the store and check the result equals the
 server's REST projection; they also cover reconcile, the execution
 lifecycle, folder targeting, version parsing and SSE framing.
+
+`python3 dev/m3-protocol-test.py /path/to/opencode2` checks live permission
+requests, restoring pending requests, once/always/reject replies, rejected tool
+history and latest-turn edit diffs against real opencode 2.2.6. It creates a
+temporary repository and isolated config/data, and starts its own mock model.
 
 `dev/teardown-test.sh` (Linux, Xvfb) checks that the sidecar dies on SIGTERM,
 SIGINT, SIGKILL, panic and normal quit.
@@ -126,7 +165,10 @@ src/
   ui/app_view.rs     root layout: sidebar | conversation; theme
   ui/sidebar.rs      folders with their sessions; new / rename / delete; connection
   ui/conversation.rs virtualized message list (MessageScroller), start screen
-  ui/message.rs      one message: plain text, reasoning, one-line tool rows
+  ui/message.rs      one message: plain text, reasoning, tool cards
+  ui/tool_card.rs    expandable tool input/output, errors, exit/truncation metadata
+  ui/permission.rs   pending permissions with explicit allow/reject actions
+  ui/changes.rs      read-only, color-coded latest-turn file patches
   ui/composer.rs     prompt box, Enter / Shift+Enter, Send ↔ Stop
 docs/
   protocol-notes.md              endpoints + real event samples (opencode 2.2.6)
@@ -175,8 +217,8 @@ handoff.md                       state of the project for the next session
 
 - [x] **M0** Spike: pinned stack, window, sidecar lifecycle, prompt round-trip, protocol notes
 - [x] **M1** Folders + sessions sidebar, plain-text streaming conversation, composer, reconnect + reconcile, opencode 2.x, dark theme
-- [ ] **M2** Incremental streaming markdown, selectable text, collapsible reasoning (virtualized list already in)
-- [ ] **M3** Tool cards, permissions (`permission.asked`), diffs
+- [x] **M2** Incremental streaming markdown, code copy buttons, links, selectable text, collapsible reasoning, frame-time probe
+- [x] **M3** Tool cards, permissions (`permission.asked`), diffs
 - [ ] **M4** @mentions, model/agent picker, history
 - [ ] **M5** Keyboard, persistence of window/sidebar, error states
 - [ ] **M6** Packaging (.app, AppImage), CI
@@ -186,7 +228,7 @@ handoff.md                       state of the project for the next session
 The UI follows the Codex app's layout ideas: a quiet sidebar of folders with
 their sessions, one centered conversation column (max 760 px), user messages
 as soft right-aligned bubbles, assistant output as plain flowing text, tool
-calls as one-line rows, and a rounded composer docked at the bottom (centered
+calls as expandable cards, and a rounded composer docked at the bottom (centered
 on the start screen, with a folder chooser). Dark theme by default; colors
 come from gpui-component's neutral theme.
 
@@ -194,7 +236,10 @@ come from gpui-component's neutral theme.
 
 - Only verified on Linux (Xvfb + llvmpipe) so far. macOS is the primary
   target but hasn't been run yet.
-- No permission UI yet (M3): with a config that asks for permission, a turn
-  waits until stopped.
+- Question forms (`form.*`) are not implemented yet; permission requests
+  (`permission.*`) are supported.
+- Changes shows the latest turn, not a full session or repository diff. Patch
+  previews are bounded; Copy patch includes the full patch returned by opencode.
 - On macOS a `kill -9` of ocdesk can orphan the sidecar: there is no
   `PDEATHSIG` equivalent. Every other exit path is covered.
+
