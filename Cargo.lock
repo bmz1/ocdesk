@@ -4487,11 +4487,13 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "syntect",
  "tokio",
  "tokio-tungstenite",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "two-face",
 ]
 
 [[package]]

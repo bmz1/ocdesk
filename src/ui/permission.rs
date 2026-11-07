@@ -171,7 +171,10 @@ pub fn render_permissions(store: &Store, controller: Entity<Controller>, cx: &Ap
                     .child(super::changes::patch_view_with(
                         &format!("permission-diff-{}-{i}", request.id),
                         &file.patch,
-                        super::changes::PatchOpts::default(),
+                        super::changes::PatchOpts {
+                            language: Some(file.file.clone()),
+                            ..Default::default()
+                        },
                         cx,
                     ));
             }

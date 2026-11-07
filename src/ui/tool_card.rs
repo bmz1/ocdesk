@@ -355,6 +355,21 @@ fn tool_details(t: &ToolCall, key: &str, ctx: &ToolCtx, cx: &App) -> AnyElement 
         )
         .child(input_block);
 
+    // The file a call is about: its output (reads) and content (writes)
+    // are coloured as that file's language.
+    let file = str_input(t, "filePath").or(str_input(t, "path"));
+    if t.name == "write"
+        && let Some(content) = str_input(t, "content").filter(|c| !c.trim().is_empty())
+    {
+        card = card.child(output_panel(
+            &format!("content-{key}"),
+            content.trim_end(),
+            theme.foreground,
+            file,
+            ctx,
+            cx,
+        ));
+    }
     // Result: the error for failed tools, else the output.
     match (&t.error, t.output.trim_end()) {
         (Some(error), _) => {
@@ -362,15 +377,22 @@ fn tool_details(t: &ToolCall, key: &str, ctx: &ToolCtx, cx: &App) -> AnyElement 
                 &format!("error-{key}"),
                 error,
                 theme.danger,
+                None,
                 ctx,
                 cx,
             ));
         }
-        (None, out) if !out.is_empty() => {
+        (None, out) if !out.is_empty() && t.name != "write" => {
+            let read = kind(&t.name) == Kind::Read;
             card = card.child(output_panel(
                 &format!("output-{key}"),
                 out,
-                theme.muted_foreground,
+                if read {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                },
+                file.filter(|_| read),
                 ctx,
                 cx,
             ));
@@ -405,6 +427,7 @@ fn tool_details(t: &ToolCall, key: &str, ctx: &ToolCtx, cx: &App) -> AnyElement 
         card = card.child(super::changes::patch_view(
             &format!("tool-diff-{key}"),
             diff,
+            file,
             cx,
         ));
     }
@@ -413,10 +436,24 @@ fn tool_details(t: &ToolCall, key: &str, ctx: &ToolCtx, cx: &App) -> AnyElement 
 
 /// Mono output, bounded in height. Scrolling inside it doesn't drag the
 /// conversation along; at either end the wheel goes back to the list.
-fn output_panel(id: &str, text: &str, color: Hsla, ctx: &ToolCtx, cx: &App) -> AnyElement {
+fn output_panel(
+    id: &str,
+    text: &str,
+    color: Hsla,
+    language: Option<&str>,
+    ctx: &ToolCtx,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let preview: String = text.chars().take(PREVIEW_CHARS).collect();
     let clipped = preview.len() < text.len();
+    let body: AnyElement = match language {
+        Some(lang) if super::syntax::supported(lang) => {
+            let spans = super::syntax::highlight_gutter(lang, &preview);
+            super::syntax::styled(preview, &spans, cx).into_any_element()
+        }
+        _ => preview.into_any_element(),
+    };
     let handle = ctx
         .scrolls
         .borrow_mut()
@@ -433,7 +470,7 @@ fn output_panel(id: &str, text: &str, color: Hsla, ctx: &ToolCtx, cx: &App) -> A
                 .font_family(theme.mono_font_family.clone())
                 .text_xs()
                 .text_color(color)
-                .child(preview),
+                .child(body),
         )
         .when(clipped, |el| {
             el.child(

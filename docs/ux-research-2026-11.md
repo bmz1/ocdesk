@@ -240,7 +240,7 @@ items that depend on server behaviour are marked *unverified live*.
 | 13 | Plan bar with Implement (switches to build, then prompts) | Done |
 | 14 | Terminal tab on opencode's persistent PTY | Done; protocol tested against a mock server built from opencode's client source, *unverified live* |
 | — | macOS transparent title bar, traffic-light inset, drag region, menu bar, Dock reopen | Done; *unverified on a Mac* |
-| — | `ui/kit` components, opencode tokens, Inter / IBM Plex Mono, syntect highlighting | Done |
+| — | `ui/kit` components, opencode tokens, Inter / IBM Plex Mono, syntect highlighting | Done: code fences, diffs (review panel, approvals, edit cards; both sides highlighted as continuous text), file reads (line-number gutters left plain) and written file content |
 
 ## 5. Not recommended
 

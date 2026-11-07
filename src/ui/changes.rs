@@ -283,6 +283,7 @@ pub fn render_changes(
                                 on_comment: Some((hooks.on_comment)(&file.file)),
                                 below_line: (hooks.below)(&file.file),
                                 show_copy: false,
+                                language: Some(file.file.clone()),
                             },
                             cx,
                         )))
@@ -327,6 +328,8 @@ pub struct PatchOpts {
     /// new-side line.
     pub below_line: Vec<(u32, AnyElement)>,
     pub show_copy: bool,
+    /// The file's path (or a language name), for syntax colours.
+    pub language: Option<String>,
 }
 
 /// One displayable line of a unified diff.
@@ -422,13 +425,62 @@ pub fn parse_patch(patch: &str) -> Vec<PatchLine> {
     out
 }
 
-pub fn patch_view(id: &str, patch: &str, cx: &App) -> AnyElement {
+/// Syntax colours for a patch's lines. Each side (old: context and
+/// removed lines; new: context and added) is highlighted as one text so
+/// strings and comments spanning lines colour correctly.
+struct SideHighlights {
+    old: super::syntax::Spans,
+    new: super::syntax::Spans,
+    /// Per parsed line: which side and its byte range there.
+    lines: Vec<Option<(bool, std::ops::Range<usize>)>>,
+}
+
+impl SideHighlights {
+    fn line(&self, i: usize, len: usize) -> Vec<(std::ops::Range<usize>, &'static str)> {
+        let Some(Some((new, r))) = self.lines.get(i) else {
+            return Vec::new();
+        };
+        let spans = if *new { &self.new } else { &self.old };
+        super::syntax::slice(spans, r.start..r.start + len.min(r.len()))
+    }
+}
+
+fn side_highlights(parsed: &[PatchLine], language: Option<&str>) -> Option<SideHighlights> {
+    let lang = language.filter(|l| super::syntax::supported(l))?;
+    let (mut old, mut new) = (String::new(), String::new());
+    let mut lines = Vec::with_capacity(parsed.len());
+    let push = |side: &mut String, text: &str| {
+        let start = side.len();
+        side.push_str(text);
+        side.push('\n');
+        start..start + text.len()
+    };
+    for l in parsed {
+        lines.push(match l {
+            PatchLine::Hunk(_) => None,
+            PatchLine::Context { text, .. } => {
+                push(&mut old, text);
+                Some((true, push(&mut new, text)))
+            }
+            PatchLine::Added { text, .. } => Some((true, push(&mut new, text))),
+            PatchLine::Removed { text, .. } => Some((false, push(&mut old, text))),
+        });
+    }
+    Some(SideHighlights {
+        old: super::syntax::highlight(lang, &old),
+        new: super::syntax::highlight(lang, &new),
+        lines,
+    })
+}
+
+pub fn patch_view(id: &str, patch: &str, language: Option<&str>, cx: &App) -> AnyElement {
     patch_view_with(
         id,
         patch,
         PatchOpts {
             max_h: Some(400.),
             show_copy: true,
+            language: language.map(str::to_string),
             ..Default::default()
         },
         cx,
@@ -443,6 +495,7 @@ pub fn patch_view_with(id: &str, patch: &str, opts: PatchOpts, cx: &App) -> AnyE
     let parsed = parse_patch(patch);
     let total = parsed.len();
     let mut below = opts.below_line;
+    let colours = side_highlights(&parsed, opts.language.as_deref());
     let gutter = |n: Option<u32>| {
         div()
             .w(px(34.))
@@ -539,7 +592,13 @@ pub fn patch_view_with(id: &str, patch: &str, opts: PatchOpts, cx: &App) -> AnyE
                         .min_w_0()
                         .text_color(fg)
                         .whitespace_nowrap()
-                        .child(preview),
+                        .child(match &colours {
+                            Some(c) => {
+                                let spans = c.line(i, preview.len());
+                                super::syntax::styled(preview, &spans, cx).into_any_element()
+                            }
+                            None => preview.into_any_element(),
+                        }),
                 )
                 .children(comment),
         );

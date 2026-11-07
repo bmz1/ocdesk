@@ -16,6 +16,7 @@ pub mod prose;
 pub mod review;
 pub mod settings;
 pub mod sidebar;
+pub mod syntax;
 pub mod tasks;
 pub mod terminal;
 pub mod theme;

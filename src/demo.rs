@@ -145,7 +145,7 @@ fn showcase(now: u64) -> Vec<Message> {
                     "c2",
                     "read",
                     json!({"filePath": "src/stream.ts"}),
-                    "…",
+                    "<file>\n00001| import { backoff } from \"./backoff\"\n00002| \n00003| // Opens the stream and reconnects on error.\n00004| export function open(url: string): EventSource {\n00005|   const es = new EventSource(url)\n00006|   es.onerror = () => backoff(open, 1_000)\n00007|   return es\n00008| }\n</file>",
                     ToolStatus::Completed,
                 ),
                 tool(
