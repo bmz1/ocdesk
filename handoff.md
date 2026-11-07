@@ -3,27 +3,30 @@
 State of ocdesk for whoever picks it up next. Read this first, then
 [README.md](README.md) and [docs/protocol-notes.md](docs/protocol-notes.md).
 
-_Last updated: 2026-11-07, M4 (`m4-models-agents-mentions`, branched from `master` @ `75fe7d6`)._
+_Last updated: 2026-11-07, M4 pushed on `m4-models-agents-mentions`._
 
 ## Where things are
 
 - **Done:** M0 (spike), M1 (folders + sessions, streaming conversation,
-  composer, reconnect, crash recovery) and M2 (incremental streaming
+  composer, reconnect, crash recovery), M2 (incremental streaming
   markdown, code-block copy buttons, links, selectable text, collapsible
-  reasoning, frame-time probe, offline demo mode), plus M3 (expandable tool
-  cards, session-scoped permission prompts/replies and latest-turn file diffs),
-  targeting **opencode 2.2.6 only**. Dark theme by default.
+  reasoning, frame-time probe, offline demo mode), M3 (expandable tool
+  cards, session-scoped permission prompts/replies and latest-turn file
+  diffs) and M4 (question forms, Codex-style tool cards, model/agent/variant
+  pickers, `@` mentions of files and subagents, prompt history), targeting
+  **opencode 2.2.6 only**. Dark theme by default.
 - **Workflow the owner wants:** branch from `master` → feature PR → owner
-  reviews → merge to `master`. Don't push to `master` directly. PR #1 (M1)
-  is merged. M2 is on `claude/elegant-mccarthy-dymj86` (latest picked up:
-  `bb26e4e`); M3 branches from that commit on `m3-tools-permissions-diffs`.
-  No M3 PR was opened; the owner opens/asks for PRs.
+  reviews → merge to `master`. Don't push to `master` directly; the owner
+  opens/asks for PRs. M1–M3 are merged (PRs #1–#3).
+- **M4** landed in two parts: question forms + Codex-style tool cards went
+  directly to `master` (`75fe7d6`); pickers, `@` mentions and history are
+  pushed on `m4-models-agents-mentions` (`fd0ecbb`, branched from
+  `75fe7d6`). **No PR opened yet**; the owner asks for it
+  (github.com/bmz1/opencode-gui/pull/new/m4-models-agents-mentions).
 - The old `claude/friendly-lamport-ne3gxc` remote branch could not be deleted
   from the agent sandbox (git proxy 403); the owner was asked to delete it.
-- **M4** is split in two: question forms + Codex-style tool cards landed
-  directly on `master` (`75fe7d6`); model/agent/variant pickers, `@`
-  mentions and prompt history are on `m4-models-agents-mentions`
-  (uncommitted until the owner asks). Next milestone after that: **M5**.
+- **Next:** hand-test M4's composer UI (see *M4 notes*), then **M5**
+  (keyboard, persistence of window/sidebar and model/agent draft, error states).
 
 ## Decisions already made (don't re-litigate)
 
