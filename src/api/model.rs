@@ -376,6 +376,58 @@ pub struct UserMessage {
     pub id: String,
     pub text: String,
     pub attachments: Vec<Attachment>,
+    pub meta: Meta,
+}
+
+/// When a block started and ended (epoch ms). Display only; equality
+/// ignores it, like [`Meta`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Timing {
+    pub created: Option<u64>,
+    pub completed: Option<u64>,
+}
+
+impl PartialEq for Timing {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// Display-only facts about a message or block: times (epoch ms), the
+/// model and agent that produced it, and its usage.
+///
+/// Equality ignores it on purpose: streamed state stamps times from event
+/// envelopes while the REST projection has its own, and the store's
+/// "matches REST" check (`OCDESK_VERIFY_ON_IDLE`) is about content.
+#[derive(Clone, Debug, Default)]
+pub struct Meta {
+    pub created: Option<u64>,
+    pub completed: Option<u64>,
+    pub model: Option<ModelRef>,
+    pub agent: Option<String>,
+    pub tokens: Option<crate::api::features::Tokens>,
+    pub cost: Option<f64>,
+}
+
+impl PartialEq for Meta {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Meta {
+    /// `{time: {created, completed}, model, agent, tokens, cost}` as the
+    /// projection writes it on messages and blocks.
+    pub fn from_json(v: &Value) -> Self {
+        Self {
+            created: u64_at(v, "/time/created"),
+            completed: u64_at(v, "/time/completed"),
+            model: v.get("model").and_then(ModelRef::from_json),
+            agent: str_at(v, "/agent"),
+            tokens: v.get("tokens").map(crate::api::features::Tokens::parse),
+            cost: v.get("cost").and_then(Value::as_f64),
+        }
+    }
 }
 /// Metadata only: never clone the base64 file bodies into the view store.
 #[derive(Clone, Debug, PartialEq)]
@@ -414,6 +466,7 @@ pub struct AssistantMessage {
     pub completed: bool,
     pub finish: Option<String>,
     pub error: Option<String>,
+    pub meta: Meta,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -431,6 +484,8 @@ pub enum Block {
         ordinal: u64,
         text: String,
         done: bool,
+        /// When the block started and ended (display only).
+        time: Timing,
     },
     Tool(Box<ToolCall>),
 }
@@ -464,6 +519,8 @@ pub struct PermissionRequest {
     pub save: Vec<String>,
     pub message: Option<String>,
     pub metadata: Value,
+    /// The tool call that asked (`source.id`), when a tool did.
+    pub call_id: Option<String>,
 }
 
 impl PermissionRequest {
@@ -487,6 +544,7 @@ impl PermissionRequest {
             save: strings("save"),
             message: str_at(v, "/message"),
             metadata: v.get("metadata").cloned().unwrap_or(Value::Null),
+            call_id: str_at(v, "/source/id"),
         })
     }
 }
@@ -646,6 +704,7 @@ impl Message {
                 id,
                 text: str_at(v, "/text").unwrap_or_default(),
                 attachments: Attachment::list(&v["files"]),
+                meta: Meta::from_json(v),
             })),
             "assistant" => {
                 let mut ordinals = [0u64; 2];
@@ -664,6 +723,7 @@ impl Message {
                     completed: v.pointer("/time/completed").is_some(),
                     finish: str_at(v, "/finish"),
                     error: error_text(v.get("error")),
+                    meta: Meta::from_json(v),
                 }))
             }
             "compaction" => {
@@ -739,6 +799,10 @@ impl Block {
             ordinal,
             text: str_at(v, "/text").unwrap_or_default(),
             done: true,
+            time: Timing {
+                created: u64_at(v, "/time/created"),
+                completed: u64_at(v, "/time/completed"),
+            },
         })
     }
 }

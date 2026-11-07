@@ -26,7 +26,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::api::model::{Delivery, FsEntry, InboxItem, Message, ModelRef};
+use crate::api::model::{Delivery, FsEntry, InboxItem, Message, ModelRef, PermissionDecision};
 use crate::controller::Controller;
 use crate::store::{Connection, Store};
 use crate::ui::mention::{self, AGENT_PREFIX, FILE_PREFIX, History, SKILL_PREFIX};
@@ -143,6 +143,8 @@ pub struct Composer {
     /// First Esc of a double-Esc stop.
     esc_armed: Option<Instant>,
     placeholder_busy: bool,
+    /// The next paste goes in as text, however large (Cmd/Ctrl+Shift+V).
+    paste_inline: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -210,6 +212,7 @@ impl Composer {
             draft_key,
             esc_armed: None,
             placeholder_busy: false,
+            paste_inline: false,
             _subs: subs,
         }
     }
@@ -237,6 +240,10 @@ impl Composer {
         self.recalled = None;
         self.esc_armed = None;
         self.set_text(&restored, window, cx);
+    }
+
+    pub fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input.read(cx).focus_handle(cx)
     }
 
     pub fn focus(this: &Entity<Self>, window: &mut Window, cx: &mut App) {
@@ -321,6 +328,44 @@ impl Composer {
         self.close_mention(cx);
         self.set_text("", window, cx);
         self.controller.update(cx, |c, cx| c.send_prompt(input, cx));
+    }
+
+    /// With an approval pending, Enter answers it instead of sending: an
+    /// empty box allows once, typed text denies with that text as feedback.
+    /// Returns whether it handled the key.
+    fn answer_permission(
+        &mut self,
+        decision: Option<PermissionDecision>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let first = {
+            let store = self.store.read(cx);
+            let Some(sid) = store.selected.as_deref() else {
+                return false;
+            };
+            crate::ui::permission::pending(store, sid)
+                .first()
+                .map(|(r, _)| (r.session_id.clone(), r.id.clone()))
+        };
+        let Some((sid, rid)) = first else {
+            return false;
+        };
+        let text = self.input.read(cx).value().trim().to_string();
+        let (decision, message) = match decision {
+            Some(d) => (d, None),
+            None if text.is_empty() && self.attachments.is_empty() => {
+                (PermissionDecision::Once, None)
+            }
+            None => (PermissionDecision::Reject, Some(text)),
+        };
+        if message.is_some() {
+            self.set_text("", window, cx);
+        }
+        self.controller.update(cx, |c, cx| {
+            c.reply_permission(sid, rid, decision, message, cx)
+        });
+        true
     }
 
     /// Esc with no popup: the first arms, a second within [`ESC_WINDOW`]
@@ -895,12 +940,47 @@ impl Composer {
                 })
                 .label()
         };
+        // Permission mode: a quiet icon on the default (Supervised), the
+        // mode's name otherwise, so a risky mode is always visible.
+        let non_default = !matches!(label, "Supervised" | "Permissions…" | "Saving permissions…");
+        let full = label == crate::settings::PermissionMode::FullAccess.label();
+        let theme = cx.theme().clone();
         let c = controller.clone();
-        row=row.child(Button::new("permission-mode").label(label).ghost().xsmall().tooltip("Session permissions; saved project grants still apply. Manage saved grants in Settings.")
-            .disabled(selected.as_ref().is_some_and(|sid|store.mode_sending.contains(sid)) || store.connection()!=Connection::Connected)
-            .dropdown_menu(move|mut menu,_,_|{
-                for mode in crate::settings::PermissionMode::ALL{let c=c.clone();menu=menu.item(PopupMenuItem::new(mode.label()).on_click(move|_,_,cx|c.update(cx,|c,cx|c.set_permission_mode(mode,cx))));}menu
-            }));
+        let mut perm = Button::new("permission-mode")
+            .icon(crate::ui::icons::shield())
+            .ghost()
+            .xsmall();
+        if non_default {
+            perm = perm.label(label);
+        }
+        if full {
+            perm = perm.text_color(theme.warning);
+        }
+        let perm = perm
+            .tooltip(format!(
+                "Permissions: {label}. Saved project grants still apply (Settings). Cycle with {}.",
+                if cfg!(target_os = "macos") {
+                    "Cmd+Shift+M"
+                } else {
+                    "Ctrl+Shift+M"
+                }
+            ))
+            .disabled(
+                selected
+                    .as_ref()
+                    .is_some_and(|sid| store.mode_sending.contains(sid))
+                    || store.connection() != Connection::Connected,
+            )
+            .dropdown_menu(move |mut menu, _, _| {
+                for mode in crate::settings::PermissionMode::ALL {
+                    let c = c.clone();
+                    menu = menu.item(PopupMenuItem::new(mode.label()).on_click(move |_, _, cx| {
+                        c.update(cx, |c, cx| c.set_permission_mode(mode, cx))
+                    }));
+                }
+                menu
+            });
+        row = row.child(perm);
         // Agent.
         let primary: Vec<_> = catalog
             .agents
@@ -918,12 +998,7 @@ impl Composer {
             let c = controller.clone();
             let current = agent.clone();
             row = row.child(
-                Button::new("agent-picker")
-                    .label(label)
-                    .icon(IconName::Bot)
-                    .ghost()
-                    .xsmall()
-                    .dropdown_caret(true)
+                crate::ui::kit::quiet_select("agent-picker", label)
                     .tooltip("Agent")
                     .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
                         for a in &primary {
@@ -963,12 +1038,7 @@ impl Composer {
             let c = controller.clone();
             let current = model.clone();
             row = row.child(
-                Button::new("model-picker")
-                    .label(label)
-                    .icon(IconName::Cpu)
-                    .ghost()
-                    .xsmall()
-                    .dropdown_caret(true)
+                crate::ui::kit::quiet_select("model-picker", label)
                     .tooltip("Model")
                     .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
                         menu = menu.scrollable(true).max_h(px(360.)).min_w(px(220.));
@@ -1001,15 +1071,20 @@ impl Composer {
             if let (Some(info), Some(current)) = (info, model)
                 && !info.variants.is_empty()
             {
-                let label = current.variant.clone().unwrap_or_else(|| "default".into());
+                let label = current
+                    .variant
+                    .clone()
+                    .map(|v| {
+                        let mut c = v.chars();
+                        c.next()
+                            .map(|f| f.to_uppercase().chain(c).collect::<String>())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_else(|| "Default effort".into());
                 let c = controller.clone();
                 row = row.child(
-                    Button::new("variant-picker")
-                        .label(label)
-                        .ghost()
-                        .xsmall()
-                        .dropdown_caret(true)
-                        .tooltip("Variant")
+                    crate::ui::kit::quiet_select("variant-picker", label)
+                        .tooltip("Reasoning effort")
                         .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
                             let options = std::iter::once(None)
                                 .chain(info.variants.iter().cloned().map(Some));
@@ -1145,6 +1220,12 @@ impl Render for Composer {
                     let ix = this.mention.as_ref().map_or(0, |m| m.selected);
                     this.accept_mention(ix, window, cx);
                     cx.stop_propagation();
+                } else if !e.shift
+                    && !e.secondary
+                    && this.mention.is_none()
+                    && this.answer_permission(None, window, cx)
+                {
+                    cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
@@ -1154,11 +1235,14 @@ impl Render for Composer {
                     cx.stop_propagation();
                 }
             }))
-            .capture_action(cx.listener(|this, _: &Escape, _, cx| {
+            .capture_action(cx.listener(|this, _: &Escape, window, cx| {
                 if this.mention.is_some() {
                     this.close_mention(cx);
                     cx.stop_propagation();
-                } else if this.escape_to_stop(cx) {
+                } else if (this.input.read(cx).value().trim().is_empty()
+                    && this.answer_permission(Some(PermissionDecision::Reject), window, cx))
+                    || this.escape_to_stop(cx)
+                {
                     cx.stop_propagation();
                 }
             }))
@@ -1175,14 +1259,24 @@ impl Render for Composer {
                     cx.stop_propagation();
                 }
             }))
+            .capture_action(
+                cx.listener(|this, _: &crate::ui::keys::PasteAsText, window, cx| {
+                    this.paste_inline = true;
+                    window.dispatch_action(Box::new(gpui_kit::component::input::Paste), cx);
+                    cx.stop_propagation();
+                }),
+            )
+            // The text box binds Cmd/Ctrl+F to its own search; the app's
+            // find-in-conversation is more useful here.
+            .capture_action(
+                cx.listener(|_, _: &gpui_kit::component::input::Search, window, cx| {
+                    window.dispatch_action(Box::new(crate::ui::keys::FindInThread), cx);
+                    cx.stop_propagation();
+                }),
+            )
             .capture_action(cx.listener(|this, _: &MoveLeft, _, cx| this.close_mention(cx)))
             .capture_action(cx.listener(|this, _: &MoveRight, _, cx| this.close_mention(cx)))
             .children(pending)
-            .child(crate::ui::usage::meter(
-                self.store.read(cx),
-                self.controller.clone(),
-                cx,
-            ))
             .child(attachment_chips)
             .child(
                 Textarea::new(&self.input)

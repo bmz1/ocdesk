@@ -797,6 +797,89 @@ impl Controller {
         );
     }
 
+    /// Branch the selected session at `before` into a new session and open it.
+    pub fn fork(&mut self, before: Option<String>, cx: &mut Context<Self>) {
+        let Some(sid) = self.store.read(cx).selected.clone() else {
+            return;
+        };
+        let Some(api) = self.api(cx) else { return };
+        self.run(
+            cx,
+            async move { api.fork_session(&sid, before.as_deref()).await },
+            |this, res, cx| match res {
+                Ok(session) => {
+                    let id = session.id.clone();
+                    this.store.update(cx, |s, cx| {
+                        s.apply(Envelope::bare(Event::SessionUpserted(session)), cx)
+                    });
+                    this.select_session(Some(id), cx);
+                }
+                Err(e) => this.notice(format!("Could not fork: {e:#}"), cx),
+            },
+        );
+    }
+
+    /// Undo the selected session back to before `message_id` (its prompt,
+    /// the replies and their file changes), then reload its history.
+    pub fn undo_to(&mut self, message_id: String, cx: &mut Context<Self>) {
+        let Some(sid) = self.store.read(cx).selected.clone() else {
+            return;
+        };
+        if self.store.read(cx).is_busy(&sid) {
+            self.notice("Stop the running turn before undoing", cx);
+            return;
+        }
+        let Some(api) = self.api(cx) else { return };
+        let session = sid.clone();
+        self.run(
+            cx,
+            async move { api.revert_to(&session, &message_id).await },
+            move |this, res, cx| match res {
+                Ok(()) => {
+                    this.load_messages(sid.clone(), cx);
+                    this.refresh_diff(sid, cx);
+                }
+                Err(e) => this.notice(format!("Could not undo: {e:#}"), cx),
+            },
+        );
+    }
+
+    /// Switch the selected session to the build agent and implement the
+    /// plan it just wrote.
+    pub fn implement_plan(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.store.read(cx).selected.clone() else {
+            return;
+        };
+        let prompt = PromptInput {
+            text: "Implement the plan above.".into(),
+            ..Default::default()
+        };
+        if self.demo {
+            self.send_prompt(prompt, cx);
+            return;
+        }
+        let Some(api) = self.api(cx) else { return };
+        self.store.update(cx, |s, cx| {
+            s.set_draft_choice(None, Some("build".into()), cx);
+            s.apply(
+                Envelope::bare(Event::AgentSelected {
+                    session_id: sid.clone(),
+                    agent: "build".into(),
+                }),
+                cx,
+            )
+        });
+        // The prompt must run with the new agent, so it waits for the switch.
+        self.run(
+            cx,
+            async move { api.switch_agent(&sid, "build").await },
+            move |this, res, cx| match res {
+                Ok(()) => this.send_prompt(prompt, cx),
+                Err(e) => this.notice(format!("Could not switch to the build agent: {e:#}"), cx),
+            },
+        );
+    }
+
     /// Connect or disconnect an MCP server of the target folder.
     pub fn set_mcp_connected(&mut self, server: String, connect: bool, cx: &mut Context<Self>) {
         let Some(folder) = self.store.read(cx).target_folder() else {
@@ -1235,6 +1318,7 @@ impl Controller {
         sid: String,
         rid: String,
         decision: PermissionDecision,
+        message: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(api) = self.api(cx) else { return };
@@ -1259,7 +1343,10 @@ impl Controller {
         let (session, request) = (sid.clone(), rid.clone());
         self.run(
             cx,
-            async move { api.reply_permission(&session, &request, decision).await },
+            async move {
+                api.reply_permission(&session, &request, decision, message.as_deref())
+                    .await
+            },
             move |this, res, cx| {
                 if this.generation != generation || this.connection_epoch != epoch {
                     return;
@@ -1293,6 +1380,9 @@ impl Controller {
     }
 
     pub fn refresh_diff(&mut self, sid: String, cx: &mut Context<Self>) {
+        if self.demo {
+            return;
+        }
         let Some(api) = self.api(cx) else { return };
         let generation = self.generation;
         let request = self.diff_requests.entry(sid.clone()).or_default();

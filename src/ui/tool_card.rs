@@ -26,6 +26,36 @@ pub struct ToolCtx<'a> {
     pub toggle: ToggleTool,
     pub open_task: &'a super::tasks::OpenTask,
     pub scrolls: &'a ScrollHandles,
+    pub density: crate::settings::Density,
+    /// The find bar's query, lowercased: calls that match open up.
+    pub find: Option<&'a str>,
+}
+
+impl ToolCtx<'_> {
+    /// Whether the row or group under `key` is open. In the verbose
+    /// density rows start open and a click closes them.
+    pub fn is_open(&self, key: &str) -> bool {
+        let verbose = self.density == crate::settings::Density::Verbose;
+        self.expanded.contains(key) != verbose
+    }
+
+    fn found(&self, t: &ToolCall) -> bool {
+        self.find.is_some_and(|q| tool_matches(t, q))
+    }
+}
+
+/// Whether a call's input, output or error contains `q` (lowercase).
+pub fn tool_matches(t: &ToolCall, q: &str) -> bool {
+    let has = |s: &str| s.to_lowercase().contains(q);
+    has(&t.name)
+        || has(&t.input.to_string())
+        || has(&t.output)
+        || t.error.as_deref().is_some_and(has)
+}
+
+/// Successful, finished calls are left out in the quiet density.
+fn hidden_in(t: &ToolCall, density: crate::settings::Density) -> bool {
+    density == crate::settings::Density::Quiet && t.status == ToolStatus::Completed
 }
 
 /// Output panels taller than this scroll.
@@ -131,6 +161,9 @@ pub fn render_tools(
         run.clear();
     };
     for t in tools {
+        if hidden_in(t, ctx.density) && t.name != "subagent" {
+            continue;
+        }
         if let Some(row) = task_row(t, message_id, ctx.open_task, cx) {
             flush(&mut run, &mut out);
             out.push(row);
@@ -145,13 +178,19 @@ pub fn render_tools(
 fn render_group(tools: &[&ToolCall], message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let key = key(message_id, &format!("group-{}", tools[0].call_id));
-    let open = ctx.expanded.contains(&key);
-    let running = tools.iter().any(|t| is_running(t));
+    let open = ctx.is_open(&key) || tools.iter().any(|t| ctx.found(t));
+    let current = tools.iter().rev().find(|t| is_running(t));
+    let running = current.is_some();
     let failed = tools
         .iter()
         .filter(|t| t.status == ToolStatus::Error)
         .count();
-    let summary = tools_summary(tools.iter().copied()).unwrap_or_default();
+    // While a call runs, the row names it ("Running cargo test"); once the
+    // run settles it becomes the summary.
+    let summary = match current {
+        Some(t) => format!("{} {}", verb(t), row_summary(t)),
+        None => tools_summary(tools.iter().copied()).unwrap_or_default(),
+    };
     let toggle = ctx.toggle.clone();
     let click_key = key.clone();
     let header = h_flex()
@@ -197,7 +236,7 @@ fn render_group(tools: &[&ToolCall], message_id: &str, ctx: &ToolCtx, cx: &App) 
 fn render_tool(t: &ToolCall, message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let key = key(message_id, &t.call_id);
-    let open = ctx.expanded.contains(&key);
+    let open = ctx.is_open(&key) || ctx.found(t);
     let verb_color = if t.status == ToolStatus::Error {
         theme.danger
     } else {
@@ -239,7 +278,17 @@ fn render_tool(t: &ToolCall, message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyEl
 fn tool_details(t: &ToolCall, key: &str, ctx: &ToolCtx, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let shell = is_shell(t);
-    let input = input_text(t);
+    let raw_key = format!("raw-{key}");
+    let show_raw = ctx.expanded.contains(&raw_key);
+    // Tools without a main argument we know show their JSON input only on
+    // request; the summary row already names what they did.
+    let main = main_argument(t);
+    let input = if show_raw {
+        serde_json::to_string_pretty(&t.input).unwrap_or_default()
+    } else {
+        main.clone().unwrap_or_else(|| input_text(t))
+    };
+    let has_raw = main.is_some() && !shell && t.input.as_object().is_some_and(|o| o.len() > 1);
     let input_block = h_flex()
         .w_full()
         .items_start()
@@ -283,13 +332,44 @@ fn tool_details(t: &ToolCall, key: &str, ctx: &ToolCtx, cx: &App) -> AnyElement 
         .border_color(theme.border)
         .bg(theme.secondary.opacity(0.35))
         .child(
-            div()
+            h_flex()
+                .justify_between()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(display_name(&t.name)),
+                .child(display_name(&t.name))
+                .when(has_raw, |el| {
+                    let toggle = ctx.toggle.clone();
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("raw-toggle-{key}")))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.foreground))
+                            .child(if show_raw {
+                                "Hide raw input"
+                            } else {
+                                "Raw input"
+                            })
+                            .on_click(move |_, _, cx| toggle(raw_key.clone(), cx)),
+                    )
+                }),
         )
         .child(input_block);
 
+    // The file a call is about: its output (reads) and content (writes)
+    // are coloured as that file's language.
+    let file = str_input(t, "filePath").or(str_input(t, "path"));
+    if t.name == "write"
+        && let Some(content) = str_input(t, "content").filter(|c| !c.trim().is_empty())
+    {
+        card = card.child(output_panel(
+            &format!("content-{key}"),
+            content.trim_end(),
+            theme.foreground,
+            file,
+            ctx,
+            cx,
+        ));
+    }
     // Result: the error for failed tools, else the output.
     match (&t.error, t.output.trim_end()) {
         (Some(error), _) => {
@@ -297,15 +377,22 @@ fn tool_details(t: &ToolCall, key: &str, ctx: &ToolCtx, cx: &App) -> AnyElement 
                 &format!("error-{key}"),
                 error,
                 theme.danger,
+                None,
                 ctx,
                 cx,
             ));
         }
-        (None, out) if !out.is_empty() => {
+        (None, out) if !out.is_empty() && t.name != "write" => {
+            let read = kind(&t.name) == Kind::Read;
             card = card.child(output_panel(
                 &format!("output-{key}"),
                 out,
-                theme.muted_foreground,
+                if read {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                },
+                file.filter(|_| read),
                 ctx,
                 cx,
             ));
@@ -340,6 +427,7 @@ fn tool_details(t: &ToolCall, key: &str, ctx: &ToolCtx, cx: &App) -> AnyElement 
         card = card.child(super::changes::patch_view(
             &format!("tool-diff-{key}"),
             diff,
+            file,
             cx,
         ));
     }
@@ -348,10 +436,24 @@ fn tool_details(t: &ToolCall, key: &str, ctx: &ToolCtx, cx: &App) -> AnyElement 
 
 /// Mono output, bounded in height. Scrolling inside it doesn't drag the
 /// conversation along; at either end the wheel goes back to the list.
-fn output_panel(id: &str, text: &str, color: Hsla, ctx: &ToolCtx, cx: &App) -> AnyElement {
+fn output_panel(
+    id: &str,
+    text: &str,
+    color: Hsla,
+    language: Option<&str>,
+    ctx: &ToolCtx,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let preview: String = text.chars().take(PREVIEW_CHARS).collect();
     let clipped = preview.len() < text.len();
+    let body: AnyElement = match language {
+        Some(lang) if super::syntax::supported(lang) => {
+            let spans = super::syntax::highlight_gutter(lang, &preview);
+            super::syntax::styled(preview, &spans, cx).into_any_element()
+        }
+        _ => preview.into_any_element(),
+    };
     let handle = ctx
         .scrolls
         .borrow_mut()
@@ -368,7 +470,7 @@ fn output_panel(id: &str, text: &str, color: Hsla, ctx: &ToolCtx, cx: &App) -> A
                 .font_family(theme.mono_font_family.clone())
                 .text_xs()
                 .text_color(color)
-                .child(preview),
+                .child(body),
         )
         .when(clipped, |el| {
             el.child(
@@ -484,6 +586,27 @@ fn row_summary(t: &ToolCall) -> String {
     }
 }
 
+/// The one argument that says what a call did, for tools whose input is
+/// otherwise shown as JSON.
+fn main_argument(t: &ToolCall) -> Option<String> {
+    if !matches!(kind(&t.name), Kind::Other) {
+        return None;
+    }
+    [
+        "description",
+        "filePath",
+        "path",
+        "url",
+        "query",
+        "name",
+        "prompt",
+    ]
+    .iter()
+    .find_map(|k| str_input(t, k))
+    .map(|s| s.trim_end().to_string())
+    .filter(|s| !s.is_empty())
+}
+
 /// The card's input block: the command for shells, the main argument for
 /// file and search tools, pretty JSON for anything else.
 fn input_text(t: &ToolCall) -> String {
@@ -528,14 +651,15 @@ fn display_name(name: &str) -> String {
     }
 }
 
-/// "Ran 2 commands, read 1 file, edited 1 file, searched 1 time".
+/// "Ran 2 commands, edited 3 files and 2 more". Commands and edits rank
+/// above reads and searches; at most two categories are named.
 pub fn tools_summary<'a>(tools: impl IntoIterator<Item = &'a ToolCall>) -> Option<String> {
     let mut counts = [0usize; 5];
     for t in tools {
         let slot = match kind(&t.name) {
             Kind::Ran => 0,
-            Kind::Read => 1,
-            Kind::Edited => 2,
+            Kind::Edited => 1,
+            Kind::Read => 2,
             Kind::Searched => 3,
             Kind::Other => 4,
         };
@@ -543,21 +667,30 @@ pub fn tools_summary<'a>(tools: impl IntoIterator<Item = &'a ToolCall>) -> Optio
     }
     let plural =
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    let parts: Vec<String> = [
+    let named: Vec<(usize, String)> = [
         (counts[0], "ran", "command", "commands"),
-        (counts[1], "read", "file", "files"),
-        (counts[2], "edited", "file", "files"),
+        (counts[1], "edited", "file", "files"),
+        (counts[2], "read", "file", "files"),
         (counts[3], "searched", "time", "times"),
         (counts[4], "used", "tool", "tools"),
     ]
     .into_iter()
     .filter(|(n, ..)| *n > 0)
-    .map(|(n, verb, one, many)| format!("{verb} {}", plural(n, one, many)))
+    .map(|(n, verb, one, many)| (n, format!("{verb} {}", plural(n, one, many))))
     .collect();
-    if parts.is_empty() {
+    if named.is_empty() {
         return None;
     }
-    let mut s = parts.join(", ");
+    let rest: usize = named.iter().skip(2).map(|(n, _)| n).sum();
+    let mut s = named
+        .iter()
+        .take(2)
+        .map(|(_, p)| p.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if rest > 0 {
+        s.push_str(&format!(" and {rest} more"));
+    }
     // Capitalize the first verb only.
     if let Some(first) = s.get_mut(0..1) {
         first.make_ascii_uppercase();
@@ -733,7 +866,7 @@ pub fn text_panel(id: &str, title: &str, text: &str, cx: &App) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tok, shell_tokens};
+    use super::{Tok, ToolCall, ToolStatus, shell_tokens, tools_summary};
 
     fn kinds(src: &str) -> Vec<(&str, Tok)> {
         shell_tokens(src)
@@ -761,6 +894,37 @@ mod tests {
                 (">", Tok::Op),
                 ("out.txt", Tok::Arg),
             ]
+        );
+    }
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            call_id: name.into(),
+            name: name.into(),
+            status: ToolStatus::Completed,
+            input: serde_json::Value::Null,
+            output: String::new(),
+            error: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn summary_ranks_commands_and_edits_and_caps_categories() {
+        let tools = [
+            call("read"),
+            call("grep"),
+            call("edit"),
+            call("shell"),
+            call("edit"),
+        ];
+        assert_eq!(
+            tools_summary(tools.iter()).as_deref(),
+            Some("Ran 1 command, edited 2 files and 2 more")
+        );
+        assert_eq!(
+            tools_summary([call("read")].iter()).as_deref(),
+            Some("Read 1 file")
         );
     }
 

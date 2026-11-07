@@ -22,7 +22,6 @@ use crate::controller::Controller;
 use crate::store::{Store, StoreEvent};
 use crate::ui::icons;
 
-pub const DRAWER_W: f32 = 420.;
 const POLL: Duration = Duration::from_secs(1);
 
 /// What the drawer shows.
@@ -173,16 +172,6 @@ impl TasksDrawer {
                     .font_weight(FontWeight::MEDIUM)
                     .when(!back, |d| d.pl_2())
                     .child(title),
-            )
-            .child(
-                Button::new("tasks-close")
-                    .icon(IconName::Close)
-                    .ghost()
-                    .small()
-                    .tooltip_with_action("Close", &super::keys::ToggleTasks, None)
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(super::keys::ToggleTasks), cx)
-                    }),
             )
     }
 
@@ -493,11 +482,7 @@ impl Render for TasksDrawer {
             }
         };
         v_flex()
-            .w(px(DRAWER_W))
-            .h_full()
-            .flex_none()
-            .border_l_1()
-            .border_color(theme.border)
+            .size_full()
             .bg(theme.background)
             .child(self.header(title, cx))
             .child(
@@ -651,7 +636,7 @@ mod tests {
         });
         assert_eq!(
             activity_summary(&[msg]).as_deref(),
-            Some("Ran 2 commands, read 1 file, searched 1 time")
+            Some("Ran 2 commands, read 1 file and 1 more")
         );
         assert_eq!(activity_summary(&[]), None);
     }

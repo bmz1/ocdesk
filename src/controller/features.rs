@@ -436,3 +436,144 @@ impl Controller {
         self.refresh_diff(sid, cx);
     }
 }
+
+// ── navigation, palette and sidebar intents ──────────────────────────────
+
+impl Controller {
+    /// Ctrl+O: normal → verbose → quiet.
+    /// Returns what to tell the user.
+    pub fn cycle_density(&mut self, cx: &mut Context<Self>) -> String {
+        let next = self.settings.density.next();
+        self.update_settings(cx, |s| s.density = next);
+        format!("Transcript: {}", next.label())
+    }
+
+    pub fn set_density(&mut self, density: crate::settings::Density, cx: &mut Context<Self>) {
+        self.update_settings(cx, |s| s.density = density);
+    }
+
+    /// The permission mode the composer shows for the selected session or
+    /// the draft.
+    pub fn current_permission_mode(&self, cx: &App) -> Option<PermissionMode> {
+        let store = self.store.read(cx);
+        match &store.selected {
+            Some(sid) => store.session_modes.get(sid).copied().flatten(),
+            None => Some(store.draft_permission.unwrap_or_else(|| {
+                store
+                    .target_folder()
+                    .map(|f| self.settings.permission_for(&f))
+                    .unwrap_or_default()
+            })),
+        }
+    }
+
+    pub fn cycle_permission_mode(&mut self, cx: &mut Context<Self>) -> String {
+        let current = self.current_permission_mode(cx);
+        let all = PermissionMode::ALL;
+        let next = current
+            .and_then(|m| all.iter().position(|x| *x == m))
+            .map_or(all[0], |i| all[(i + 1) % all.len()]);
+        self.set_permission_mode(next, cx);
+        format!("Permissions: {}", next.label())
+    }
+
+    /// Next reasoning variant of the current model (wrapping to the
+    /// model's default).
+    pub fn cycle_effort(&mut self, cx: &mut Context<Self>) -> String {
+        let store = self.store.read(cx);
+        let Some(model) = store.effective_model() else {
+            return "Choose a model first".into();
+        };
+        let variants = store
+            .target_catalog()
+            .and_then(|c| c.model(&model))
+            .map(|m| m.variants.clone())
+            .unwrap_or_default();
+        if variants.is_empty() {
+            return "This model has no reasoning levels".into();
+        }
+        let next = match model
+            .variant
+            .as_ref()
+            .and_then(|v| variants.iter().position(|x| x == v))
+        {
+            None => Some(variants[0].clone()),
+            Some(i) if i + 1 < variants.len() => Some(variants[i + 1].clone()),
+            Some(_) => None,
+        };
+        let label = next.clone().unwrap_or_else(|| "default".into());
+        self.choose_model(
+            ModelRef {
+                variant: next,
+                ..model
+            },
+            cx,
+        );
+        format!("Reasoning effort: {label}")
+    }
+
+    /// The selected session's last reply as plain text.
+    pub fn last_reply(&self, cx: &App) -> Option<String> {
+        use crate::api::model::{Block, BlockKind, Message};
+        let conv = self.store.read(cx).selected_conversation()?;
+        let last_user = conv
+            .messages
+            .iter()
+            .rposition(|m| matches!(m, Message::User(_)))
+            .map_or(0, |i| i + 1);
+        let text: Vec<&str> = conv.messages[last_user..]
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => Some(a),
+                _ => None,
+            })
+            .flat_map(|a| a.blocks.iter())
+            .filter_map(|b| match b {
+                Block::Prose {
+                    kind: BlockKind::Text,
+                    text,
+                    ..
+                } if !text.trim().is_empty() => Some(text.trim()),
+                _ => None,
+            })
+            .collect();
+        (!text.is_empty()).then(|| text.join("\n\n"))
+    }
+
+    pub fn toggle_pin(&mut self, sid: String, cx: &mut Context<Self>) {
+        self.update_settings(cx, |s| {
+            if let Some(i) = s.pinned.iter().position(|p| *p == sid) {
+                s.pinned.remove(i);
+            } else {
+                s.pinned.insert(0, sid);
+            }
+        });
+    }
+
+    /// Archive (`true`) or restore a session. The server removes an
+    /// archived session from the list; restoring re-reads the list.
+    pub fn set_archived(&mut self, sid: String, archived: bool, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        if archived && self.store.read(cx).selected.as_deref() == Some(sid.as_str()) {
+            self.select_session(None, cx);
+        }
+        let id = sid.clone();
+        self.run(
+            cx,
+            async move { api.set_archived(&id, archived).await },
+            move |this, res, cx| match res {
+                Ok(()) if !archived => this.refresh_sessions(cx),
+                Ok(()) => {}
+                Err(e) => this.notice(format!("Could not update {sid}: {e:#}"), cx),
+            },
+        );
+    }
+}
+
+impl Controller {
+    /// The API client and the Tokio runtime, for views that run their own
+    /// long-lived I/O (the terminal). `None` while opencode isn't running.
+    pub fn api_and_runtime(&self) -> Option<(crate::api::Api, tokio::runtime::Handle)> {
+        Some((self.api.clone()?, self.rt.clone()))
+    }
+}

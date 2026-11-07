@@ -98,6 +98,9 @@ impl Composer {
             }
             return true;
         }
+        if std::mem::take(&mut self.paste_inline) {
+            return false;
+        }
         if let Some(text) = item.text()
             && (text.chars().count() > LARGE_PASTE_CHARS
                 || text.lines().count() > LARGE_PASTE_LINES)

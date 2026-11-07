@@ -15,8 +15,8 @@ use gpui_kit::{Context, EventEmitter};
 use crate::api::events::Outcome;
 use crate::api::model::{
     AgentInfo, AssistantMessage, Block, BlockKind, CommandInfo, FileDiff, FormRequest, InboxItem,
-    McpServer, Message, ModelInfo, ModelRef, PermissionRequest, SessionInfo, ShellInfo, SkillInfo,
-    ToolCall, ToolStatus, UserMessage, VcsInfo,
+    McpServer, Message, Meta, ModelInfo, ModelRef, PermissionRequest, SessionInfo, ShellInfo,
+    SkillInfo, Timing, ToolCall, ToolStatus, UserMessage, VcsInfo,
 };
 use crate::api::{Envelope, Event};
 
@@ -1025,6 +1025,12 @@ impl Store {
         if let Some(seq) = env.seq {
             conv.last_seq = Some(conv.last_seq.map_or(seq, |s| s.max(seq)));
         }
+        // Server time of the event; local events (demo, replies) use now.
+        let at = if env.created > 0 {
+            env.created
+        } else {
+            now_ms()
+        };
         let changed = |index: usize, inserted: bool| {
             if inserted {
                 StoreEvent::MessageInserted {
@@ -1053,13 +1059,29 @@ impl Store {
                             id: message_id,
                             text,
                             attachments,
+                            meta: Meta {
+                                created: Some(at),
+                                ..Default::default()
+                            },
                         }),
                     );
                     out.push(changed(index, true));
                 }
             }
-            Event::StepStarted { message_id, .. } => {
-                let (index, inserted, _) = conv.assistant_mut(&message_id);
+            Event::StepStarted {
+                message_id,
+                model,
+                agent,
+                ..
+            } => {
+                let (index, inserted, msg) = conv.assistant_mut(&message_id);
+                msg.meta.created.get_or_insert(at);
+                if model.is_some() {
+                    msg.meta.model = model;
+                }
+                if agent.is_some() {
+                    msg.meta.agent = agent;
+                }
                 if inserted {
                     out.push(changed(index, true));
                 }
@@ -1071,7 +1093,7 @@ impl Store {
                 ..
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
-                prose_mut(msg, kind, ordinal);
+                prose_mut(msg, kind, ordinal).2.created.get_or_insert(at);
                 out.push(changed(index, inserted));
             }
             Event::BlockDelta {
@@ -1082,7 +1104,7 @@ impl Store {
                 ..
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
-                let (text, _) = prose_mut(msg, kind, ordinal);
+                let (text, _, _) = prose_mut(msg, kind, ordinal);
                 text.push_str(&delta);
                 out.push(changed(index, inserted));
             }
@@ -1094,9 +1116,10 @@ impl Store {
                 ..
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
-                let (text, done) = prose_mut(msg, kind, ordinal);
+                let (text, done, time) = prose_mut(msg, kind, ordinal);
                 *text = full;
                 *done = true;
+                time.completed = Some(at);
                 out.push(changed(index, inserted));
             }
             Event::ToolStarted {
@@ -1169,11 +1192,22 @@ impl Store {
                 out.push(changed(index, inserted));
             }
             Event::StepEnded {
-                message_id, finish, ..
+                message_id,
+                finish,
+                tokens,
+                cost,
+                ..
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
                 msg.completed = true;
                 msg.finish = Some(finish);
+                msg.meta.completed = Some(at);
+                if let Some(t) = tokens {
+                    msg.meta.tokens = Some(crate::api::features::Tokens::parse(&t));
+                }
+                if cost.is_some() {
+                    msg.meta.cost = cost;
+                }
                 out.push(changed(index, inserted));
             }
             Event::StepFailed {
@@ -1181,6 +1215,7 @@ impl Store {
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
                 msg.completed = true;
+                msg.meta.completed = Some(at);
                 msg.finish = Some("error".into());
                 msg.error = Some(error);
                 out.push(changed(index, inserted));
@@ -1254,7 +1289,7 @@ fn prose_mut(
     msg: &mut AssistantMessage,
     kind: BlockKind,
     ordinal: u64,
-) -> (&mut String, &mut bool) {
+) -> (&mut String, &mut bool, &mut Timing) {
     let pos = msg.blocks.iter().position(
         |b| matches!(b, Block::Prose { kind: k, ordinal: o, .. } if *k == kind && *o == ordinal),
     );
@@ -1264,11 +1299,14 @@ fn prose_mut(
             ordinal,
             text: String::new(),
             done: false,
+            time: Timing::default(),
         });
         msg.blocks.len() - 1
     });
     match &mut msg.blocks[pos] {
-        Block::Prose { text, done, .. } => (text, done),
+        Block::Prose {
+            text, done, time, ..
+        } => (text, done, time),
         Block::Tool(_) => unreachable!(),
     }
 }
@@ -1331,6 +1369,13 @@ fn same_block(a: &Block, b: &Block) -> bool {
         (Block::Tool(x), Block::Tool(y)) => x.call_id == y.call_id,
         _ => false,
     }
+}
+
+/// Wall-clock epoch milliseconds.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[cfg(test)]
@@ -1439,6 +1484,7 @@ mod tests {
                 id: id.into(),
                 text: id.into(),
                 attachments: vec![],
+                meta: Default::default(),
             })
         };
         s.apply_inner(wire(r#"{"type":"session.step.started","data":{"sessionID":"ses_a","assistantMessageID":"msg_0_reply"}}"#));
@@ -1748,6 +1794,7 @@ mod tests {
             ordinal: 0,
             text: t.into(),
             done: false,
+            time: Default::default(),
         };
         let msg = |t: &str| {
             Message::Assistant(AssistantMessage {

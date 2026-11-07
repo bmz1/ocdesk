@@ -1,65 +1,15 @@
 use crate::{controller::Controller, store::Store};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::*;
 
-pub fn meter(store: &Store, controller: Entity<Controller>, cx: &App) -> AnyElement {
-    let Some(sid) = store.selected.clone() else {
-        return div().into_any_element();
-    };
-    let label = if let Some(r) = store.usage.get(&sid) {
-        let context = match (r.context, r.context_limit) {
-            (Some(n), Some(limit)) if limit > 0 => {
-                format!(" · context ~{:.0}%", n as f64 / limit as f64 * 100.)
-            }
-            (Some(n), _) => format!(" · context {n}"),
-            _ => String::new(),
-        };
-        format!("{} tokens · ${:.4}{context}", r.tokens.total(), r.cost)
-    } else if store.usage_loading.contains(&sid) {
-        "Usage loading…".into()
-    } else {
-        "Usage details".into()
-    };
-    let button = Button::new("usage-meter")
-        .label(label)
-        .ghost()
-        .xsmall()
-        .on_click({
-            let sid = sid.clone();
-            move |_, window, cx| open(sid.clone(), controller.clone(), window, cx)
-        });
-    let mut row = h_flex().gap_2().items_center().child(button);
-    if let Some(r) = store.usage.get(&sid)
-        && let (Some(n), Some(limit)) = (r.context, r.context_limit)
-        && limit > 0
-    {
-        let fraction = (n as f32 / limit as f32).clamp(0., 1.);
-        let color = if fraction > 0.9 {
-            cx.theme().danger
-        } else if fraction > 0.75 {
-            cx.theme().warning
-        } else {
-            cx.theme().primary
-        };
-        row = row.child(
-            div()
-                .w(px(70.))
-                .h(px(4.))
-                .rounded_md()
-                .bg(cx.theme().secondary)
-                .child(div().h_full().w(relative(fraction)).rounded_md().bg(color)),
-        );
-    }
-    row.into_any_element()
-}
 struct UsageDetails {
     sid: String,
     controller: Entity<Controller>,
     store: Entity<Store>,
     _sub: Subscription,
 }
-fn open(sid: String, controller: Entity<Controller>, window: &mut Window, cx: &mut App) {
+pub fn open(sid: String, controller: Entity<Controller>, window: &mut Window, cx: &mut App) {
     let store = controller.read(cx).view_store();
     let view = cx.new(|cx| {
         let sub = cx.observe(&store, |_, _, cx| cx.notify());
