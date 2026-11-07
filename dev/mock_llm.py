@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Deterministic OpenAI-compatible streaming LLM for exercising ocdesk offline.
+
+Dev tooling only; never shipped. Usage:
+    python3 dev/mock_llm.py [port]          # default 4555
+then run opencode with dev/mock-opencode.json (see README "Developing").
+
+Behaviour is keyed on the last user message:
+    contains "tool:bash"  -> calls the bash tool, then summarizes the result
+    contains "tool:edit"  -> calls the write tool on mock_note.txt, then summarizes
+    contains "long"       -> streams a long markdown answer with code blocks
+    anything else         -> short reasoning + a short markdown answer
+"""
+import json
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DELAY = 0.03
+
+
+def last_user_text(messages):
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, list):
+                return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            return c or ""
+    return ""
+
+
+def words(s):
+    out, cur = [], ""
+    for ch in s:
+        cur += ch
+        if ch in " \n":
+            out.append(cur)
+            cur = ""
+    if cur:
+        out.append(cur)
+    return out
+
+
+LONG = "# A long answer\n\n" + "\n\n".join(
+    f"## Section {i}\n\nSome *emphasis*, some `inline code`, and a [link](https://opencode.ai).\n\n"
+    f"```rust\nfn section_{i}() -> u32 {{\n    let x = {i};\n    x * 2\n}}\n```\n\n- item one\n- item two"
+    for i in range(1, 9)
+)
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("mock_llm: " + fmt % args + "\n")
+
+    def do_GET(self):
+        if self.path.endswith("/models"):
+            self._json({"object": "list", "data": [{"id": "mock-1", "object": "model"}]})
+        else:
+            self._json({"ok": True})
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        req = json.loads(self.rfile.read(n) or b"{}")
+        msgs = req.get("messages", [])
+        has_tool_result = bool(msgs) and msgs[-1].get("role") == "tool"
+        user = last_user_text(msgs)
+        sys_text = " ".join(
+            m.get("content", "") if isinstance(m.get("content"), str) else ""
+            for m in msgs if m.get("role") == "system"
+        )
+        is_title = "title" in sys_text.lower() and not req.get("tools")
+
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def chunk(delta, finish=None):
+            payload = {
+                "id": "mock", "object": "chat.completion.chunk", "created": int(time.time()),
+                "model": "mock-1",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
+            self.wfile.flush()
+
+        def stream_text(text, key="content"):
+            for w in words(text):
+                chunk({key: w})
+                time.sleep(DELAY)
+
+        def tool_call(name, args):
+            chunk({"tool_calls": [{"index": 0, "id": f"call_{int(time.time()*1000)}", "type": "function",
+                                   "function": {"name": name, "arguments": ""}}]})
+            s = json.dumps(args)
+            for i in range(0, len(s), 12):
+                chunk({"tool_calls": [{"index": 0, "function": {"arguments": s[i:i+12]}}]})
+                time.sleep(DELAY)
+            chunk({}, "tool_calls")
+
+        try:
+            chunk({"role": "assistant"})
+            if is_title:
+                stream_text(" ".join(user.split()[:5]) or "Mock session")
+                chunk({}, "stop")
+            elif has_tool_result:
+                stream_text("Thinking about the tool output.", "reasoning_content")
+                stream_text("The tool finished. Output was:\n\n```\n" + str(msgs[-1].get("content"))[:400] + "\n```\n")
+                chunk({}, "stop")
+            elif "tool:bash" in user:
+                stream_text("I should run a command.", "reasoning_content")
+                stream_text("Running a command.\n")
+                tool_call("bash", {"command": "echo hello-from-bash && ls | head -5", "description": "Say hello and list files"})
+            elif "tool:edit" in user:
+                stream_text("Writing a file.\n")
+                tool_call("write", {"filePath": "mock_note.txt", "content": "line one\nline two\n"})
+            elif "long" in user:
+                stream_text("Planning a long answer with many sections.", "reasoning_content")
+                stream_text(LONG)
+                chunk({}, "stop")
+            else:
+                stream_text("The user wants a short reply. I will be brief.", "reasoning_content")
+                stream_text("Hello from the **mock** model. You said: " + user.strip()[:200])
+                chunk({}, "stop")
+            usage = {"id": "mock", "object": "chat.completion.chunk", "created": int(time.time()), "model": "mock-1",
+                     "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}}
+            self.wfile.write(f"data: {json.dumps(usage)}\n\ndata: [DONE]\n\n".encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+if __name__ == "__main__":
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 4555
+    print(f"mock_llm listening on http://127.0.0.1:{port}/v1", flush=True)
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
