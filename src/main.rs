@@ -70,7 +70,7 @@ fn main() -> Result<()> {
 
     let _sidecar_guard = SidecarGuard;
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(ui::icons::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             cx.on_app_quit(|_| {

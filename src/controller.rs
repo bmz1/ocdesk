@@ -430,6 +430,7 @@ impl Controller {
         pending_sessions.extend(self.store.read(cx).forms.keys().cloned());
         if let Some(id) = selected {
             pending_sessions.insert(id.clone());
+            self.refresh_inbox(id.clone(), cx);
             self.load_messages(id.clone(), cx);
             if self.store.read(cx).diffs.contains_key(&id) {
                 self.refresh_diff(id, cx);
@@ -1056,6 +1057,7 @@ impl Controller {
         if let Some(id) = id {
             self.refresh_permissions(id.clone(), cx);
             self.refresh_forms(id.clone(), cx);
+            self.refresh_inbox(id.clone(), cx);
             self.load_messages(id, cx);
         }
     }
@@ -1191,7 +1193,10 @@ impl Controller {
             self.notice("Add a folder first", cx);
             return;
         };
-        if let Some(sid) = &selected {
+        let was_busy = selected.as_ref().is_some_and(|sid| store.is_busy(sid));
+        if let Some(sid) = &selected
+            && !was_busy
+        {
             // Flip to busy right away so the composer shows Stop; the server
             // confirms with session.execution.started within milliseconds.
             self.store.update(cx, |s, cx| {
@@ -1220,7 +1225,7 @@ impl Controller {
                 api.prompt(&sid, &input).await?;
                 Ok((sid, created))
             },
-            |this, res, cx| match res {
+            move |this, res, cx| match res {
                 Ok((sid, Some(session))) => {
                     this.store.update(cx, |s, cx| {
                         s.apply(Envelope::bare(Event::SessionUpserted(session)), cx);
@@ -1230,10 +1235,61 @@ impl Controller {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    if let Some(sid) = this.store.read(cx).selected.clone() {
+                    // A steer/queue into a running turn leaves it running.
+                    if !was_busy && let Some(sid) = this.store.read(cx).selected.clone() {
                         this.store.update(cx, |s, cx| s.set_busy(&sid, false, cx));
                     }
                     this.notice(format!("Could not send prompt: {e:#}"), cx);
+                }
+            },
+        );
+    }
+
+    // ── inbox: queued and steering prompts ──────────────────────────────
+
+    /// Re-read a session's pending inbox (select, reconnect).
+    pub fn refresh_inbox(&mut self, sid: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else { return };
+        let target = sid.clone();
+        self.run(
+            cx,
+            async move { api.inbox(&sid).await },
+            move |this, res, cx| match res {
+                Ok(items) => this
+                    .store
+                    .update(cx, |s, cx| s.set_inbox(&target, items, cx)),
+                Err(e) => tracing::warn!("could not read inbox of {target}: {e:#}"),
+            },
+        );
+    }
+
+    /// Withdraw a queued/steering prompt that hasn't been delivered yet.
+    pub fn cancel_inbox(&mut self, sid: String, item_id: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        self.run(
+            cx,
+            async move { api.cancel_inbox(&sid, &item_id).await },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    // Most likely delivered in the meantime.
+                    this.notice(format!("Could not remove the queued prompt: {e:#}"), cx);
+                }
+            },
+        );
+    }
+
+    /// Turn a queued prompt into a steer (delivered at the next step).
+    pub fn steer_now(&mut self, sid: String, item_id: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        self.run(
+            cx,
+            async move {
+                api.set_inbox_delivery(&sid, &item_id, crate::api::model::Delivery::Steer)
+                    .await
+            },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    this.notice(format!("Could not steer: {e:#}"), cx);
                 }
             },
         );

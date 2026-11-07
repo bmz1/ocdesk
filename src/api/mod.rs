@@ -240,7 +240,7 @@ impl Api {
         Ok(())
     }
 
-    /// Full history in chronological order (`GET /api/session/{id}/message`).
+    /// Full history in transcript order (`GET /api/session/{id}/message`).
     pub async fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let mut raw = Vec::new();
         let mut cursor: Option<String> = None;
@@ -266,9 +266,10 @@ impl Api {
                 break;
             }
         }
-        let mut msgs: Vec<Message> = raw.iter().filter_map(Message::from_v2_json).collect();
-        msgs.sort_by(|a, b| a.id().cmp(b.id()));
-        Ok(msgs)
+        // Keep the server's order: it is delivery order, which differs from
+        // id order once prompts are queued/steered (a queued prompt gets its
+        // id when sent but lands after a later steer).
+        Ok(raw.iter().filter_map(Message::from_v2_json).collect())
     }
 
     pub async fn permissions(&self, session_id: &str) -> Result<Vec<model::PermissionRequest>> {
@@ -405,6 +406,227 @@ impl Api {
         Ok(())
     }
 
+    // ── M7: inbox, commands, skills, MCP, shells, VCS, worktrees ─────────
+
+    /// Pending prompts/compactions of a session (`GET …/inbox`), oldest first.
+    pub async fn inbox(&self, session_id: &str) -> Result<Vec<model::InboxItem>> {
+        let path = format!("/api/session/{}/inbox", id(session_id));
+        let v = self.send(self.req(Method::GET, &path)).await?;
+        Ok(array(&v["data"])?
+            .iter()
+            .filter_map(|i| model::InboxItem::from_json(None, i))
+            .collect())
+    }
+
+    /// Withdraw a pending item → 204 + `session.inbox.cancelled`.
+    pub async fn cancel_inbox(&self, session_id: &str, item_id: &str) -> Result<()> {
+        let path = format!("/api/session/{}/inbox/{}", id(session_id), id(item_id));
+        self.send(self.req(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    /// Re-target a pending item → 204 + `session.inbox.delivery.changed`.
+    pub async fn set_inbox_delivery(
+        &self,
+        session_id: &str,
+        item_id: &str,
+        delivery: model::Delivery,
+    ) -> Result<()> {
+        let path = format!("/api/session/{}/inbox/{}", id(session_id), id(item_id));
+        self.send(
+            self.req(Method::PATCH, &path)
+                .json(&json!({ "delivery": delivery.as_str() })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Summarize the context (`POST …/compact`); queued like a steer item.
+    pub async fn compact(&self, session_id: &str) -> Result<()> {
+        let path = format!("/api/session/{}/compact", id(session_id));
+        self.send(self.req(Method::POST, &path).json(&json!({})))
+            .await?;
+        Ok(())
+    }
+
+    /// Server-side slash commands for a folder (`GET /api/command`).
+    pub async fn commands(&self, directory: &Path) -> Result<Vec<model::CommandInfo>> {
+        let v = self.get_in("/api/command", directory).await?;
+        Ok(array(&v["data"])?
+            .iter()
+            .filter_map(model::CommandInfo::from_json)
+            .collect())
+    }
+
+    /// Run a command (`POST …/command {name, text}`); the expanded template
+    /// becomes the user message.
+    pub async fn run_command(
+        &self,
+        session_id: &str,
+        name: &str,
+        text: &str,
+        delivery: Option<model::Delivery>,
+    ) -> Result<()> {
+        let path = format!("/api/session/{}/command", id(session_id));
+        let mut body = json!({ "name": name, "text": text });
+        if let Some(d) = delivery {
+            body["delivery"] = d.as_str().into();
+        }
+        self.send(self.req(Method::POST, &path).json(&body)).await?;
+        Ok(())
+    }
+
+    pub async fn skills(&self, directory: &Path) -> Result<Vec<model::SkillInfo>> {
+        let v = self.get_in("/api/skill", directory).await?;
+        Ok(array(&v["data"])?
+            .iter()
+            .filter_map(model::SkillInfo::from_json)
+            .collect())
+    }
+
+    pub async fn mcp_servers(&self, directory: &Path) -> Result<Vec<model::McpServer>> {
+        let v = self.get_in("/api/mcp", directory).await?;
+        Ok(array(&v["data"])?
+            .iter()
+            .filter_map(model::McpServer::from_json)
+            .collect())
+    }
+
+    /// `POST /api/experimental/mcp/{server}/connect|disconnect`.
+    pub async fn mcp_set_connected(
+        &self,
+        directory: &Path,
+        server: &str,
+        connect: bool,
+    ) -> Result<()> {
+        let verb = if connect { "connect" } else { "disconnect" };
+        let path = format!("/api/experimental/mcp/{}/{verb}", id(server));
+        self.send(
+            self.req(Method::POST, &path)
+                .query(&[("location[directory]", directory)]),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Shell commands the server runs for a folder (`GET /api/shell`).
+    pub async fn shells(&self, directory: &Path) -> Result<Vec<model::ShellInfo>> {
+        let v = self.get_in("/api/shell", directory).await?;
+        Ok(array(&v["data"])?
+            .iter()
+            .filter_map(model::ShellInfo::from_json)
+            .collect())
+    }
+
+    /// The tail of a shell's output (`GET /api/shell/{id}/output`).
+    pub async fn shell_output(&self, directory: &Path, shell_id: &str) -> Result<String> {
+        let path = format!("/api/shell/{}/output", id(shell_id));
+        let v = self.get_in(&path, directory).await?;
+        Ok(v["data"]["output"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Kill a shell (`DELETE /api/shell/{id}`) → `shell.exited {status: killed}`.
+    pub async fn kill_shell(&self, directory: &Path, shell_id: &str) -> Result<()> {
+        let path = format!("/api/shell/{}", id(shell_id));
+        self.send(
+            self.req(Method::DELETE, &path)
+                .query(&[("location[directory]", directory)]),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Child (subagent) sessions of a session, newest first.
+    pub async fn children(&self, session_id: &str) -> Result<Vec<SessionInfo>> {
+        let v = self
+            .send(
+                self.req(Method::GET, "/api/session")
+                    .query(&[("parentID", session_id), ("limit", "100")]),
+            )
+            .await?;
+        Ok(array(&v["data"])?
+            .iter()
+            .filter_map(SessionInfo::from_json)
+            .collect())
+    }
+
+    pub async fn vcs(&self, directory: &Path) -> Result<model::VcsInfo> {
+        let v = self.get_in("/api/vcs", directory).await?;
+        Ok(model::VcsInfo::from_json(&v["data"]))
+    }
+
+    /// The project a folder belongs to (`GET /api/location` → `project.id`).
+    pub async fn project_id(&self, directory: &Path) -> Result<String> {
+        let v = self.get_in("/api/location", directory).await?;
+        v.pointer("/project/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{} has no project", directory.display()))
+    }
+
+    /// Worktree directories of a project (the main checkout included).
+    pub async fn worktrees(&self, project_id: &str) -> Result<Vec<PathBuf>> {
+        let v = self
+            .send(
+                self.req(Method::GET, "/api/worktree")
+                    .query(&[("projectID", project_id)]),
+            )
+            .await?;
+        Ok(array(&v)?
+            .iter()
+            .filter_map(|w| w["directory"].as_str().map(PathBuf::from))
+            .collect())
+    }
+
+    /// `POST /api/worktree {projectID, name}` → the new checkout's directory.
+    pub async fn create_worktree(&self, project_id: &str, name: &str) -> Result<PathBuf> {
+        let v = self
+            .send(
+                self.req(Method::POST, "/api/worktree")
+                    .json(&json!({ "projectID": project_id, "name": name })),
+            )
+            .await?;
+        v["directory"]
+            .as_str()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("unexpected worktree response: {v}"))
+    }
+
+    /// `DELETE /api/worktree`. Without `force`, a dirty worktree fails with
+    /// `forceRequired`.
+    pub async fn remove_worktree(
+        &self,
+        project_id: &str,
+        directory: &Path,
+        force: bool,
+    ) -> Result<()> {
+        self.send(
+            self.req(Method::DELETE, "/api/worktree")
+                .json(&json!({ "projectID": project_id, "directory": directory, "force": force })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Re-pin a session to another directory (e.g. a worktree).
+    pub async fn move_session(&self, session_id: &str, directory: &Path) -> Result<()> {
+        let path = format!("/api/session/{}/move", id(session_id));
+        self.send(
+            self.req(Method::POST, &path)
+                .json(&json!({ "directory": directory })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn get_in(&self, path: &str, directory: &Path) -> Result<Value> {
+        self.send(
+            self.req(Method::GET, path)
+                .query(&[("location[directory]", directory)]),
+        )
+        .await
+    }
+
     /// Pump `GET /api/event` (all locations) forever, forwarding decoded
     /// envelopes. Every (re)connect yields [`Event::Connected`] and every
     /// drop yields [`Event::Disconnected`], then reconnects with exponential
@@ -519,6 +741,11 @@ impl SseParser {
         }
         out
     }
+}
+
+fn array(v: &Value) -> Result<&Vec<Value>> {
+    v.as_array()
+        .ok_or_else(|| anyhow!("expected an array, got {}", v))
 }
 
 #[cfg(test)]
@@ -736,6 +963,7 @@ mod tests {
                 "general".into(),
                 Mention::from_byte_range(text, 9..17).unwrap(),
             )],
+            ..Default::default()
         };
         api.prompt("ses_a", &input).await.unwrap();
         server.join().unwrap();
