@@ -332,6 +332,9 @@ pub fn file_uri(path: &std::path::Path) -> String {
 pub enum Message {
     User(UserMessage),
     Assistant(AssistantMessage),
+    /// A non-chat transcript entry shown as a divider: a compaction or an
+    /// activated skill.
+    Marker(MarkerMessage),
 }
 
 impl Message {
@@ -339,8 +342,21 @@ impl Message {
         match self {
             Message::User(m) => &m.id,
             Message::Assistant(m) => &m.id,
+            Message::Marker(m) => &m.id,
         }
     }
+}
+
+/// `{type: "compaction", status, error?}` or `{type: "skill", name}` in the
+/// message projection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkerMessage {
+    pub id: String,
+    /// "compaction" or "skill".
+    pub kind: String,
+    /// "Context compacted", "Compaction failed: …", "Skill: greeter".
+    pub text: String,
+    pub failed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -607,6 +623,37 @@ impl Message {
                     error: error_text(v.get("error")),
                 }))
             }
+            "compaction" => {
+                let status = str_at(v, "/status").unwrap_or_default();
+                let failed = status == "failed";
+                let text = if failed {
+                    format!(
+                        "Compaction failed: {}",
+                        error_text(v.get("error")).unwrap_or_else(|| "unknown error".into())
+                    )
+                } else if status == "completed" {
+                    "Context compacted".to_string()
+                } else {
+                    "Compacting context…".to_string()
+                };
+                Some(Message::Marker(MarkerMessage {
+                    id,
+                    kind: "compaction".into(),
+                    text,
+                    failed,
+                }))
+            }
+            "skill" => Some(Message::Marker(MarkerMessage {
+                id,
+                kind: "skill".into(),
+                text: format!(
+                    "Skill: {}",
+                    str_at(v, "/name")
+                        .or_else(|| str_at(v, "/skill"))
+                        .unwrap_or_default()
+                ),
+                failed: false,
+            })),
             _ => None,
         }
     }
@@ -961,5 +1008,32 @@ mod m7_tests {
             VcsInfo::from_json(&json!({"branch":{}})),
             VcsInfo::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn compaction_and_skill_entries_become_markers() {
+        // Shapes from the 2.2.6 projection (docs/protocol-notes.md, M7).
+        let failed = Message::from_v2_json(&json!({"type":"compaction","id":"msg_c","status":"failed",
+            "reason":"manual","error":{"type":"compaction.failed","message":"Compaction summary did not match the required template"}}))
+        .unwrap();
+        assert!(
+            matches!(&failed, Message::Marker(m) if m.failed && m.text.contains("did not match"))
+        );
+        let ok =
+            Message::from_v2_json(&json!({"type":"compaction","id":"msg_d","status":"completed"}))
+                .unwrap();
+        assert!(matches!(&ok, Message::Marker(m) if !m.failed && m.text == "Context compacted"));
+        let skill = Message::from_v2_json(
+            &json!({"type":"skill","id":"msg_s","skill":"greeter","name":"greeter","text":"x"}),
+        )
+        .unwrap();
+        assert!(matches!(&skill, Message::Marker(m) if m.text == "Skill: greeter"));
+        assert!(Message::from_v2_json(&json!({"type":"idle","id":"msg_i"})).is_none());
     }
 }

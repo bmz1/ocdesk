@@ -1,6 +1,6 @@
-//! `@` mentions in the composer: finding the query under the caret and
-//! turning the composer's tokens into prompt attachments. Pure functions, so
-//! they're testable without a window.
+//! `@` mentions and the `/` menu in the composer: finding the query under
+//! the caret and turning the composer's tokens into prompt attachments. Pure
+//! functions, so they're testable without a window.
 
 use std::ops::Range;
 use std::path::Path;
@@ -11,6 +11,22 @@ use crate::api::model::{Mention, PromptInput};
 /// `agent:<agent id>`.
 pub const FILE_PREFIX: &str = "file:";
 pub const AGENT_PREFIX: &str = "agent:";
+pub const SKILL_PREFIX: &str = "skill:";
+
+/// The `/query` being typed: only as the first word of the prompt, with the
+/// caret still inside it.
+pub fn slash_query(text: &str, caret: usize) -> Option<&str> {
+    let before = text.get(..caret)?;
+    let query = before.strip_prefix('/')?;
+    (!query.chars().any(char::is_whitespace)).then_some(query)
+}
+
+/// `/name rest…` → (`name`, `rest`), for running a server command.
+pub fn parse_command(text: &str) -> Option<(&str, &str)> {
+    let body = text.trim_start().strip_prefix('/')?;
+    let (name, rest) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+    (!name.is_empty()).then(|| (name, rest.trim()))
+}
 
 /// The `@query` the caret is in, as (byte offset of `@`, query). A mention
 /// starts at the beginning of the text or after whitespace, runs up to the
@@ -58,6 +74,8 @@ pub fn build_prompt<'a>(
             input.files.push((folder.join(rel), mention));
         } else if let Some(agent) = id.strip_prefix(AGENT_PREFIX) {
             input.agents.push((agent.to_string(), mention));
+        } else if let Some(skill) = id.strip_prefix(SKILL_PREFIX) {
+            input.skills.push((skill.to_string(), mention));
         }
     }
     input
@@ -122,6 +140,35 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slash_only_as_first_word() {
+        assert_eq!(slash_query("/", 1), Some(""));
+        assert_eq!(slash_query("/com", 4), Some("com"));
+        assert_eq!(slash_query("/compact now", 12), None, "past the first word");
+        assert_eq!(slash_query("say /x", 6), None);
+        assert_eq!(slash_query(" /x", 3), None);
+    }
+
+    #[test]
+    fn parses_commands() {
+        assert_eq!(parse_command("/review"), Some(("review", "")));
+        assert_eq!(
+            parse_command("/review  branch main "),
+            Some(("review", "branch main"))
+        );
+        assert_eq!(parse_command("/"), None);
+        assert_eq!(parse_command("no slash"), None);
+    }
+
+    #[test]
+    fn skill_tokens_become_skill_attachments() {
+        let text = "/greeter hello";
+        let input = build_prompt(text, [(0..8, "skill:greeter")], Path::new("/repo"));
+        assert_eq!(input.skills.len(), 1);
+        assert_eq!(input.skills[0].0, "greeter");
+        assert_eq!(input.skills[0].1.end, 8);
+    }
 
     #[test]
     fn finds_query_at_caret() {

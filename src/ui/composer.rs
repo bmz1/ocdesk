@@ -29,11 +29,12 @@ use gpui_kit::*;
 use crate::api::model::{Delivery, FsEntry, InboxItem, Message, ModelRef};
 use crate::controller::Controller;
 use crate::store::{Connection, Store};
-use crate::ui::mention::{self, AGENT_PREFIX, FILE_PREFIX, History};
+use crate::ui::mention::{self, AGENT_PREFIX, FILE_PREFIX, History, SKILL_PREFIX};
 
 /// Wait this long after the last keystroke before searching files.
 const FIND_DEBOUNCE: Duration = Duration::from_millis(120);
 const MAX_ITEMS: usize = 8;
+const SLASH_MAX_ITEMS: usize = 12;
 /// A second Esc within this window stops the running turn.
 const ESC_WINDOW: Duration = Duration::from_millis(1200);
 const PLACEHOLDER_IDLE: &str = "Ask opencode anything… @ to mention files, / for commands";
@@ -42,19 +43,47 @@ const PLACEHOLDER_BUSY: &str = "Steer the running turn… (Ctrl+Enter queues it 
 #[derive(Clone, Debug, PartialEq)]
 enum MentionItem {
     File(FsEntry),
-    Agent { id: String, name: String },
+    Agent {
+        id: String,
+        name: String,
+    },
+    // `/` menu entries.
+    /// A client action (`compact`).
+    Action {
+        id: &'static str,
+        detail: &'static str,
+    },
+    Command {
+        name: String,
+        detail: String,
+    },
+    Skill {
+        id: String,
+        name: String,
+        detail: String,
+    },
+    Mcp {
+        name: String,
+        status: String,
+        connected: bool,
+    },
 }
 
 impl MentionItem {
-    fn token(&self) -> InlineToken {
-        match self {
+    /// The inline token a pick becomes, for items that attach something.
+    fn token(&self) -> Option<InlineToken> {
+        Some(match self {
             MentionItem::File(f) => {
                 InlineToken::new(format!("{FILE_PREFIX}{}", f.path), format!("@{}", f.path))
             }
             MentionItem::Agent { id, .. } => {
                 InlineToken::new(format!("{AGENT_PREFIX}{id}"), format!("@{id}"))
             }
-        }
+            MentionItem::Skill { id, name, .. } => {
+                InlineToken::new(format!("{SKILL_PREFIX}{id}"), format!("/{name}"))
+            }
+            _ => return None,
+        })
     }
 }
 
@@ -63,6 +92,8 @@ struct MentionPopup {
     /// Byte offset of the `@` in the text.
     at: usize,
     query: String,
+    /// `/` menu entries (empty for `@`).
+    slash: Vec<MentionItem>,
     agents: Vec<MentionItem>,
     files: Vec<MentionItem>,
     selected: usize,
@@ -72,7 +103,16 @@ struct MentionPopup {
 
 impl MentionPopup {
     fn items(&self) -> impl Iterator<Item = &MentionItem> {
-        self.agents.iter().chain(&self.files).take(MAX_ITEMS)
+        let max = if self.slash.is_empty() {
+            MAX_ITEMS
+        } else {
+            SLASH_MAX_ITEMS
+        };
+        self.slash
+            .iter()
+            .chain(&self.agents)
+            .chain(&self.files)
+            .take(max)
     }
 
     fn len(&self) -> usize {
@@ -206,6 +246,30 @@ impl Composer {
         let Some(folder) = self.store.read(cx).target_folder() else {
             return;
         };
+        // `/name args` runs a server command; `/compact` compacts.
+        let text = content.text().to_string();
+        if let Some((name, rest)) = mention::parse_command(&text) {
+            let store = self.store.read(cx);
+            let known = store
+                .tooling
+                .get(&folder)
+                .is_some_and(|t| t.commands.iter().any(|c| c.name == name));
+            let (name, rest) = (name.to_string(), rest.to_string());
+            if known || (name == "compact" && rest.is_empty()) {
+                self.sent.push(text.trim().to_string());
+                self.history.reset();
+                self.close_mention(cx);
+                self.set_text("", window, cx);
+                self.controller.update(cx, |c, cx| {
+                    if name == "compact" && !known {
+                        c.compact(cx)
+                    } else {
+                        c.run_command(name, rest, delivery, cx)
+                    }
+                });
+                return;
+            }
+        }
         let mut input = mention::build_prompt(
             content.text(),
             content
@@ -366,6 +430,12 @@ impl Composer {
             let tokens: Vec<_> = i.tokens().iter().map(|t| t.range()).collect();
             (i.value().to_string(), i.cursor(), tokens)
         };
+        if tokens.is_empty()
+            && let Some(query) = mention::slash_query(&text, caret)
+        {
+            self.open_slash(query.to_string(), cx);
+            return;
+        }
         let Some((at, query)) = mention::active_query(&text, caret, &tokens) else {
             self.close_mention(cx);
             return;
@@ -412,6 +482,7 @@ impl Composer {
         self.mention = Some(MentionPopup {
             at,
             query: query.to_string(),
+            slash: Vec::new(),
             agents,
             files,
             selected: 0,
@@ -467,12 +538,107 @@ impl Composer {
             return;
         };
         let caret = self.input.read(cx).cursor();
-        self.input.update(cx, |i, cx| {
-            if let Err(e) = i.replace_range_with_token(m.at..caret, item.token(), window, cx) {
-                tracing::warn!("could not insert mention: {e:?}");
-                return;
+        let range = m.at..caret;
+        if let Some(token) = item.token() {
+            self.input.update(cx, |i, cx| {
+                if let Err(e) = i.replace_range_with_token(range, token, window, cx) {
+                    tracing::warn!("could not insert mention: {e:?}");
+                    return;
+                }
+                i.insert(" ", window, cx);
+            });
+            cx.notify();
+            return;
+        }
+        // `/` entries that act instead of attaching.
+        let rest = self.input.read(cx).value()[caret..].to_string();
+        match item {
+            MentionItem::Command { name, .. } => {
+                // Arguments follow; Enter runs it (see `submit`).
+                self.set_text(&format!("/{name} {}", rest.trim_start()), window, cx);
             }
-            i.insert(" ", window, cx);
+            MentionItem::Action { id: "compact", .. } => {
+                self.set_text(rest.trim_start(), window, cx);
+                self.controller.update(cx, |c, cx| c.compact(cx));
+            }
+            MentionItem::Mcp {
+                name, connected, ..
+            } => {
+                self.set_text(rest.trim_start(), window, cx);
+                self.controller
+                    .update(cx, |c, cx| c.set_mcp_connected(name, !connected, cx));
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Whether the box is in `/` menu mode (first word starts with `/`).
+    fn slash_mode(&self, cx: &App) -> bool {
+        let i = self.input.read(cx);
+        mention::slash_query(&i.value(), i.cursor()).is_some()
+    }
+
+    /// The `/` menu: client actions, the folder's server commands, skills
+    /// and MCP servers (picking one toggles its connection).
+    fn open_slash(&mut self, query: String, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let tooling = store
+            .target_folder()
+            .and_then(|f| store.tooling.get(&f).cloned())
+            .unwrap_or_default();
+        let has_session = store.selected.is_some();
+        let q = query.as_str();
+        let hit = |s: &str| mention::fuzzy_match(s, q);
+        let mut items = Vec::new();
+        if has_session && hit("compact") {
+            items.push(MentionItem::Action {
+                id: "compact",
+                detail: "Summarize the conversation to free up context",
+            });
+        }
+        items.extend(tooling.commands.iter().filter(|c| hit(&c.name)).map(|c| {
+            MentionItem::Command {
+                name: c.name.clone(),
+                detail: c.description.clone(),
+            }
+        }));
+        items.extend(
+            tooling
+                .skills
+                .iter()
+                .filter(|sk| hit(&sk.id) || hit(&sk.name))
+                .map(|sk| MentionItem::Skill {
+                    id: sk.id.clone(),
+                    name: sk.id.clone(),
+                    detail: sk.description.clone(),
+                }),
+        );
+        items.extend(
+            tooling
+                .mcp
+                .iter()
+                .filter(|m| hit(&m.name) || hit("mcp"))
+                .map(|m| MentionItem::Mcp {
+                    name: m.name.clone(),
+                    status: m.error.clone().unwrap_or_else(|| m.status.clone()),
+                    connected: m.connected(),
+                }),
+        );
+        self.mention_seq += 1;
+        let selected = self
+            .mention
+            .as_ref()
+            .filter(|m| !m.slash.is_empty() && m.query == query)
+            .map_or(0, |m| m.selected);
+        self.mention = Some(MentionPopup {
+            at: 0,
+            query,
+            slash: items,
+            agents: Vec::new(),
+            files: Vec::new(),
+            selected,
+            seq: self.mention_seq,
         });
         cx.notify();
     }
@@ -545,17 +711,43 @@ impl Composer {
             .items()
             .enumerate()
             .map(|(ix, item)| {
-                let (icon, label, detail) = match item {
+                use crate::ui::icons;
+                let (icon, label, detail): (Icon, String, String) = match item {
                     MentionItem::File(f) => {
                         let (dir, name) = match f.path.rsplit_once('/') {
                             Some((d, n)) => (d.to_string(), n.to_string()),
                             None => (String::new(), f.path.clone()),
                         };
-                        (IconName::File, name, dir)
+                        (Icon::new(IconName::File), name, dir)
                     }
-                    MentionItem::Agent { id, name } => {
-                        (IconName::Bot, id.clone(), format!("{name} agent"))
+                    MentionItem::Agent { id, name } => (
+                        Icon::new(IconName::Bot),
+                        id.clone(),
+                        format!("{name} agent"),
+                    ),
+                    MentionItem::Action { id, detail } => {
+                        (icons::layers(), format!("/{id}"), detail.to_string())
                     }
+                    MentionItem::Command { name, detail } => {
+                        (icons::slash(), format!("/{name}"), detail.clone())
+                    }
+                    MentionItem::Skill { name, detail, .. } => (
+                        icons::sparkles(),
+                        format!("/{name}"),
+                        format!("skill · {detail}"),
+                    ),
+                    MentionItem::Mcp {
+                        name,
+                        status,
+                        connected,
+                    } => (
+                        icons::plug(),
+                        name.clone(),
+                        format!(
+                            "MCP · {status} · {}",
+                            if *connected { "disconnect" } else { "connect" }
+                        ),
+                    ),
                 };
                 let selected = ix == m.selected;
                 h_flex()
@@ -567,7 +759,7 @@ impl Composer {
                     .cursor_pointer()
                     .when(selected, |d| d.bg(theme.accent))
                     .hover(|d| d.bg(theme.accent))
-                    .child(Icon::new(icon).small().text_color(theme.muted_foreground))
+                    .child(icon.small().text_color(theme.muted_foreground))
                     .child(div().text_sm().child(label))
                     .child(
                         div()
@@ -585,6 +777,11 @@ impl Composer {
             })
             .collect();
         let empty = rows.is_empty();
+        let empty_text = if m.at == 0 && m.agents.is_empty() && self.slash_mode(cx) {
+            "No matching commands"
+        } else {
+            "No matching files"
+        };
         let popup = v_flex()
             .absolute()
             .bottom_full()
@@ -605,7 +802,7 @@ impl Composer {
                         .py_1()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child("No matching files"),
+                        .child(empty_text),
                 )
             })
             .children(rows);

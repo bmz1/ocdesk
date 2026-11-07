@@ -77,7 +77,7 @@ impl Conversation {
         };
         match &mut self.messages[index] {
             Message::Assistant(a) => (index, inserted, a),
-            Message::User(_) => unreachable!("message id {id} is a user message"),
+            _ => unreachable!("message id {id} is not an assistant message"),
         }
     }
 }
@@ -188,6 +188,9 @@ pub struct Store {
     pub worktrees: HashMap<PathBuf, Vec<PathBuf>>,
     /// Per folder: `/` menu sources.
     pub tooling: HashMap<PathBuf, Tooling>,
+    /// Sessions whose transcript gained entries the stream doesn't describe
+    /// (compactions, skills): re-fetched when their turn ends.
+    pub needs_reload: HashSet<String>,
     pub connection: Option<Connection>,
     pub opencode_version: Option<String>,
     /// A transient, app-level problem shown as a dismissible banner.
@@ -507,10 +510,17 @@ impl Store {
                         };
                         M7::Continue(out)
                     }
-                    // Missed the enqueue (or a compaction): the REST
-                    // projection fills the transcript on the next reconcile.
-                    _ => M7::Handled(out),
+                    // A compaction (or an enqueue we missed): the REST
+                    // projection fills the transcript when the turn ends.
+                    _ => {
+                        self.needs_reload.insert(sid);
+                        M7::Handled(out)
+                    }
                 }
+            }
+            Event::SkillActivated { session_id } => {
+                self.needs_reload.insert(session_id.clone());
+                M7::Handled(vec![])
             }
             Event::ShellCreated(info) => {
                 self.shells.insert(info.id.clone(), info.clone());
@@ -1494,6 +1504,7 @@ mod tests {
                 })
                 .chain(a.error.clone())
                 .collect(),
+            Message::Marker(m) => vec![m.text.clone()],
         }
     }
 

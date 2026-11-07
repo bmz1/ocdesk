@@ -113,6 +113,10 @@ pub enum Event {
     WorktreesChanged {
         project_id: String,
     },
+    /// `session.skill.activated`: a skill entry joins the transcript.
+    SkillActivated {
+        session_id: String,
+    },
     /// `command.updated`, `skill.updated`, `mcp.status.changed`: re-read
     /// the folder's `/` menu sources.
     ToolingChanged,
@@ -340,6 +344,7 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
             project_id: str_at(d, "/projectID")?,
         },
         "command.updated" | "skill.updated" | "mcp.status.changed" => Event::ToolingChanged,
+        "session.skill.activated" => Event::SkillActivated { session_id: sid()? },
         "session.step.started" => Event::StepStarted {
             session_id: sid()?,
             message_id: mid()?,
