@@ -446,6 +446,7 @@ impl Controller {
         if let Some(id) = selected {
             pending_sessions.insert(id.clone());
             self.refresh_inbox(id.clone(), cx);
+            self.refresh_tasks(id.clone(), cx);
             self.load_messages(id.clone(), cx);
             if self.store.read(cx).diffs.contains_key(&id) {
                 self.refresh_diff(id, cx);
@@ -597,6 +598,78 @@ impl Controller {
                         s.set_worktrees(folder.clone(), pid, wts, cx);
                     }
                 });
+            },
+        );
+    }
+
+    // ── background tasks: subagents and shells ──────────────────────────
+
+    /// Re-read a session's subagent sessions and its folder's shells.
+    pub fn refresh_tasks(&mut self, sid: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else { return };
+        let dir = self
+            .store
+            .read(cx)
+            .session(&sid)
+            .map(|s| s.directory.clone());
+        let target = sid.clone();
+        self.run(
+            cx,
+            async move {
+                let kids = api.children(&sid).await?;
+                let shells = match dir {
+                    Some(d) => api.shells(&d).await.unwrap_or_default(),
+                    None => vec![],
+                };
+                Ok((kids, shells))
+            },
+            move |this, res, cx| match res {
+                Ok((kids, shells)) => this.store.update(cx, |s, cx| {
+                    s.set_children(&target, kids, cx);
+                    s.set_shells(shells, cx);
+                }),
+                Err(e) => tracing::warn!("could not read tasks of {target}: {e:#}"),
+            },
+        );
+    }
+
+    /// Load a subagent's transcript (it isn't in the sidebar, so nothing
+    /// else would); live events keep it current afterwards.
+    pub fn load_child(&mut self, child: String, cx: &mut Context<Self>) {
+        let loaded = self
+            .store
+            .read(cx)
+            .conversations
+            .get(&child)
+            .is_some_and(|c| c.loaded);
+        if !loaded {
+            self.load_messages(child, cx);
+        }
+    }
+
+    /// The tail of a shell's output. `None` when opencode isn't running.
+    pub fn shell_output(
+        &self,
+        dir: PathBuf,
+        shell_id: String,
+    ) -> Option<oneshot::Receiver<Result<String>>> {
+        let api = self.api.clone()?;
+        let (tx, rx) = oneshot::channel();
+        self.rt.spawn(async move {
+            let _ = tx.send(api.shell_output(&dir, &shell_id).await);
+        });
+        Some(rx)
+    }
+
+    pub fn kill_shell(&mut self, dir: PathBuf, shell_id: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        self.run(
+            cx,
+            async move { api.kill_shell(&dir, &shell_id).await },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    this.notice(format!("Could not stop the command: {e:#}"), cx);
+                }
             },
         );
     }
@@ -1178,6 +1251,7 @@ impl Controller {
             self.refresh_permissions(id.clone(), cx);
             self.refresh_forms(id.clone(), cx);
             self.refresh_inbox(id.clone(), cx);
+            self.refresh_tasks(id.clone(), cx);
             self.load_messages(id, cx);
         }
     }

@@ -11,6 +11,7 @@ pub mod message;
 pub mod permission;
 pub mod prose;
 pub mod sidebar;
+pub mod tasks;
 pub mod tool_card;
 
 use std::path::PathBuf;

@@ -248,6 +248,9 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &keys::ToggleChanges, _, cx| {
                 this.conversation.update(cx, |c, cx| c.toggle_changes(cx));
             }))
+            .on_action(cx.listener(|this, _: &keys::ToggleTasks, _, cx| {
+                this.conversation.update(cx, |c, cx| c.toggle_tasks(cx));
+            }))
             .on_action(|_: &keys::ShowShortcuts, window, cx| keys::show_shortcuts(window, cx))
             .on_action(|_: &keys::Quit, _, cx| cx.quit())
             .on_drag_move(

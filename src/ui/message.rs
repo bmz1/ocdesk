@@ -21,6 +21,7 @@ pub fn render_message(
     cache: &Entity<ProseCache>,
     expanded: &HashSet<String>,
     toggle: ToggleTool,
+    open_task: &super::tasks::OpenTask,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -100,6 +101,7 @@ pub fn render_message(
                 &a.id,
                 expanded,
                 toggle.clone(),
+                open_task,
                 cx,
             )),
         };
