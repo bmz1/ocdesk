@@ -3,24 +3,30 @@
 State of ocdesk for whoever picks it up next. Read this first, then
 [README.md](README.md) and [docs/protocol-notes.md](docs/protocol-notes.md).
 
-_Last updated: 2026-11-07, M3 built on M2 (`m3-tools-permissions-diffs`)._
+_Last updated: 2026-11-07, M4 pushed on `m4-models-agents-mentions`._
 
 ## Where things are
 
 - **Done:** M0 (spike), M1 (folders + sessions, streaming conversation,
-  composer, reconnect, crash recovery) and M2 (incremental streaming
+  composer, reconnect, crash recovery), M2 (incremental streaming
   markdown, code-block copy buttons, links, selectable text, collapsible
-  reasoning, frame-time probe, offline demo mode), plus M3 (expandable tool
-  cards, session-scoped permission prompts/replies and latest-turn file diffs),
-  targeting **opencode 2.2.6 only**. Dark theme by default.
+  reasoning, frame-time probe, offline demo mode), M3 (expandable tool
+  cards, session-scoped permission prompts/replies and latest-turn file
+  diffs) and M4 (question forms, Codex-style tool cards, model/agent/variant
+  pickers, `@` mentions of files and subagents, prompt history), targeting
+  **opencode 2.2.6 only**. Dark theme by default.
 - **Workflow the owner wants:** branch from `master` → feature PR → owner
-  reviews → merge to `master`. Don't push to `master` directly. PR #1 (M1)
-  is merged. M2 is on `claude/elegant-mccarthy-dymj86` (latest picked up:
-  `bb26e4e`); M3 branches from that commit on `m3-tools-permissions-diffs`.
-  No M3 PR was opened; the owner opens/asks for PRs.
+  reviews → merge to `master`. Don't push to `master` directly; the owner
+  opens/asks for PRs. M1–M3 are merged (PRs #1–#3).
+- **M4** landed in two parts: question forms + Codex-style tool cards went
+  directly to `master` (`75fe7d6`); pickers, `@` mentions and history are
+  pushed on `m4-models-agents-mentions` (`fd0ecbb`, branched from
+  `75fe7d6`). **No PR opened yet**; the owner asks for it
+  (github.com/bmz1/opencode-gui/pull/new/m4-models-agents-mentions).
 - The old `claude/friendly-lamport-ne3gxc` remote branch could not be deleted
   from the agent sandbox (git proxy 403); the owner was asked to delete it.
-- **Next milestone: M4** (see *Next steps*).
+- **Next:** hand-test M4's composer UI (see *M4 notes*), then **M5**
+  (keyboard, persistence of window/sidebar and model/agent draft, error states).
 
 ## Decisions already made (don't re-litigate)
 
@@ -172,13 +178,33 @@ Data flow: view → `Controller` intent → `Api` on Tokio → result back via
 - Changes displays the latest turn's per-file patches (`context=3`), counts,
   server truncation and copy. Refresh during a turn; an opened view refreshes
   when the turn ends. It is not a full-session/repository diff.
-- `form.*` questions remain unimplemented (separate from permissions).
+- `form.*` questions are implemented in M4 (`ui/form_view.rs`), separate from permissions.
 - The mock write tool now sends `path`, as required by 2.2.6, rather than the
   old `filePath` argument. `dev/m3-protocol-test.py` checks real once/always/
   reject permission flow, restoring pending requests and an edit diff in a
   temporary repository with isolated config/data.
 
-**M4:** model picker (`/api/model`, `/api/model/default`, `POST /api/session/{id}/model`),
-agents (`/api/agent`), `@` mentions (`/api/fs/find`), prompt `files`.
+**M4 notes**
+- Verified on Fedora/Wayland (real GPU, not Xvfb; no xdotool here):
+  `cargo fmt --check`, `clippy -D warnings`, `cargo test` **30 passed**
+  (incl. an HTTP contract test for model/agent/find/switch/prompt-attachment
+  wire shapes, mention/history unit tests, store precedence test). Real
+  opencode 2.2.6: `types=chat`, `fs/find`, switch endpoints/events and
+  `files`+`agents` attachments with UTF-16 mention offsets (scratch probe);
+  app probe prompt → `verify: store matches REST`.
+- **Not yet driven by hand:** the `@` popup keyboard flow, picker menus and
+  history recall in the native window. Do that first (and screenshot) on a
+  box with Xvfb+xdotool or by hand.
+- Key interception: GPUI dispatches key *bindings* before key listeners, so
+  the composer claims Up/Down/Enter/Tab/Escape with `capture_action` on the
+  textarea's actions (`MoveUp`, `Enter`, `IndentInline`, …), not
+  `on_key_down`.
+- Mentions are gpui-base inline tokens (`replace_range_with_token`), id
+  `file:<rel>` / `agent:<id>`; `ui/mention.rs::build_prompt` turns
+  `content().tokens()` into attachments.
+- Ideas left: directory mentions (server behavior for a dir `file://` URI
+  is untested), restoring tokens on history recall, showing attached files
+  as chips on sent user messages (the projection has `files[]`), `skills`
+  attachments, persisting the draft model/agent in settings (M5).
 **M5/M6:** see README roadmap.
 

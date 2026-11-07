@@ -14,8 +14,8 @@ use gpui_kit::{Context, EventEmitter};
 
 use crate::api::events::Outcome;
 use crate::api::model::{
-    AssistantMessage, Block, BlockKind, FileDiff, FormRequest, Message, PermissionRequest,
-    SessionInfo, ToolCall, ToolStatus, UserMessage,
+    AgentInfo, AssistantMessage, Block, BlockKind, FileDiff, FormRequest, Message, ModelInfo,
+    ModelRef, PermissionRequest, SessionInfo, ToolCall, ToolStatus, UserMessage,
 };
 use crate::api::{Envelope, Event};
 
@@ -96,6 +96,33 @@ pub enum StoreEvent {
         session_id: String,
     },
     ConnectionChanged,
+    /// A folder's models/agents, or the composer's model/agent choice, changed.
+    ChoicesChanged,
+}
+
+/// What a folder offers: its models, default model and agents.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Catalog {
+    pub models: Vec<ModelInfo>,
+    pub default_model: Option<ModelRef>,
+    pub agents: Vec<AgentInfo>,
+}
+
+impl Catalog {
+    pub fn model(&self, r: &ModelRef) -> Option<&ModelInfo> {
+        self.models
+            .iter()
+            .find(|m| m.provider_id == r.provider_id && m.id == r.id)
+    }
+
+    /// The agent a session without an explicit choice runs: `build` if it
+    /// exists, else the first primary agent.
+    pub fn default_agent(&self) -> Option<&AgentInfo> {
+        let primary = || self.agents.iter().filter(|a| a.is_primary());
+        primary()
+            .find(|a| a.id == "build")
+            .or_else(|| primary().next())
+    }
 }
 
 #[derive(Default)]
@@ -133,6 +160,12 @@ pub struct Store {
     pub diffs: HashMap<String, Vec<FileDiff>>,
     pub diff_loading: HashSet<String>,
     pub diff_errors: HashMap<String, String>,
+    /// Per folder (location directory).
+    pub catalogs: HashMap<PathBuf, Catalog>,
+    /// The model/agent for the next new session. Updated by every pick, so
+    /// the last choice sticks, like opencode's own TUI.
+    pub draft_model: Option<ModelRef>,
+    pub draft_agent: Option<String>,
 }
 
 impl EventEmitter<StoreEvent> for Store {}
@@ -276,6 +309,56 @@ impl Store {
             .get(form_id)
             .cloned()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+    }
+
+    pub fn set_catalog(&mut self, folder: PathBuf, catalog: Catalog, cx: &mut Context<Self>) {
+        if self.catalogs.get(&folder) != Some(&catalog) {
+            self.catalogs.insert(folder, catalog);
+            cx.emit(StoreEvent::ChoicesChanged);
+            cx.notify();
+        }
+    }
+
+    /// The catalog of the folder the composer targets.
+    pub fn target_catalog(&self) -> Option<&Catalog> {
+        self.catalogs.get(&self.target_folder()?)
+    }
+
+    /// The model the next prompt runs with: the selected session's, else the
+    /// draft pick, else the folder default.
+    pub fn effective_model(&self) -> Option<ModelRef> {
+        let session = self.selected.as_ref().and_then(|id| self.session(id));
+        match session {
+            Some(s) => s.model.clone(),
+            None => self.draft_model.clone(),
+        }
+        .or_else(|| self.target_catalog()?.default_model.clone())
+    }
+
+    /// The agent the next prompt runs with (same precedence as the model).
+    pub fn effective_agent(&self) -> Option<String> {
+        let session = self.selected.as_ref().and_then(|id| self.session(id));
+        match session {
+            Some(s) => s.agent.clone(),
+            None => self.draft_agent.clone(),
+        }
+        .or_else(|| Some(self.target_catalog()?.default_agent()?.id.clone()))
+    }
+
+    pub fn set_draft_choice(
+        &mut self,
+        model: Option<ModelRef>,
+        agent: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if model.is_some() {
+            self.draft_model = model;
+        }
+        if agent.is_some() {
+            self.draft_agent = agent;
+        }
+        cx.emit(StoreEvent::ChoicesChanged);
+        cx.notify();
     }
 
     pub fn session(&self, id: &str) -> Option<&SessionInfo> {
@@ -444,14 +527,16 @@ impl Store {
         match &env.event {
             Event::SessionUpserted(s) => {
                 if s.parent_id.is_none() {
-                    let title = self
-                        .session(&s.id)
-                        .map(|old| old.title.clone())
-                        .unwrap_or_default();
+                    let old = self.session(&s.id).cloned();
                     self.sessions.retain(|x| x.id != s.id);
                     let mut s = s.clone();
-                    if s.title.is_empty() {
-                        s.title = title;
+                    // `session.created` carries neither title nor choices.
+                    if let Some(old) = old {
+                        if s.title.is_empty() {
+                            s.title = old.title;
+                        }
+                        s.model = s.model.or(old.model);
+                        s.agent = s.agent.or(old.agent);
                     }
                     let pos = self
                         .sessions
@@ -490,6 +575,20 @@ impl Store {
                 if self.selected.as_ref() == Some(session_id) {
                     self.selected = None;
                     out.push(StoreEvent::SelectionChanged);
+                }
+                return out;
+            }
+            Event::ModelSelected { session_id, model } => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == session_id) {
+                    s.model = Some(model.clone());
+                    out.push(StoreEvent::ChoicesChanged);
+                }
+                return out;
+            }
+            Event::AgentSelected { session_id, agent } => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == session_id) {
+                    s.agent = Some(agent.clone());
+                    out.push(StoreEvent::ChoicesChanged);
                 }
                 return out;
             }
@@ -1153,9 +1252,82 @@ mod tests {
             created: 0,
             updated: 0,
             parent_id: None,
+            model: None,
+            agent: None,
         });
         assert_eq!(s.target_folder(), Some(PathBuf::from("/a")));
         s.selected = Some("ses_x".into());
         assert_eq!(s.target_folder(), Some(PathBuf::from("/b")));
+    }
+
+    #[test]
+    fn model_and_agent_choices_follow_events_and_precedence() {
+        use crate::api::model::{AgentInfo, AgentMode};
+        let mref = |id: &str| ModelRef {
+            provider_id: "p".into(),
+            id: id.into(),
+            variant: None,
+        };
+        let mut s = Store {
+            folders: vec!["/a".into()],
+            ..Default::default()
+        };
+        s.catalogs.insert(
+            "/a".into(),
+            Catalog {
+                models: vec![],
+                default_model: Some(mref("default")),
+                agents: vec![
+                    AgentInfo {
+                        id: "plan".into(),
+                        name: "Plan".into(),
+                        mode: AgentMode::Primary,
+                        hidden: false,
+                    },
+                    AgentInfo {
+                        id: "build".into(),
+                        name: "Build".into(),
+                        mode: AgentMode::Primary,
+                        hidden: false,
+                    },
+                ],
+            },
+        );
+        // Nothing chosen: folder defaults, `build` preferred.
+        assert_eq!(s.effective_model(), Some(mref("default")));
+        assert_eq!(s.effective_agent().as_deref(), Some("build"));
+        // A draft pick applies to new sessions.
+        s.draft_model = Some(mref("draft"));
+        assert_eq!(s.effective_model(), Some(mref("draft")));
+
+        let session = SessionInfo {
+            id: "ses_x".into(),
+            title: "t".into(),
+            directory: "/a".into(),
+            created: 0,
+            updated: 0,
+            parent_id: None,
+            model: None,
+            agent: None,
+        };
+        s.apply_inner(Envelope::bare(Event::SessionUpserted(session.clone())));
+        s.selected = Some("ses_x".into());
+        // A session without its own model shows the folder default, not the draft.
+        assert_eq!(s.effective_model(), Some(mref("default")));
+        let ev = s.apply_inner(Envelope::bare(Event::ModelSelected {
+            session_id: "ses_x".into(),
+            model: mref("chosen"),
+        }));
+        assert_eq!(ev, vec![StoreEvent::ChoicesChanged]);
+        s.apply_inner(Envelope::bare(Event::AgentSelected {
+            session_id: "ses_x".into(),
+            agent: "plan".into(),
+        }));
+        assert_eq!(s.effective_model(), Some(mref("chosen")));
+        assert_eq!(s.effective_agent().as_deref(), Some("plan"));
+        // `session.created` replays carry no choices; keep the known ones.
+        s.apply_inner(Envelope::bare(Event::SessionUpserted(session)));
+        assert_eq!(s.effective_model(), Some(mref("chosen")));
+        assert_eq!(s.session("ses_x").unwrap().title, "t");
     }
 }

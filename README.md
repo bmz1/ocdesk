@@ -104,6 +104,14 @@ save rules), or **Reject**. The exact rules being saved are shown beside the
 actions. Failed replies stay visible and retryable. Reconnecting and selecting a
 session re-fetch pending requests; ocdesk never replies automatically.
 
+**Composer.** Type `@` to search the folder's files (and subagents such as
+`@general`); ↑/↓ and Enter or Tab pick one, Esc closes the list. A picked file
+becomes a chip and is attached to the prompt (opencode inlines its content).
+The footer picks the **agent** (Build, Plan, …), the **model** (grouped by
+provider) and, when the model has them, its **variant** (reasoning effort).
+With nothing selected, the pick applies to the next new session and sticks.
+↑ in an empty prompt recalls earlier prompts of the session; ↓ goes back.
+
 **Changes.** The conversation header's **Changes** button shows the latest
 turn's files, addition/deletion counts, and colored unified patches. Use
 **Refresh** during an active turn; opened diffs refresh when a turn finishes.
@@ -169,7 +177,9 @@ src/
   ui/tool_card.rs    expandable tool input/output, errors, exit/truncation metadata
   ui/permission.rs   pending permissions with explicit allow/reject actions
   ui/changes.rs      read-only, color-coded latest-turn file patches
-  ui/composer.rs     prompt box, Enter / Shift+Enter, Send ↔ Stop
+  ui/composer.rs     prompt box, Send ↔ Stop, agent/model/variant pickers, @ popup, history
+  ui/mention.rs      @ query detection, tokens → prompt attachments, history (pure)
+  ui/form_view.rs    question forms (form.*) above the composer
 docs/
   protocol-notes.md              endpoints + real event samples (opencode 2.2.6)
   openapi-opencode-2.2.6.json    the server's own spec (GET /openapi.json)
@@ -219,7 +229,7 @@ handoff.md                       state of the project for the next session
 - [x] **M1** Folders + sessions sidebar, plain-text streaming conversation, composer, reconnect + reconcile, opencode 2.x, dark theme
 - [x] **M2** Incremental streaming markdown, code copy buttons, links, selectable text, collapsible reasoning, frame-time probe
 - [x] **M3** Tool cards, permissions (`permission.asked`), diffs
-- [ ] **M4** @mentions, model/agent picker, history
+- [x] **M4** Question forms, @mentions (files, subagents), model/variant/agent picker, prompt history
 - [ ] **M5** Keyboard, persistence of window/sidebar, error states
 - [ ] **M6** Packaging (.app, AppImage), CI
 
@@ -236,8 +246,9 @@ come from gpui-component's neutral theme.
 
 - Only verified on Linux (Xvfb + llvmpipe) so far. macOS is the primary
   target but hasn't been run yet.
-- Question forms (`form.*`) are not implemented yet; permission requests
-  (`permission.*`) are supported.
+- `@` mentions attach files only; directories from the file search are
+  hidden. Recalled history entries come back as plain text (their mention
+  tokens aren't restored).
 - Changes shows the latest turn, not a full session or repository diff. Patch
   previews are bounded; Copy patch includes the full patch returned by opencode.
 - On macOS a `kill -9` of ocdesk can orphan the sidecar: there is no

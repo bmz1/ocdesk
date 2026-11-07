@@ -4,6 +4,7 @@ pub mod composer;
 pub mod conversation;
 pub mod form_view;
 pub mod frame_stats;
+pub mod mention;
 pub mod message;
 pub mod permission;
 pub mod prose;

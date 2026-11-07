@@ -15,11 +15,11 @@ use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use gpui_kit::{Context, Entity, Task};
 
-use crate::api::model::PermissionDecision;
+use crate::api::model::{FsEntry, ModelRef, PermissionDecision, PromptInput};
 use crate::api::{Api, Envelope, Event};
 use crate::settings::Settings;
 use crate::sidecar::{self, SidecarConfig};
-use crate::store::{Connection, Store};
+use crate::store::{Catalog, Connection, Store};
 
 /// Give up auto-restarting after this many crashes within [`CRASH_WINDOW`].
 const MAX_QUICK_RESTARTS: u32 = 3;
@@ -30,6 +30,8 @@ const NOTICE_LINGER: Duration = Duration::from_secs(10);
 /// registration (404 `LocationNotFoundError`).
 const LOCATION_RETRIES: usize = 3;
 const LOCATION_BACKOFF: Duration = Duration::from_millis(400);
+/// `model.updated`/`agent.updated` arrive in bursts (startup, config reload).
+const CATALOG_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// A 404 on `permission`/`form` reads right after startup usually means the
 /// session's location has not been registered server-side yet — retry, don't
@@ -75,6 +77,8 @@ pub struct Controller {
     recent_crashes: Vec<Instant>,
     /// Bumped per notice so a stale auto-clear timer can't hide a newer one.
     notice_seq: u64,
+    /// Bumped per catalog refresh request, to debounce bursts.
+    catalog_seq: u64,
     /// Offline UI demo (`OCDESK_DEMO`): no sidecar; prompts get synthetic replies.
     demo: bool,
 }
@@ -109,6 +113,7 @@ impl Controller {
             exit_watch: None,
             recent_crashes: Vec::new(),
             notice_seq: 0,
+            catalog_seq: 0,
             demo: false,
         };
         this.save_settings();
@@ -321,6 +326,7 @@ impl Controller {
                     }
                 });
             }
+            Event::CatalogChanged => self.schedule_catalog_refresh(cx),
             _ => {
                 let turn_over = match &env.event {
                     Event::ExecutionEnded { session_id, .. } => Some(session_id.clone()),
@@ -396,9 +402,164 @@ impl Controller {
                     }
                     Ok::<(), anyhow::Error>(())
                 },
-                |_this, _res, _cx| {},
+                |this, _res, cx| this.refresh_catalogs(cx),
             );
         }
+    }
+
+    // ── models and agents ────────────────────────────────────────────────
+
+    fn schedule_catalog_refresh(&mut self, cx: &mut Context<Self>) {
+        self.catalog_seq += 1;
+        let seq = self.catalog_seq;
+        let exec = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            exec.timer(CATALOG_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.catalog_seq == seq {
+                    this.refresh_catalogs(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Re-read models, default model and agents for every folder.
+    fn refresh_catalogs(&mut self, cx: &mut Context<Self>) {
+        for folder in self.store.read(cx).folders.clone() {
+            self.refresh_catalog(folder, cx);
+        }
+    }
+
+    fn refresh_catalog(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else { return };
+        let generation = self.generation;
+        let dir = folder.clone();
+        self.run(
+            cx,
+            async move {
+                let (models, default_model, agents) =
+                    futures::join!(api.models(&dir), api.default_model(&dir), api.agents(&dir));
+                Ok(Catalog {
+                    models: models?,
+                    // No default configured is not an error.
+                    default_model: default_model.unwrap_or_else(|e| {
+                        tracing::warn!("no default model for {}: {e:#}", dir.display());
+                        None
+                    }),
+                    agents: agents?,
+                })
+            },
+            move |this, res: Result<Catalog>, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                match res {
+                    Ok(c) => this.store.update(cx, |s, cx| s.set_catalog(folder, c, cx)),
+                    Err(e) => tracing::warn!(
+                        "could not read models/agents for {}: {e:#}",
+                        folder.display()
+                    ),
+                }
+            },
+        );
+    }
+
+    /// Pick the model (and variant) for the selected session, or for the
+    /// next new session when nothing is selected.
+    pub fn choose_model(&mut self, model: ModelRef, cx: &mut Context<Self>) {
+        self.store.update(cx, |s, cx| {
+            s.set_draft_choice(Some(model.clone()), None, cx)
+        });
+        let Some(sid) = self.store.read(cx).selected.clone() else {
+            return;
+        };
+        if self.demo {
+            return;
+        }
+        let Some(api) = self.api(cx) else { return };
+        let previous = self
+            .store
+            .read(cx)
+            .session(&sid)
+            .and_then(|s| s.model.clone());
+        // Optimistic; the stream confirms with session.model.selected.
+        self.store.update(cx, |s, cx| {
+            s.apply(
+                Envelope::bare(Event::ModelSelected {
+                    session_id: sid.clone(),
+                    model: model.clone(),
+                }),
+                cx,
+            )
+        });
+        let target = sid.clone();
+        self.run(
+            cx,
+            async move { api.switch_model(&sid, &model).await },
+            move |this, res, cx| {
+                let Err(e) = res else { return };
+                this.notice(format!("Could not switch model: {e:#}"), cx);
+                // Roll back the optimistic choice.
+                if let Some(prev) = previous {
+                    this.store.update(cx, |s, cx| {
+                        s.apply(
+                            Envelope::bare(Event::ModelSelected {
+                                session_id: target,
+                                model: prev,
+                            }),
+                            cx,
+                        )
+                    });
+                }
+            },
+        );
+    }
+
+    /// Pick the primary agent for the selected session, or the next new one.
+    pub fn choose_agent(&mut self, agent: String, cx: &mut Context<Self>) {
+        self.store.update(cx, |s, cx| {
+            s.set_draft_choice(None, Some(agent.clone()), cx)
+        });
+        let Some(sid) = self.store.read(cx).selected.clone() else {
+            return;
+        };
+        if self.demo {
+            return;
+        }
+        let Some(api) = self.api(cx) else { return };
+        self.store.update(cx, |s, cx| {
+            s.apply(
+                Envelope::bare(Event::AgentSelected {
+                    session_id: sid.clone(),
+                    agent: agent.clone(),
+                }),
+                cx,
+            )
+        });
+        self.run(
+            cx,
+            async move { api.switch_agent(&sid, &agent).await },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    this.notice(format!("Could not switch agent: {e:#}"), cx);
+                }
+            },
+        );
+    }
+
+    /// Fuzzy file search for `@` mentions. `None` when opencode isn't running.
+    pub fn find_files(
+        &self,
+        folder: PathBuf,
+        query: String,
+    ) -> Option<oneshot::Receiver<Result<Vec<FsEntry>>>> {
+        let api = self.api.clone()?;
+        let (tx, rx) = oneshot::channel();
+        self.rt.spawn(async move {
+            let _ = tx.send(api.find_files(&folder, &query, 20).await);
+        });
+        Some(rx)
     }
 
     /// Debug check (OCDESK_VERIFY_ON_IDLE): the streamed state of a loaded
@@ -837,6 +998,7 @@ impl Controller {
                 s.set_folders(folders, cx);
                 s.collapsed.remove(&folder);
             });
+            this.refresh_catalog(folder.clone(), cx);
             this.new_session(Some(folder), cx);
         };
         match self.api.clone() {
@@ -920,19 +1082,21 @@ impl Controller {
     }
 
     /// Send a prompt to the selected session, creating one in the target
-    /// folder first if nothing is selected.
-    pub fn send_prompt(&mut self, text: String, cx: &mut Context<Self>) {
-        let text = text.trim().to_string();
-        if text.is_empty() {
+    /// folder first if nothing is selected. A new session gets the draft
+    /// model/agent before its first prompt.
+    pub fn send_prompt(&mut self, mut input: PromptInput, cx: &mut Context<Self>) {
+        input.text = input.text.trim_end().to_string();
+        if input.text.trim().is_empty() {
             return;
         }
         if self.demo {
-            crate::demo::stream_reply(self.store.clone(), text, cx);
+            crate::demo::stream_reply(self.store.clone(), input.text, cx);
             return;
         }
         let Some(api) = self.api(cx) else { return };
         let store = self.store.read(cx);
         let selected = store.selected.clone();
+        let (draft_model, draft_agent) = (store.draft_model.clone(), store.draft_agent.clone());
         let Some(folder) = store.target_folder() else {
             self.notice("Add a folder first", cx);
             return;
@@ -951,11 +1115,19 @@ impl Controller {
                 let (sid, created) = match selected {
                     Some(sid) => (sid, None),
                     None => {
-                        let s = api.create_session(&folder).await?;
+                        let mut s = api.create_session(&folder).await?;
+                        if let Some(m) = &draft_model {
+                            api.switch_model(&s.id, m).await?;
+                            s.model = Some(m.clone());
+                        }
+                        if let Some(a) = &draft_agent {
+                            api.switch_agent(&s.id, a).await?;
+                            s.agent = Some(a.clone());
+                        }
                         (s.id.clone(), Some(s))
                     }
                 };
-                api.prompt(&sid, &text).await?;
+                api.prompt(&sid, &input).await?;
                 Ok((sid, created))
             },
             |this, res, cx| match res {
@@ -1002,7 +1174,13 @@ impl Controller {
             if store.read(cx).connection() == Connection::Connected
                 && let Some(t) = text.take()
             {
-                this.send_prompt(t, cx);
+                this.send_prompt(
+                    PromptInput {
+                        text: t,
+                        ..Default::default()
+                    },
+                    cx,
+                );
             }
         })
         .detach();
