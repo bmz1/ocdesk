@@ -13,6 +13,9 @@ use crate::ui::frame_stats::FrameStats;
 use crate::ui::keys;
 use crate::ui::sidebar::{SIDEBAR_MAX_W, SIDEBAR_MIN_W, SIDEBAR_W, Sidebar};
 
+/// Reverse-DNS id shared by the window class, `.desktop` file and `.app`.
+pub const APP_ID: &str = "io.github.bmz1.ocdesk";
+
 /// Drag payload of the sidebar's resize handle.
 struct SidebarResize;
 
@@ -62,6 +65,8 @@ pub fn window_options(settings: &Settings, cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(window_bounds),
         window_min_size: Some(size(px(WindowPlacement::MIN_W), px(WindowPlacement::MIN_H))),
+        // Matches the desktop entry (StartupWMClass) and the macOS bundle id.
+        app_id: Some(APP_ID.into()),
         titlebar: Some(TitlebarOptions {
             title: Some("ocdesk".into()),
             ..Default::default()

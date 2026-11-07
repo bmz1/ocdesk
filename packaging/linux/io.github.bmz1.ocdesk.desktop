@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ocdesk
+GenericName=Coding agent
+Comment=Native desktop client for the opencode coding agent
+Exec=ocdesk %f
+Icon=io.github.bmz1.ocdesk
+Terminal=false
+Categories=Development;IDE;
+Keywords=opencode;ai;agent;code;
+StartupWMClass=io.github.bmz1.ocdesk

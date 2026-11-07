@@ -16,6 +16,7 @@ alive() { local st; st=$(ps -o stat= -p "$1" 2>/dev/null); [ -n "$st" ] && [[ $s
 
 run() { # name, extra-env, action
   local name=$1 envs=$2 action=$3 log=$WORK/$1.log
+  # shellcheck disable=SC2086 # $envs is intentionally split: "" or "A=1 B=2"
   env $envs "$BIN" >"$log" 2>&1 &
   local app=$!
   for _ in $(seq 100); do grep -q "sidecar healthy" "$log" && break; sleep 0.1; done
@@ -29,7 +30,7 @@ run() { # name, extra-env, action
   if [ -n "$sc" ] && [ "$sc" != 0 ] && ! alive "$sc" && ! alive "$app"; then
     echo "PASS $name (app $app, sidecar $sc gone)"; pass=$((pass+1))
   else
-    echo "FAIL $name (app $app alive=$(alive $app && echo y || echo n), sidecar '$sc' alive=$(alive ${sc:-0} && echo y || echo n))"; fail=$((fail+1))
+    echo "FAIL $name (app $app alive=$(alive "$app" && echo y || echo n), sidecar '$sc' alive=$(alive "${sc:-0}" && echo y || echo n))"; fail=$((fail+1))
     kill -9 "$app" "$sc" 2>/dev/null
   fi
 }

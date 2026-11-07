@@ -2,7 +2,7 @@
 name = "ocdesk"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.99"
 description = "Native GPUI desktop client for the opencode coding agent"
 license = "MIT"
 publish = false

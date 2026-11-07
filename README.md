@@ -31,10 +31,30 @@ See *Roadmap* and [handoff.md](handoff.md).
 | opencode | **2.2.6** (`@opencode/cli`) | ocdesk refuses anything below 2.x and warns if the version differs from the pin |
 | gpui | `gpui-pre =0.3.11` = **zed@f816e1f** (via `gpui-kit =0.9.0`) | GPUI's API changes between snapshots |
 | gpui-component | 0.9.0 (via `gpui-kit`) | must match the gpui snapshot |
-| Rust | 1.97 (edition 2024) | |
+| Rust | **1.99.1** (edition 2024, `rust-toolchain.toml`) | gpui-pre-macos needs `Option::map_or_default` (stable in 1.99); Linux would build on older |
 
 Why `gpui-kit` and not a Zed git rev: see [docs/gpui-notes.md](docs/gpui-notes.md).
 The API ocdesk relies on, with real samples: [docs/protocol-notes.md](docs/protocol-notes.md).
+
+## Installing
+
+Builds come from the **Package** workflow (tag `vX.Y.Z` → draft GitHub
+release; or *Run workflow* for artifacts only):
+
+- **macOS** (11+, universal): `ocdesk-<version>-macos-universal.dmg` (or `.zip`).
+  Builds are ad-hoc signed unless the signing secrets below are configured, so
+  on first launch right-click → **Open**, or run
+  `xattr -dr com.apple.quarantine /Applications/ocdesk.app`.
+- **Linux** (x86_64, aarch64): `ocdesk-<version>-linux-<arch>.AppImage`
+  (`chmod +x` and run), or the `.tar.gz`: unpack and run `./install.sh`
+  (installs to `~/.local`, or `PREFIX=/usr/local`), which adds a desktop entry
+  and icon.
+
+Started from the Dock, Finder or a desktop launcher, an app doesn't get your
+shell's `PATH`, so ocdesk asks your login shell for it at startup (`$SHELL -l -i`,
+5 s timeout). That's how it finds `opencode2` installed through npm/nvm/Volta/
+Homebrew, and what opencode's tools (git, rg, compilers) see. From a terminal
+the inherited `PATH` is used as is. `OCDESK_NO_SHELL_ENV=1` turns this off.
 
 ## Running
 
@@ -182,11 +202,33 @@ SIGINT, SIGKILL, panic and normal quit.
 
 Before every commit: `cargo fmt && cargo clippy --all-targets -- -D warnings`.
 
+**CI** (`.github/workflows/ci.yml`, every push to `master` and every PR):
+Linux runs fmt, clippy, unit tests, shellcheck, then installs opencode 2.2.6
+and runs `dev/m3-protocol-test.py` and `dev/teardown-test.sh` under Xvfb;
+macOS runs clippy, unit tests and a build.
+
+**Packaging** (`packaging/`, also what `.github/workflows/package.yml` runs):
+
+```sh
+packaging/linux/package.sh                    # AppImage + tarball in target/package/
+SKIP_APPIMAGE=1 packaging/linux/package.sh    # tarball only
+ARCHS="arm64 x86_64" packaging/macos/bundle.sh  # ocdesk.app, .dmg, .zip (on a Mac)
+```
+
+The AppImage is made with linuxdeploy (downloaded into `target/tools`).
+macOS signing: set `MACOS_SIGN_IDENTITY` (a Developer ID Application identity)
+and optionally `NOTARY_PROFILE` (from `xcrun notarytool store-credentials`).
+In CI, add the repository secrets `MACOS_CERT_P12` (base64 .p12),
+`MACOS_CERT_PASSWORD`, and for notarization `APPLE_ID`, `APPLE_TEAM_ID`,
+`APPLE_APP_PASSWORD`; without them builds are ad-hoc signed. The app id is
+`io.github.bmz1.ocdesk` (bundle id, Linux window class, desktop file).
+
 ## Architecture
 
 ```
 src/
   main.rs            bootstrap: logging, tokio runtime thread, signals, window
+  shell_env.rs       login-shell PATH for apps started outside a terminal
   sidecar.rs         spawn / health-check / kill `opencode serve`
   settings.rs        folders, theme, window/sidebar, last session, draft model/agent (JSON)
   api/mod.rs         thin HTTP client + SSE reader (the only place that does HTTP)
@@ -210,6 +252,8 @@ docs/
   openapi-opencode-2.2.6.json    the server's own spec (GET /openapi.json)
   gpui-notes.md                  GPUI patterns and surprises
 tests/fixtures/                  real 2.2.6 captures used by the unit tests
+packaging/                       icon, macOS bundle script + Info.plist, Linux AppImage/tarball
+.github/workflows/               ci.yml (checks + e2e), package.yml (installers, draft release)
 handoff.md                       state of the project for the next session
 ```
 
@@ -256,7 +300,7 @@ handoff.md                       state of the project for the next session
 - [x] **M3** Tool cards, permissions (`permission.asked`), diffs
 - [x] **M4** Question forms, @mentions (files, subagents), model/variant/agent picker, prompt history
 - [x] **M5** Keyboard, persistence of window/sidebar, error states
-- [ ] **M6** Packaging (.app, AppImage), CI
+- [x] **M6** Packaging (.app, AppImage), CI
 
 ## Design
 
@@ -269,8 +313,9 @@ come from gpui-component's neutral theme.
 
 ## Known limitations
 
-- Only verified on Linux (Xvfb + llvmpipe) so far. macOS is the primary
-  target but hasn't been run yet.
+- Only run on Linux (Xvfb + llvmpipe) so far. macOS is the primary target;
+  it type-checks and lints for `aarch64-apple-darwin`, and CI builds and tests
+  it, but nobody has opened the window on a Mac yet.
 - `@` mentions attach files only; directories from the file search are
   hidden. Recalled history entries come back as plain text (their mention
   tokens aren't restored).

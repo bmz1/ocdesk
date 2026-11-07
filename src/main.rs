@@ -2,6 +2,7 @@ mod api;
 mod controller;
 mod demo;
 mod settings;
+mod shell_env;
 mod sidecar;
 mod store;
 mod ui;
@@ -40,7 +41,12 @@ fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
 
 fn main() -> Result<()> {
     STARTED.get_or_init(Instant::now);
+    // Before any thread exists: it may set PATH.
+    let path_status = shell_env::import_login_path();
     let _log_guard = init_logging()?;
+    if let Some(status) = path_status {
+        tracing::info!("{status}");
+    }
     sidecar::install_panic_hook();
     let runtime = api::Runtime::new()?;
     let rt = runtime.handle();
