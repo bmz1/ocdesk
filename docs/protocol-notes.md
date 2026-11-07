@@ -242,12 +242,33 @@ wait for the abort response to clear the busy state.
 `reference.updated`, `integration.updated`, `session.diff` (`{"diff": []}`; may
 feed the M3 changed-files summary).
 
+## Things learned in M1
+
+- **REST lags the stream.** Right after `session.idle` following an abort,
+  `GET /session/{id}/message` returned the text part with `"text": ""`
+  while the stream had already delivered the streamed text. About 500 ms later
+  REST had it too. So a REST snapshot can be *behind* what the client has
+  seen, and reconcile must not blindly overwrite local text (ocdesk keeps local
+  text when it strictly extends the snapshot's).
+- `GET /session?roots=true` returns only top-level sessions (sub-agent
+  sessions have `parentID`). `PATCH /session/{id}` `{"title"}` renames and
+  `DELETE /session/{id}` → `true`, followed by `session.deleted` on the stream.
+- The server generates a title shortly after the first prompt (`session.updated`).
+- Sessions belong to a *project*, keyed by the git repo's first commit. A
+  directory with no git repo, or `git init` with no commits, maps to the
+  shared `"global"` project, so all such directories see each other's sessions.
+  Sessions created before the first commit show up in the project afterwards.
+- A frozen server (SIGSTOP) keeps the TCP connection open; only the
+  heartbeat-based idle timeout notices. A killed server ends the stream at once.
+
 ## opencode-codes (1.19.5) notes
 
 - Types are generated from the spec; `Event` is a tagged enum with ~110
   variants. ocdesk normalizes the ~15 it needs into `api::events::Event`.
 - `EventStream` reconnects with exponential backoff and yields
-  `StreamEvent::Connected` on every (re)open. That's the hook for M1 reconcile.
+  `StreamEvent::Connected` on every (re)open, but swallows transient errors,
+  so a consumer can't tell it is disconnected. ocdesk reads SSE itself (still
+  using the crate's types and its authenticated `event_request()`).
 - `OpencodeClient::event_stream` applies no request timeout (correct for SSE);
   normal requests use the builder's timeout.
 - `ManagedServer` was not used: it inherits stderr, hides the pid, and does not

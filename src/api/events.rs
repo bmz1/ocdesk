@@ -1,6 +1,7 @@
 //! Our own normalized event enum. The rest of the app never sees
 //! `opencode_codes` types for events, so the protocol crate can be swapped.
 
+#[cfg(test)]
 use opencode_codes::StreamEvent;
 use opencode_codes::protocol_generated::types::{self as oc, Event as OcEvent};
 
@@ -20,6 +21,8 @@ pub enum RunState {
 pub enum Event {
     /// The SSE stream (re)connected. Frames may have been missed: reconcile.
     Connected,
+    /// The SSE stream dropped; the pump is backing off and will reconnect.
+    Disconnected,
     SessionUpserted(oc::Session),
     SessionDeleted {
         session_id: String,
@@ -70,6 +73,22 @@ pub enum Event {
 }
 
 impl Event {
+    /// Decode one SSE `data:` payload.
+    pub fn from_json(data: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(data).ok()?;
+        Some(match serde_json::from_value::<OcEvent>(value.clone()) {
+            Ok(ev) => Self::from_oc(ev),
+            Err(_) => Event::Other(
+                value
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+            ),
+        })
+    }
+
+    #[cfg(test)]
     pub fn from_stream(ev: StreamEvent) -> Self {
         match ev {
             StreamEvent::Connected => Event::Connected,
@@ -109,7 +128,7 @@ impl Event {
                 message: e
                     .properties
                     .error
-                    .map(|err| serde_json::to_string(&err).unwrap_or_default())
+                    .map(|err| crate::store::error_message(&err))
                     .unwrap_or_else(|| "unknown error".into()),
             },
             OcEvent::MessageUpdated(e) => Event::MessageUpserted {

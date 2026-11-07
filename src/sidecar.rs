@@ -49,7 +49,6 @@ pub struct Sidecar {
     pub base_url: String,
     pub password: String,
     pub version: String,
-    pub pid: u32,
 }
 
 /// How the sidecar process ended.
@@ -193,7 +192,6 @@ pub async fn spawn(cfg: SidecarConfig) -> Result<(Sidecar, oneshot::Receiver<Sid
         base_url,
         password,
         version,
-        pid,
     };
     if let Err(e) = wait_healthy(&sidecar).await {
         kill_sidecar();
