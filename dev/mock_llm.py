@@ -8,6 +8,9 @@ then run opencode with dev/mock-opencode.json (see README "Developing").
 Behaviour is keyed on the last user message:
     contains "tool:bash"  -> calls the shell tool ("bash" on old servers), then summarizes
     contains "tool:edit"  -> calls the write tool on mock_note.txt, then summarizes
+    contains "tool:task"  -> calls the subagent tool (spawns a "general" subagent), then summarizes
+    contains "tool:sleep" -> runs `sleep 20` through the shell tool (a long-running command)
+    contains "slow"       -> a reply streamed over ~10 s (for queue/steer testing)
     contains "long"       -> streams a long markdown answer with code blocks
     contains "rich"       -> long reasoning + every markdown construct (tables, quotes, lists, code)
     anything else         -> short reasoning + a short markdown answer
@@ -129,7 +132,8 @@ class Handler(BaseHTTPRequestHandler):
             for m in msgs if m.get("role") == "system"
         )
         is_title = "title" in sys_text.lower() and not req.get("tools")
-        offered = {t.get("function", {}).get("name") for t in req.get("tools") or []}
+        tools = {t.get("function", {}).get("name"): t.get("function", {}) for t in req.get("tools") or []}
+        offered = set(tools)
         if offered:
             sys.stderr.write("mock_llm: tools offered: " + ", ".join(sorted(n for n in offered if n)) + "\n")
 
@@ -179,10 +183,29 @@ class Handler(BaseHTTPRequestHandler):
                 stream_text("Thinking about the tool output.", "reasoning_content")
                 stream_text("The tool finished. Output was:\n\n```\n" + str(msgs[-1].get("content"))[:400] + "\n```\n")
                 chunk({}, "stop")
+            elif "tool:sleep" in user:
+                stream_text("Starting a long command.\n")
+                tool_call(pick("shell", "bash"), {"command": "sleep 20 && echo slept", "description": "Wait a while"})
             elif "tool:bash" in user:
                 stream_text("I should run a command.", "reasoning_content")
                 stream_text("Running a command.\n")
                 tool_call(pick("shell", "bash"), {"command": "echo hello-from-bash && ls | head -5", "description": "Say hello and list files"})
+            elif "tool:task" in user and "Subagent:" not in user:
+                # Fill the server's own task-tool schema, whatever its field names.
+                name = pick("subagent", "task")
+                params = tools.get(name, {}).get("parameters", {})
+                sys.stderr.write(f"mock_llm: {name} schema: " + json.dumps(params) + "\n")
+                values = {"description": "Look around", "prompt": "Subagent: say hello",
+                          "subagent_type": "general", "agent": "general", "subagent": "general"}
+                props = params.get("properties", {})
+                args = {k: values.get(k, "general") for k in (params.get("required") or props)}
+                stream_text("Delegating to a subagent.\n")
+                tool_call(name, args)
+            elif "slow" in user:
+                for w in words("A deliberately slow reply, one word at a time, so there is time to queue or steer. " * 3):
+                    chunk({"content": w})
+                    time.sleep(0.25)
+                chunk({}, "stop")
             elif "tool:edit" in user:
                 stream_text("Writing a file.\n")
                 tool_call(pick("write", "edit"), {"path": "mock_note.txt", "content": "line one\nline two\n"})
