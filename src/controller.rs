@@ -24,6 +24,42 @@ use crate::store::{Connection, Store};
 /// Give up auto-restarting after this many crashes within [`CRASH_WINDOW`].
 const MAX_QUICK_RESTARTS: u32 = 3;
 const CRASH_WINDOW: Duration = Duration::from_secs(60);
+/// How long a transient notice stays visible before clearing itself.
+const NOTICE_LINGER: Duration = Duration::from_secs(10);
+/// Retries for reads that can race a fresh sidecar's lazy location
+/// registration (404 `LocationNotFoundError`).
+const LOCATION_RETRIES: usize = 3;
+const LOCATION_BACKOFF: Duration = Duration::from_millis(400);
+
+/// A 404 on `permission`/`form` reads right after startup usually means the
+/// session's location has not been registered server-side yet — retry, don't
+/// bother the user.
+fn is_location_404(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}");
+    s.contains("404") || s.contains("LocationNotFoundError")
+}
+
+async fn with_location_retry<F, T>(mut f: F) -> Result<T>
+where
+    F: FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send>>,
+{
+    let mut attempt = 0;
+    loop {
+        match f().await {
+            Err(e) if attempt < LOCATION_RETRIES && is_location_404(&e) => {
+                tracing::warn!(
+                    "location read not ready yet ({}), retrying ({}/{})",
+                    e,
+                    attempt + 1,
+                    LOCATION_RETRIES
+                );
+                attempt += 1;
+                tokio::time::sleep(LOCATION_BACKOFF * attempt as u32).await;
+            }
+            res => return res,
+        }
+    }
+}
 
 pub struct Controller {
     rt: tokio::runtime::Handle,
@@ -37,6 +73,8 @@ pub struct Controller {
     pump: Option<(tokio::task::AbortHandle, Task<()>)>,
     exit_watch: Option<Task<()>>,
     recent_crashes: Vec<Instant>,
+    /// Bumped per notice so a stale auto-clear timer can't hide a newer one.
+    notice_seq: u64,
     /// Offline UI demo (`OCDESK_DEMO`): no sidecar; prompts get synthetic replies.
     demo: bool,
 }
@@ -70,6 +108,7 @@ impl Controller {
             pump: None,
             exit_watch: None,
             recent_crashes: Vec::new(),
+            notice_seq: 0,
             demo: false,
         };
         this.save_settings();
@@ -128,6 +167,7 @@ impl Controller {
         self.api = None;
         self.store.update(cx, |s, cx| {
             s.permission_sending.clear();
+            s.form_sending.clear();
             s.diff_loading.clear();
             cx.notify();
         });
@@ -272,6 +312,7 @@ impl Controller {
                 self.connection_epoch += 1;
                 self.store.update(cx, |s, cx| {
                     s.permission_sending.clear();
+                    s.form_sending.clear();
                     cx.notify();
                 });
                 self.store.update(cx, |s, cx| {
@@ -296,6 +337,7 @@ impl Controller {
     /// A turn finished (`session.execution.succeeded|failed|interrupted`).
     fn on_turn_over(&mut self, _session_id: String, cx: &mut Context<Self>) {
         self.refresh_permissions(_session_id.clone(), cx);
+        self.refresh_forms(_session_id.clone(), cx);
         if self.store.read(cx).diffs.contains_key(&_session_id) {
             self.refresh_diff(_session_id.clone(), cx);
         }
@@ -329,6 +371,7 @@ impl Controller {
         }
         let mut pending_sessions: std::collections::HashSet<String> =
             self.store.read(cx).permissions.keys().cloned().collect();
+        pending_sessions.extend(self.store.read(cx).forms.keys().cloned());
         if let Some(id) = selected {
             pending_sessions.insert(id.clone());
             self.load_messages(id.clone(), cx);
@@ -337,7 +380,24 @@ impl Controller {
             }
         }
         for sid in pending_sessions {
-            self.refresh_permissions(sid, cx);
+            self.refresh_permissions(sid.clone(), cx);
+            self.refresh_forms(sid, cx);
+        }
+        // Prime every folder's location: a fresh sidecar registers a project
+        // only when the directory is first mentioned, and until then reads for
+        // that location's sessions 404 (LocationNotFoundError).
+        let folders = self.store.read(cx).folders.clone();
+        if let Some(api) = self.api.clone() {
+            self.run(
+                cx,
+                async move {
+                    for f in &folders {
+                        let _ = api.location(f).await;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                },
+                |_this, _res, _cx| {},
+            );
         }
     }
 
@@ -366,20 +426,40 @@ impl Controller {
 
     // ── intents ──────────────────────────────────────────────────────────
 
-    fn api(&self, cx: &mut Context<Self>) -> Option<Api> {
+    fn api(&mut self, cx: &mut Context<Self>) -> Option<Api> {
         if self.api.is_none() {
             self.notice("opencode is not running", cx);
         }
         self.api.clone()
     }
 
-    fn notice(&self, msg: impl Into<String>, cx: &mut Context<Self>) {
+    /// Transient warning in the conversation's notice bar. Auto-clears after
+    /// [`NOTICE_LINGER`] so a stale error never sticks around.
+    fn notice(&mut self, msg: impl Into<String>, cx: &mut Context<Self>) {
         let msg = msg.into();
         tracing::warn!("{msg}");
+        self.notice_seq += 1;
+        let seq = self.notice_seq;
         self.store.update(cx, |s, cx| {
             s.notice = Some(msg);
             cx.notify();
         });
+        let exec = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            exec.timer(NOTICE_LINGER).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.notice_seq != seq {
+                    return;
+                }
+                this.store.update(cx, |s, cx| {
+                    if s.notice.is_some() {
+                        s.notice = None;
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .detach();
     }
 
     pub fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
@@ -422,7 +502,14 @@ impl Controller {
         let id = sid.clone();
         self.run(
             cx,
-            async move { api.permissions(&id).await },
+            async move {
+                with_location_retry(move || {
+                    let api = api.clone();
+                    let id = id.clone();
+                    Box::pin(async move { api.permissions(&id).await })
+                })
+                .await
+            },
             move |this, res, cx| {
                 if this.generation != generation || this.connection_epoch != epoch {
                     return;
@@ -437,8 +524,180 @@ impl Controller {
                             this.refresh_permissions(sid, cx);
                         }
                     }
+                    Err(e) if is_location_404(&e) => {
+                        tracing::warn!("could not load permission requests: {e:#}")
+                    }
                     Err(e) => this.notice(format!("Could not load permission requests: {e:#}"), cx),
                 }
+            },
+        );
+    }
+
+    pub fn refresh_forms(&mut self, sid: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else { return };
+        let (generation, epoch) = (self.generation, self.connection_epoch);
+        let revision = self.store.read(cx).form_revision(&sid);
+        let id = sid.clone();
+        self.run(
+            cx,
+            async move {
+                with_location_retry(move || {
+                    let api = api.clone();
+                    let id = id.clone();
+                    Box::pin(async move { api.forms(&id).await })
+                })
+                .await
+            },
+            move |this, res, cx| {
+                if this.generation != generation || this.connection_epoch != epoch {
+                    return;
+                }
+                match res {
+                    Ok(forms) => {
+                        // A live created/replied event (or newer snapshot) wins over this read.
+                        if this.store.read(cx).form_revision(&sid) == revision {
+                            this.store.update(cx, |s, cx| s.set_forms(&sid, forms, cx));
+                        } else {
+                            this.refresh_forms(sid, cx);
+                        }
+                    }
+                    Err(e) if is_location_404(&e) => {
+                        tracing::warn!("could not load question forms: {e:#}")
+                    }
+                    Err(e) => this.notice(format!("Could not load question forms: {e:#}"), cx),
+                }
+            },
+        );
+    }
+
+    pub fn reply_form(
+        &mut self,
+        sid: String,
+        fid: String,
+        answer: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(api) = self.api(cx) else { return };
+        let key = (sid.clone(), fid.clone());
+        let store = self.store.read(cx);
+        let exists = store
+            .forms
+            .get(&sid)
+            .is_some_and(|fs| fs.iter().any(|f| f.id == fid));
+        if !exists
+            || store.form_sending.contains(&key)
+            || store.connection() != Connection::Connected
+        {
+            return;
+        }
+        let (generation, epoch) = (self.generation, self.connection_epoch);
+        self.store.update(cx, |s, cx| {
+            s.form_sending.insert(key.clone());
+            s.form_errors.remove(&key);
+            cx.notify();
+        });
+        let (session, form) = (sid.clone(), fid.clone());
+        self.run(
+            cx,
+            async move { api.reply_form(&session, &form, &answer).await },
+            move |this, res, cx| {
+                if this.generation != generation || this.connection_epoch != epoch {
+                    return;
+                }
+                this.store.update(cx, |s, cx| {
+                    s.form_sending.remove(&key);
+                    match res {
+                        Ok(()) => s.apply(
+                            Envelope::bare(Event::FormReplied {
+                                session_id: sid.clone(),
+                                form_id: fid.clone(),
+                            }),
+                            cx,
+                        ),
+                        Err(e) => {
+                            // Keep the form visible and retryable after an HTTP failure.
+                            if s.forms
+                                .get(&sid)
+                                .is_some_and(|fs| fs.iter().any(|f| f.id == fid))
+                            {
+                                s.form_errors.insert(key, format!("Could not reply: {e:#}"));
+                            }
+                            cx.notify();
+                        }
+                    }
+                });
+                this.refresh_forms(sid, cx);
+            },
+        );
+    }
+
+    /// Record one answer in a form's draft (option picked, box toggled, text
+    /// typed). Pure UI state; the server sees it only on submit.
+    pub fn set_form_answer(
+        &self,
+        form_id: String,
+        key: String,
+        value: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        self.store.update(cx, |s, cx| {
+            s.set_form_draft(&form_id, &key, value, cx);
+        });
+    }
+
+    /// The committed draft answers of the selected form.
+    pub fn form_draft(&self, form_id: String, cx: &Context<Self>) -> serde_json::Value {
+        self.store.read(cx).form_draft(&form_id)
+    }
+
+    pub fn cancel_form(&mut self, sid: String, fid: String, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        let key = (sid.clone(), fid.clone());
+        let store = self.store.read(cx);
+        let exists = store
+            .forms
+            .get(&sid)
+            .is_some_and(|fs| fs.iter().any(|f| f.id == fid));
+        if !exists || store.form_sending.contains(&key) {
+            return;
+        }
+        let (generation, epoch) = (self.generation, self.connection_epoch);
+        self.store.update(cx, |s, cx| {
+            s.form_sending.insert(key.clone());
+            cx.notify();
+        });
+        let (session, form) = (sid.clone(), fid.clone());
+        self.run(
+            cx,
+            async move { api.cancel_form(&session, &form).await },
+            move |this, res, cx| {
+                if this.generation != generation || this.connection_epoch != epoch {
+                    return;
+                }
+                this.store.update(cx, |s, cx| {
+                    s.form_sending.remove(&key);
+                    match res {
+                        Ok(()) => s.apply(
+                            Envelope::bare(Event::FormCancelled {
+                                session_id: sid.clone(),
+                                form_id: fid.clone(),
+                            }),
+                            cx,
+                        ),
+                        Err(e) => {
+                            let msg = format!("Could not cancel: {e:#}");
+                            tracing::warn!("{msg}");
+                            if s.forms
+                                .get(&sid)
+                                .is_some_and(|fs| fs.iter().any(|f| f.id == fid))
+                            {
+                                s.form_errors.insert(key, msg);
+                            }
+                            cx.notify();
+                        }
+                    }
+                });
+                this.refresh_forms(sid, cx);
             },
         );
     }
@@ -545,6 +804,7 @@ impl Controller {
         self.store.update(cx, |s, cx| s.select(id.clone(), cx));
         if let Some(id) = id {
             self.refresh_permissions(id.clone(), cx);
+            self.refresh_forms(id.clone(), cx);
             self.load_messages(id, cx);
         }
     }

@@ -155,6 +155,110 @@ pub enum PermissionDecision {
     Reject,
 }
 
+/// An opencode "question" form (`Form.Info`): one blocking card asking the
+/// user for answers to one or more fields. Parsed leniently like everything
+/// else in this module; unknown field kinds are dropped rather than failing
+/// the whole form.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormRequest {
+    pub id: String,
+    pub session_id: String,
+    pub title: String,
+    pub fields: Vec<FormField>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormOption {
+    pub value: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormFieldKind {
+    /// Free text; with `options` this is the mock's single-select.
+    String,
+    Number,
+    Integer,
+    Boolean,
+    MultiSelect,
+    /// A link the user must follow outside ocdesk.
+    External,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormField {
+    pub key: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub kind: FormFieldKind,
+    pub required: bool,
+    pub options: Vec<FormOption>,
+    /// `custom: true` adds a free-text row besides the options.
+    pub custom: bool,
+    pub placeholder: Option<String>,
+    pub default: Option<Value>,
+    pub hidden: bool,
+}
+
+impl FormField {
+    fn from_json(v: &Value) -> Option<Self> {
+        let kind = match v.get("type").and_then(Value::as_str)? {
+            "string" => FormFieldKind::String,
+            "number" => FormFieldKind::Number,
+            "integer" => FormFieldKind::Integer,
+            "boolean" => FormFieldKind::Boolean,
+            "multiselect" => FormFieldKind::MultiSelect,
+            "external" => FormFieldKind::External,
+            _ => return None,
+        };
+        let options = v
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(|o| {
+                        Some(FormOption {
+                            value: str_at(o, "/value")?,
+                            label: str_at(o, "/label").unwrap_or_default(),
+                            description: str_at(o, "/description"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            key: str_at(v, "/key")?,
+            title: str_at(v, "/title").unwrap_or_default(),
+            description: str_at(v, "/description"),
+            kind,
+            required: v.get("required").and_then(Value::as_bool).unwrap_or(false),
+            options,
+            custom: v.get("custom").and_then(Value::as_bool).unwrap_or(false),
+            placeholder: str_at(v, "/placeholder"),
+            default: v.get("default").cloned().filter(|d| !d.is_null()),
+            hidden: v.get("hidden").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+}
+
+impl FormRequest {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let fields = v
+            .get("fields")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(FormField::from_json)
+            .collect();
+        Some(Self {
+            id: str_at(v, "/id")?,
+            session_id: str_at(v, "/sessionID")?,
+            title: str_at(v, "/title").unwrap_or_default(),
+            fields,
+        })
+    }
+}
+
 impl PermissionDecision {
     pub fn as_str(self) -> &'static str {
         match self {

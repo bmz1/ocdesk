@@ -14,10 +14,12 @@ use gpui_kit::{Context, EventEmitter};
 
 use crate::api::events::Outcome;
 use crate::api::model::{
-    AssistantMessage, Block, BlockKind, FileDiff, Message, PermissionRequest, SessionInfo,
-    ToolCall, ToolStatus, UserMessage,
+    AssistantMessage, Block, BlockKind, FileDiff, FormRequest, Message, PermissionRequest,
+    SessionInfo, ToolCall, ToolStatus, UserMessage,
 };
 use crate::api::{Envelope, Event};
+
+use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Connection {
@@ -120,6 +122,14 @@ pub struct Store {
     pub permission_revision: HashMap<String, u64>,
     pub permission_sending: HashSet<(String, String)>,
     pub permission_errors: HashMap<(String, String), String>,
+    /// Pending question forms, session-owned like permissions.
+    pub forms: HashMap<String, Vec<FormRequest>>,
+    pub form_revision: HashMap<String, u64>,
+    pub form_sending: HashSet<(String, String)>,
+    pub form_errors: HashMap<(String, String), String>,
+    /// In-progress answers per pending form (`answer[key] = value`), seeded
+    /// from the fields' defaults and edited as the user picks or types.
+    pub form_drafts: HashMap<String, Value>,
     pub diffs: HashMap<String, Vec<FileDiff>>,
     pub diff_loading: HashSet<String>,
     pub diff_errors: HashMap<String, String>,
@@ -182,6 +192,90 @@ impl Store {
         self.permission_sending.remove(&key);
         self.permission_errors.remove(&key);
         *self.permission_revision.entry(sid.to_string()).or_default() += 1;
+    }
+
+    pub fn form_revision(&self, sid: &str) -> u64 {
+        self.form_revision.get(sid).copied().unwrap_or_default()
+    }
+
+    /// Replace the pending forms of a session (snapshot read). Drafts survive
+    /// as long as the form stays pending.
+    pub fn set_forms(&mut self, sid: &str, forms: Vec<FormRequest>, cx: &mut Context<Self>) {
+        let forms: Vec<FormRequest> = forms.into_iter().filter(|f| f.session_id == sid).collect();
+        for f in &forms {
+            self.seed_form_draft(f);
+        }
+        self.forms.insert(sid.to_string(), forms.clone());
+        let pending: HashSet<&str> = forms.iter().map(|f| f.id.as_str()).collect();
+        self.form_sending
+            .retain(|(session, form)| session != sid || pending.contains(form.as_str()));
+        self.form_errors
+            .retain(|(session, form), _| session != sid || pending.contains(form.as_str()));
+        self.form_drafts
+            .retain(|form, _| pending.contains(form.as_str()));
+        *self.form_revision.entry(sid.to_string()).or_default() += 1;
+        cx.emit(StoreEvent::StatusChanged {
+            session_id: sid.to_string(),
+        });
+        cx.notify();
+    }
+
+    fn remove_form(&mut self, sid: &str, fid: &str) {
+        if let Some(forms) = self.forms.get_mut(sid) {
+            forms.retain(|f| f.id != fid);
+        }
+        let key = (sid.to_string(), fid.to_string());
+        self.form_sending.remove(&key);
+        self.form_errors.remove(&key);
+        self.form_drafts.remove(fid);
+        *self.form_revision.entry(sid.to_string()).or_default() += 1;
+    }
+
+    /// Fill a new form's draft with its fields' default answers.
+    fn seed_form_draft(&mut self, form: &FormRequest) {
+        if self.form_drafts.contains_key(&form.id) {
+            return;
+        }
+        let mut draft = serde_json::Map::new();
+        for field in &form.fields {
+            if let Some(d) = &field.default {
+                draft.insert(field.key.clone(), d.clone());
+            }
+        }
+        self.form_drafts
+            .insert(form.id.clone(), Value::Object(draft));
+    }
+
+    /// One answer inside a form's draft; keyed by form so drafts survive
+    /// re-renders.
+    pub fn set_form_draft(
+        &mut self,
+        form_id: &str,
+        key: &str,
+        value: Value,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = self
+            .form_drafts
+            .entry(form_id.to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(serde_json::Map::new());
+        }
+        let map = entry.as_object_mut().expect("draft object");
+        if map.get(key) == Some(&value) {
+            return;
+        }
+        map.insert(key.to_string(), value);
+        cx.notify();
+    }
+
+    /// The current draft answers of a form (empty object if none yet).
+    pub fn form_draft(&self, form_id: &str) -> Value {
+        self.form_drafts
+            .get(form_id)
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
     }
 
     pub fn session(&self, id: &str) -> Option<&SessionInfo> {
@@ -385,6 +479,10 @@ impl Store {
                 self.permission_sending.retain(|(sid, _)| sid != session_id);
                 self.permission_errors
                     .retain(|(sid, _), _| sid != session_id);
+                self.forms.remove(session_id);
+                self.form_revision.remove(session_id);
+                self.form_sending.retain(|(sid, _)| sid != session_id);
+                self.form_errors.retain(|(sid, _), _| sid != session_id);
                 self.diffs.remove(session_id);
                 self.diff_loading.remove(session_id);
                 self.diff_errors.remove(session_id);
@@ -408,6 +506,32 @@ impl Store {
                 request_id,
             } => {
                 self.remove_permission(session_id, request_id);
+                return vec![StoreEvent::StatusChanged {
+                    session_id: session_id.clone(),
+                }];
+            }
+            Event::FormAsked(form) => {
+                let sid = form.session_id.clone();
+                let fid = form.id.clone();
+                self.seed_form_draft(form);
+                if let Some(forms) = self.forms.get_mut(&sid) {
+                    forms.retain(|f| f.id != fid);
+                    forms.push(form.clone());
+                } else {
+                    self.forms.insert(sid.clone(), vec![form.clone()]);
+                }
+                *self.form_revision.entry(sid.clone()).or_default() += 1;
+                return vec![StoreEvent::StatusChanged { session_id: sid }];
+            }
+            Event::FormReplied {
+                session_id,
+                form_id,
+            }
+            | Event::FormCancelled {
+                session_id,
+                form_id,
+            } => {
+                self.remove_form(session_id, form_id);
                 return vec![StoreEvent::StatusChanged {
                     session_id: session_id.clone(),
                 }];
@@ -791,6 +915,41 @@ mod tests {
             "save":["echo *"], "metadata":{"command":"echo hello"}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn forms_are_session_scoped_and_close_cleanly() {
+        let mut s = Store::default();
+        let form = || {
+            FormRequest::from_json(&serde_json::json!({
+                "id": "frm_1", "sessionID": "ses_a", "title": "Questions",
+                "fields": [
+                    {"key": "q0", "type": "string", "options": [{"value": "y", "label": "Yes"}], "custom": true},
+                    {"key": "q1", "type": "string", "options": [{"value": "startup", "label": "Startup"}]}
+                ]
+            }))
+            .unwrap()
+        };
+        s.apply_inner(Envelope::bare(Event::FormAsked(form())));
+        s.apply_inner(Envelope::bare(Event::FormAsked(form())));
+        assert_eq!(
+            s.forms["ses_a"].len(),
+            1,
+            "duplicate ask frames must not duplicate cards"
+        );
+        assert_eq!(s.form_draft("frm_1"), serde_json::json!({}));
+        let before = s.form_revision("ses_a");
+        s.apply_inner(Envelope::bare(Event::FormReplied {
+            session_id: "ses_a".into(),
+            form_id: "frm_1".into(),
+        }));
+        assert!(s.forms["ses_a"].is_empty());
+        assert!(
+            s.form_revision("ses_a") > before,
+            "in-flight snapshots must be invalidated"
+        );
+        // The draft and scratch of the closed form go away with it.
+        assert_eq!(s.form_draft("frm_1"), serde_json::json!({}));
     }
 
     #[test]

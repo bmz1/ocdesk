@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use super::model::{
-    BlockKind, PermissionRequest, SessionInfo, content_text, error_text, str_at, u64_at,
+    BlockKind, FormRequest, PermissionRequest, SessionInfo, content_text, error_text, str_at,
+    u64_at,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +111,18 @@ pub enum Event {
     PermissionReplied {
         session_id: String,
         request_id: String,
+    },
+    /// A blocking question form was created (`form.created`).
+    FormAsked(FormRequest),
+    /// A form was answered (`form.replied`); the answer lands as a tool result.
+    FormReplied {
+        session_id: String,
+        form_id: String,
+    },
+    /// A form was cancelled (`form.cancelled`).
+    FormCancelled {
+        session_id: String,
+        form_id: String,
     },
     ToolSucceeded {
         session_id: String,
@@ -267,6 +280,15 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
             session_id: sid()?,
             request_id: str_at(d, "/requestID")?,
         },
+        "form.created" => Event::FormAsked(FormRequest::from_json(d.get("form")?)?),
+        "form.replied" => Event::FormReplied {
+            session_id: sid()?,
+            form_id: str_at(d, "/id")?,
+        },
+        "form.cancelled" => Event::FormCancelled {
+            session_id: sid()?,
+            form_id: str_at(d, "/id")?,
+        },
         "session.tool.progress" => Event::ToolProgress {
             session_id: sid()?,
             message_id: mid()?,
@@ -317,6 +339,39 @@ mod tests {
             .lines()
             .map(|l| Envelope::from_json(l).expect("every captured frame decodes"))
             .collect()
+    }
+
+    #[test]
+    fn decodes_form_events() {
+        // Shape captured from a live sidecar (opencode 2.2.6 question tool).
+        let created = Envelope::from_json(concat!(
+            r#"{"type":"form.created","data":{"form":{"id":"frm_1","sessionID":"ses_a","title":"Questions","#,
+            r#""metadata":{"kind":"question"},"fields":["#,
+            r#"{"key":"q0","title":"404 banner","type":"string","description":"Still visible?","#,
+            r#""options":[{"value":"Yes, still there","label":"Yes, still there"}],"custom":true},"#,
+            r#"{"key":"q1","title":"When","type":"string","options":[{"value":"Right at startup","label":"Right at startup"}]}"#,
+            r#"]}}}"#,
+        ))
+        .unwrap();
+        assert!(matches!(
+            created.event,
+            Event::FormAsked(f) if f.id == "frm_1" && f.fields.len() == 2 && f.fields[0].custom
+        ));
+        let replied = Envelope::from_json(
+            r#"{"type":"form.replied","data":{"sessionID":"ses_a","id":"frm_1"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(replied.event, Event::FormReplied { session_id, form_id } if form_id == "frm_1" && session_id == "ses_a")
+        );
+        let cancelled = Envelope::from_json(
+            r#"{"type":"form.cancelled","data":{"sessionID":"ses_a","id":"frm_1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            cancelled.event,
+            Event::FormCancelled { form_id, .. } if form_id == "frm_1"
+        ));
     }
 
     #[test]

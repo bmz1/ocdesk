@@ -91,9 +91,12 @@ impl Api {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let mut q = vec![("limit", PAGE.to_string()), ("order", "desc".to_string())];
+            // `cursor` must not be combined with `order` (the API rejects it).
+            let mut q = vec![("limit", PAGE.to_string())];
             if let Some(c) = &cursor {
                 q.push(("cursor", c.clone()));
+            } else {
+                q.push(("order", "desc".to_string()));
             }
             let v = self
                 .send(self.req(Method::GET, "/api/session").query(&q))
@@ -145,9 +148,13 @@ impl Api {
         let mut raw = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let mut q = vec![("limit", PAGE.to_string()), ("order", "asc".to_string())];
-            if let Some(c) = &cursor {
-                q.push(("cursor", c.clone()));
+            // The API rejects `cursor` combined with `order`, so `order` is
+            // only sent for the first page.
+            let mut q = vec![("limit", PAGE.to_string())];
+            if cursor.is_none() {
+                q.push(("order", "asc".to_string()));
+            } else {
+                q.push(("cursor", cursor.clone().unwrap()));
             }
             let path = format!("/api/session/{}/message", id(session_id));
             let v = self.send(self.req(Method::GET, &path).query(&q)).await?;
@@ -197,6 +204,38 @@ impl Api {
                 .json(&json!({"decision": decision.as_str()})),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Pending question forms for one session (`GET /api/session/{id}/form`).
+    pub async fn forms(&self, session_id: &str) -> Result<Vec<model::FormRequest>> {
+        let path = format!("/api/session/{}/form", id(session_id));
+        let v = self.send(self.req(Method::GET, &path)).await?;
+        let data = v["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("invalid forms response"))?;
+        Ok(data
+            .iter()
+            .filter_map(model::FormRequest::from_json)
+            .collect())
+    }
+
+    /// Answer a form (`POST /api/session/{id}/form/{form}/reply`, body
+    /// `{"answer": {key: value}}` → 204).
+    pub async fn reply_form(&self, session_id: &str, form_id: &str, answer: &Value) -> Result<()> {
+        let path = format!("/api/session/{}/form/{}/reply", id(session_id), id(form_id));
+        self.send(
+            self.req(Method::POST, &path)
+                .json(&json!({ "answer": answer })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Cancel a form without answering (`DELETE /api/session/{id}/form/{form}`).
+    pub async fn cancel_form(&self, session_id: &str, form_id: &str) -> Result<()> {
+        let path = format!("/api/session/{}/form/{}", id(session_id), id(form_id));
+        self.send(self.req(Method::DELETE, &path)).await?;
         Ok(())
     }
 
@@ -428,6 +467,24 @@ mod tests {
                     r#"{"data":[{"file":"a.rs","patch":"+new","status":"added","additions":1,"deletions":0}]}"#,
                     "200 OK",
                 ),
+                (
+                    "GET /api/session/ses_a/form ",
+                    "",
+                    r#"{"data":[{"id":"frm_a","sessionID":"ses_a","title":"Questions","fields":[{"key":"q0","type":"string","description":"Pick one","options":[{"value":"y","label":"Yes"}],"custom":true}]}]}"#,
+                    "200 OK",
+                ),
+                (
+                    "POST /api/session/ses_a/form/frm_a/reply ",
+                    r#"{"answer":{"q0":"y"}}"#,
+                    "",
+                    "204 No Content",
+                ),
+                (
+                    "DELETE /api/session/ses_a/form/frm_a ",
+                    "",
+                    "",
+                    "204 No Content",
+                ),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
@@ -474,6 +531,13 @@ mod tests {
                 .is_err()
         );
         assert_eq!(api.diff("ses_a").await.unwrap()[0].file, "a.rs");
+        let form = &api.forms("ses_a").await.unwrap()[0];
+        assert_eq!(form.id, "frm_a");
+        assert!(form.fields[0].custom);
+        api.reply_form("ses_a", "frm_a", &serde_json::json!({"q0": "y"}))
+            .await
+            .unwrap();
+        api.cancel_form("ses_a", "frm_a").await.unwrap();
         server.join().unwrap();
     }
 

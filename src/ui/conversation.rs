@@ -18,6 +18,8 @@ use crate::ui::prose::{self, ProseCache};
 pub struct ConversationView {
     expanded_tools: std::collections::HashSet<String>,
     show_changes: bool,
+    /// Free-text inputs for pending question forms, keyed (form, field).
+    form_inputs: super::form_view::FormInputs,
     store: Entity<Store>,
     controller: Entity<Controller>,
     composer: Entity<Composer>,
@@ -49,6 +51,7 @@ impl ConversationView {
         Self {
             expanded_tools: Default::default(),
             show_changes: false,
+            form_inputs: Default::default(),
             store,
             controller,
             composer,
@@ -56,6 +59,72 @@ impl ConversationView {
             prose,
             _subs: subs,
         }
+    }
+
+    /// Create (or drop) the free-text inputs pending forms need, and keep
+    /// typed text synced into the form's draft so required-field gating and
+    /// submission see it.
+    fn sync_form_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> super::form_view::FormInputs {
+        // Collect what's needed up front: `cx` is mutably borrowed while
+        // entities are created.
+        let wanted_fields: Vec<(String, crate::api::model::FormField)> = {
+            let store = self.store.read(cx);
+            let mut out = Vec::new();
+            if let Some(sid) = store.selected.clone()
+                && let Some(forms) = store.forms.get(&sid)
+            {
+                for form in forms {
+                    for field in form.fields.iter() {
+                        if super::form_view::field_needs_input(field) {
+                            out.push((form.id.clone(), field.clone()));
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let mut wanted = super::form_view::FormInputs::new();
+        for (fid, field) in wanted_fields {
+            let k = (fid.clone(), field.key.clone());
+            if let Some(state) = self.form_inputs.get(&k) {
+                wanted.insert(k.clone(), state.clone());
+                continue;
+            }
+            let placeholder = field
+                .placeholder
+                .clone()
+                .unwrap_or_else(|| "Your answer…".into());
+            let state = cx.new(|cx| {
+                gpui_kit::component::input::InputState::new(window, cx).placeholder(placeholder)
+            });
+            // Typed text becomes the field's answer immediately.
+            let (form_id, key) = (fid.clone(), field.key.clone());
+            let sub = cx.subscribe_in(
+                &state,
+                window,
+                move |this, input, ev: &gpui_kit::component::input::InputEvent, _, cx| {
+                    if !matches!(ev, gpui_kit::component::input::InputEvent::Change) {
+                        return;
+                    }
+                    let text = input.read(cx).value().to_string();
+                    let (form_id, key) = (form_id.clone(), key.clone());
+                    this.controller.update(cx, |c, cx| {
+                        c.set_form_answer(form_id, key, serde_json::Value::String(text), cx);
+                    });
+                },
+            );
+            self._subs.push(sub);
+            self.form_inputs.insert(k.clone(), state.clone());
+            wanted.insert(k, state);
+        }
+        // Drop inputs of fields that are gone (form answered, cancelled, or
+        // snapshot without it).
+        self.form_inputs.retain(|k, _| wanted.contains_key(k));
+        wanted
     }
 
     fn row_count(&self, cx: &App) -> usize {
@@ -216,7 +285,7 @@ impl ConversationView {
 }
 
 impl Render for ConversationView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let store = self.store.read(cx);
         let notice = store.notice.clone();
@@ -224,6 +293,7 @@ impl Render for ConversationView {
         let title = session.map(|s| s.display_title());
         let folder = session.map(|s| folder_name(&s.directory));
         let has_selection = store.selected.is_some();
+        let form_inputs = self.sync_form_inputs(window, cx);
 
         let notice_bar = notice.map(|n| {
             h_flex()
@@ -321,6 +391,12 @@ impl Render for ConversationView {
                                 .w_full()
                                 .max_w(px(COLUMN_MAX_W))
                                 .gap_2()
+                                .child(super::form_view::render_forms(
+                                    self.store.read(cx),
+                                    &form_inputs,
+                                    self.controller.clone(),
+                                    cx,
+                                ))
                                 .child(super::permission::render_permissions(
                                     self.store.read(cx),
                                     self.controller.clone(),
