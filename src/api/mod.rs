@@ -1,19 +1,24 @@
-//! Thin wrapper over `opencode-codes`. Everything network-facing goes through
-//! here, and every future returned must run on the Tokio runtime (see
-//! [`Runtime`]), never on the GPUI foreground executor.
+//! The only place that talks HTTP. Every future here must run on the Tokio
+//! runtime (see [`Runtime`]), never on the GPUI foreground executor.
+//!
+//! ocdesk speaks opencode 2.x's API (`/api/*`, see `docs/protocol-notes.md`)
+//! through a thin reqwest client.
 
 pub mod events;
+pub mod model;
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
+use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedSender;
-use opencode_codes::http::BasicAuth;
-use opencode_codes::protocol_generated::types as oc;
-use opencode_codes::{OpencodeClient, RetryConfig};
+use reqwest::Method;
+use serde_json::{Value, json};
 
 use crate::sidecar::{Sidecar, USERNAME};
-pub use events::Event;
+pub use events::{Envelope, Event};
+pub use model::{Message, SessionInfo};
 
 /// Dedicated Tokio runtime for reqwest/SSE, on its own threads.
 pub struct Runtime(tokio::runtime::Runtime);
@@ -34,82 +39,318 @@ impl Runtime {
     }
 }
 
+/// The server sends a `: heartbeat` comment every ~10 s; silence for this
+/// long means the connection is dead even if TCP hasn't noticed.
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const SSE_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const SSE_BACKOFF_MAX: Duration = Duration::from_secs(5);
+const PAGE: usize = 200;
+
+/// Thin client over opencode 2.x's HTTP API (`/api/*`).
 #[derive(Clone)]
 pub struct Api {
-    client: OpencodeClient,
+    http: reqwest::Client,
+    base: String,
+    password: String,
 }
 
 impl Api {
     pub fn new(sidecar: &Sidecar) -> Result<Self> {
-        let client = OpencodeClient::builder()
-            .base_url(sidecar.base_url.clone())
-            .auth(BasicAuth::new(USERNAME, sidecar.password.clone()))
-            .timeout(Duration::from_secs(30))
-            .build()?;
-        Ok(Self { client })
+        Ok(Self {
+            http: reqwest::Client::builder().build()?,
+            base: sidecar.base_url.clone(),
+            password: sidecar.password.clone(),
+        })
     }
 
-    pub async fn create_session(&self, title: Option<String>) -> Result<oc::Session> {
-        let params: oc::SessionCreateParams =
-            serde_json::from_value(serde_json::json!({ "title": title }))?;
-        Ok(self.client.create_session(&params).await?)
+    fn req(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        self.http
+            .request(method, format!("{}{path}", self.base))
+            .basic_auth(USERNAME, Some(&self.password))
     }
 
-    pub async fn prompt_text(&self, session_id: &str, text: &str) -> Result<()> {
-        let params: oc::PromptAsyncParams = serde_json::from_value(serde_json::json!({
-            "parts": [{ "type": "text", "text": text }]
-        }))?;
-        Ok(self.client.prompt_async(session_id, &params).await?)
+    async fn send(&self, rb: reqwest::RequestBuilder) -> Result<Value> {
+        let resp = rb.timeout(Duration::from_secs(30)).send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            bail!(
+                "HTTP {status}: {}",
+                body.chars().take(300).collect::<String>()
+            );
+        }
+        if body.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        Ok(serde_json::from_str(&body)?)
     }
 
-    pub async fn messages(&self, session_id: &str) -> Result<Vec<oc::MessageWithParts>> {
-        Ok(self.client.list_messages(session_id).await?)
+    /// All sessions in every location, newest first (`GET /api/session`).
+    /// Sub-agent sessions are dropped.
+    pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut q = vec![("limit", PAGE.to_string()), ("order", "desc".to_string())];
+            if let Some(c) = &cursor {
+                q.push(("cursor", c.clone()));
+            }
+            let v = self
+                .send(self.req(Method::GET, "/api/session").query(&q))
+                .await?;
+            let page = v["data"].as_array().cloned().unwrap_or_default();
+            let n = page.len();
+            out.extend(
+                page.iter()
+                    .filter_map(SessionInfo::from_json)
+                    .filter(|s| s.parent_id.is_none()),
+            );
+            cursor = v
+                .pointer("/cursor/next")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if n < PAGE || cursor.is_none() {
+                return Ok(out);
+            }
+        }
     }
 
-    pub async fn abort(&self, session_id: &str) -> Result<bool> {
-        Ok(self.client.abort(session_id).await?)
+    /// `POST /api/session` pinned to `directory`.
+    pub async fn create_session(&self, directory: &Path) -> Result<SessionInfo> {
+        let body = json!({ "location": { "directory": directory } });
+        let v = self
+            .send(self.req(Method::POST, "/api/session").json(&body))
+            .await?;
+        SessionInfo::from_json(&v["data"])
+            .ok_or_else(|| anyhow!("unexpected session response: {v}"))
     }
 
-    /// Pump `GET /event` forever, forwarding normalized events. Reconnects with
-    /// backoff (handled by the SSE layer); every reconnect yields
-    /// [`Event::Connected`]. Returns when the receiver is dropped.
-    pub async fn run_events(&self, tx: UnboundedSender<Event>) -> Result<()> {
-        let retry = RetryConfig {
-            initial_interval: Duration::from_millis(250),
-            max_interval: Duration::from_secs(5),
-            factor: 2.0,
-            max_retries: None,
-        };
-        let mut stream = self.client.event_stream(retry)?;
-        while let Some(item) = stream.next().await {
-            let ev = match item {
-                Ok(ev) => {
-                    log_raw(&ev);
-                    Event::from_stream(ev)
-                }
-                Err(e) => {
-                    tracing::warn!("event stream error: {e}");
-                    continue;
-                }
-            };
-            if tx.unbounded_send(ev).is_err() {
+    /// `POST /api/session/{id}/prompt`. Returns once the input is admitted;
+    /// the turn itself is observed on the event stream.
+    pub async fn prompt(&self, session_id: &str, text: &str) -> Result<()> {
+        let body = json!({ "text": text });
+        self.send(
+            self.req(
+                Method::POST,
+                &format!("/api/session/{}/prompt", id(session_id)),
+            )
+            .json(&body),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Full history in chronological order (`GET /api/session/{id}/message`).
+    pub async fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
+        let mut raw = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut q = vec![("limit", PAGE.to_string()), ("order", "asc".to_string())];
+            if let Some(c) = &cursor {
+                q.push(("cursor", c.clone()));
+            }
+            let path = format!("/api/session/{}/message", id(session_id));
+            let v = self.send(self.req(Method::GET, &path).query(&q)).await?;
+            let page = v["data"].as_array().cloned().unwrap_or_default();
+            let n = page.len();
+            raw.extend(page);
+            cursor = v
+                .pointer("/cursor/next")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if n < PAGE || cursor.is_none() {
                 break;
             }
         }
+        let mut msgs: Vec<Message> = raw.iter().filter_map(Message::from_v2_json).collect();
+        msgs.sort_by(|a, b| a.id().cmp(b.id()));
+        Ok(msgs)
+    }
+
+    /// `POST /api/session/{id}/interrupt`. The turn ends with
+    /// `session.execution.interrupted {reason: "user"}`.
+    pub async fn interrupt(&self, session_id: &str) -> Result<()> {
+        self.send(self.req(
+            Method::POST,
+            &format!("/api/session/{}/interrupt", id(session_id)),
+        ))
+        .await?;
         Ok(())
+    }
+
+    /// Sessions currently running (`GET /api/session/active`); seeds busy
+    /// state after every (re)connect.
+    pub async fn active(&self) -> Result<Vec<String>> {
+        let v = self
+            .send(self.req(Method::GET, "/api/session/active"))
+            .await?;
+        Ok(v["data"]
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    /// Validate a folder and resolve its project (`GET /api/location`).
+    pub async fn location(&self, directory: &Path) -> Result<PathBuf> {
+        let v = self
+            .send(
+                self.req(Method::GET, "/api/location")
+                    .query(&[("location[directory]", directory)]),
+            )
+            .await?;
+        Ok(v["directory"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| directory.to_path_buf()))
+    }
+
+    /// `PATCH /api/session/{id}` → 204; confirmed by `session.renamed`.
+    pub async fn rename_session(&self, session_id: &str, title: &str) -> Result<()> {
+        let path = format!("/api/session/{}", id(session_id));
+        self.send(
+            self.req(Method::PATCH, &path)
+                .json(&json!({ "title": title })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `DELETE /api/session/{id}` → 204; confirmed by `session.deleted`.
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        let path = format!("/api/session/{}", id(session_id));
+        self.send(self.req(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    /// Pump `GET /api/event` (all locations) forever, forwarding decoded
+    /// envelopes. Every (re)connect yields [`Event::Connected`] and every
+    /// drop yields [`Event::Disconnected`], then reconnects with exponential
+    /// backoff. Returns when the receiver is dropped; the caller aborts the
+    /// task to stop it early.
+    pub async fn run_events(&self, tx: UnboundedSender<Envelope>) {
+        let mut backoff = SSE_BACKOFF_MIN;
+        loop {
+            match self.stream_once(&tx).await {
+                Ok(StreamEnd::ReceiverGone) => return,
+                Ok(StreamEnd::Dropped) => {
+                    backoff = SSE_BACKOFF_MIN;
+                    tracing::warn!(target: "sse", "event stream dropped");
+                }
+                Err(e) => tracing::warn!(target: "sse", "event stream connect failed: {e:#}"),
+            }
+            if tx
+                .unbounded_send(Envelope::bare(Event::Disconnected))
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(SSE_BACKOFF_MAX);
+        }
+    }
+
+    async fn stream_once(&self, tx: &UnboundedSender<Envelope>) -> Result<StreamEnd> {
+        let resp = self
+            .req(Method::GET, "/api/event")
+            .header("accept", "text/event-stream")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("GET /api/event returned {}", resp.status());
+        }
+        tracing::info!(target: "sse", "connected");
+        if tx.unbounded_send(Envelope::bare(Event::Connected)).is_err() {
+            return Ok(StreamEnd::ReceiverGone);
+        }
+        let mut body = resp.bytes_stream();
+        let mut parser = SseParser::default();
+        loop {
+            let chunk = match tokio::time::timeout(SSE_IDLE_TIMEOUT, body.next()).await {
+                Err(_) => {
+                    tracing::warn!(target: "sse", "no data for {SSE_IDLE_TIMEOUT:?}");
+                    return Ok(StreamEnd::Dropped);
+                }
+                Ok(None) => return Ok(StreamEnd::Dropped),
+                Ok(Some(Err(e))) => {
+                    tracing::warn!(target: "sse", "read error: {e}");
+                    return Ok(StreamEnd::Dropped);
+                }
+                Ok(Some(Ok(chunk))) => chunk,
+            };
+            for data in parser.push(&chunk) {
+                let Some(env) = Envelope::from_json(&data) else {
+                    tracing::warn!(target: "sse", "undecodable frame: {data}");
+                    continue;
+                };
+                if !matches!(&env.event, Event::Other(t) if t == "plugin.added" || t == "server.heartbeat")
+                {
+                    tracing::debug!(target: "sse", "{data}");
+                }
+                if tx.unbounded_send(env).is_err() {
+                    return Ok(StreamEnd::ReceiverGone);
+                }
+            }
+        }
     }
 }
 
-fn log_raw(ev: &opencode_codes::StreamEvent) {
-    use opencode_codes::StreamEvent as S;
-    match ev {
-        S::Connected => tracing::info!(target: "sse", "connected"),
-        S::Event(e) => tracing::debug!(
-            target: "sse",
-            "{}",
-            serde_json::to_string(e).unwrap_or_else(|err| format!("<unserializable: {err}>"))
-        ),
-        S::Unknown(v) => tracing::debug!(target: "sse", "unknown: {v}"),
-        other => tracing::debug!(target: "sse", "{other:?}"),
+enum StreamEnd {
+    Dropped,
+    ReceiverGone,
+}
+
+/// Session ids are `ses_` + base62; strip anything else before putting one
+/// in a path.
+fn id(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// Minimal SSE framing: collects `data:` lines until a blank line.
+#[derive(Default)]
+struct SseParser {
+    buf: Vec<u8>,
+    data: String,
+}
+
+impl SseParser {
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=nl).collect();
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.is_empty() {
+                if !self.data.is_empty() {
+                    out.push(std::mem::take(&mut self.data));
+                }
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                if !self.data.is_empty() {
+                    self.data.push('\n');
+                }
+                self.data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            }
+            // `event:`, `id:`, `retry:` and comments are not used by opencode.
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SseParser;
+
+    #[test]
+    fn sse_frames_split_across_chunks() {
+        let mut p = SseParser::default();
+        assert!(p.push(b"data: {\"a\":").is_empty());
+        assert_eq!(
+            p.push(b"1}\n\ndata: {\"b\":2}\r\n\r\n: comment\n"),
+            ["{\"a\":1}", "{\"b\":2}"]
+        );
+        assert!(p.push(b"data: x\n").is_empty());
+        assert_eq!(p.push(b"data: y\n\n"), ["x\ny"]);
     }
 }

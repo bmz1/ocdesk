@@ -18,9 +18,5 @@
     }
   },
   "model": "mock/mock-1",
-  "small_model": "mock/mock-1",
-  "permission": {
-    "bash": "ask",
-    "edit": "ask"
-  }
+  "small_model": "mock/mock-1"
 }

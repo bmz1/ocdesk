@@ -1,5 +1,8 @@
 mod api;
+mod controller;
+mod settings;
 mod sidecar;
+mod store;
 mod ui;
 
 use std::sync::OnceLock;
@@ -68,7 +71,7 @@ fn main() -> Result<()> {
                 async {}
             })
             .detach();
-            let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
+            let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
             let opts = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
@@ -77,9 +80,9 @@ fn main() -> Result<()> {
                 }),
                 ..Default::default()
             };
-            if let Err(e) =
-                gpui_kit::open_window(opts, cx, |_, cx| cx.new(|cx| AppView::new(rt, cx)))
-            {
+            if let Err(e) = gpui_kit::open_window(opts, cx, |window, cx| {
+                cx.new(|cx| AppView::new(rt, window, cx))
+            }) {
                 tracing::error!("failed to open window: {e:#}");
                 cx.quit();
             }

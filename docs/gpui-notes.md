@@ -31,7 +31,30 @@ the new Zed rev.
 - `QuitMode::Default` = Explicit on macOS, LastWindowClosed elsewhere.
 - `Button::disabled` comes from the `Disableable` trait (`gpui_kit::component::Disableable`).
 
+- **Chat list:** `gpui_component::message_scroller::{MessageScroller, MessageScrollerState}`
+  is a virtualized `gpui::list` with tail-following, a "Jump to latest" button
+  and a scrollbar. Keep its row count in sync with `splice` / `reset`, and call
+  `remeasure_items(i..i+1)` when one row's content changes (only the streaming
+  row is re-laid out).
+- **Multi-line input:** `TextareaState::new(window, cx).auto_grow(1, 10).submit_on_enter(true)`
+  emits `InputEvent::PressEnter { secondary: false, shift: false }` on Enter;
+  Shift+Enter inserts a newline.
+- **Dialogs:** `window.open_alert_dialog(cx, |alert, window, cx| alert.title(..).description(el).confirm().on_ok(..))`
+  (`WindowExt`). The builder re-runs on every rebuild, and the dialog steals
+  focus on open: focus an input only on the first run, guarded by a `Cell<bool>`.
+- **Menus:** `Button::dropdown_menu(|menu, _, _| menu.item(PopupMenuItem::new("Rename").on_click(..)))`.
+- Hover-revealed controls: `.group(name)` on the row, then
+  `.invisible().group_hover(name, |s| s.visible())` on the child.
+
 ## Surprises
+
+- Rows in a scrolling `v_flex` **shrink** below their `h_8()` once the list
+  overflows (flex-shrink); add `.flex_none()`.
+- `Button` centers its content and ignores `justify_start()`; for a
+  left-aligned sidebar item build an `h_flex` row with `.on_click` instead.
+- Not GPUI, but bit us: dropping a tokio `AbortHandle` does **not** cancel the
+  task. Call `.abort()`.
+- Under Xvfb the theme can't detect the system appearance and stays light.
 
 - Linux build needs `libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
   libvulkan-dev libx11-xcb-dev libxcb-xkb-dev libfontconfig-dev libssl-dev
@@ -42,3 +65,9 @@ the new Zed rev.
 - `.SystemUIFont` falls back to DejaVu Sans on a bare Linux box.
 - A clean build of the gpui stack takes ~10 min in this container; keep
   `[profile.dev.package."*"] opt-level = 2` so dependencies are fast in debug.
+- `cx.prompt_for_paths(PathPromptOptions { directories: true, .. })` is the
+  native folder picker. On Linux it goes through xdg-desktop-portal over
+  D-Bus; without a session bus it fails with a ZBus error, so ocdesk falls
+  back to a typed-path dialog.
+- Theme: `Theme::change(ThemeMode::Dark, Some(window), cx)` at startup;
+  `Theme::sync_system_appearance` + `observe_window_appearance` to follow the OS.
