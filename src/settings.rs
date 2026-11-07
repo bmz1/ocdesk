@@ -61,6 +61,54 @@ pub struct Settings {
     pub unread: BTreeSet<String>,
     /// Scope/file -> fingerprint of the reviewed patch.
     pub viewed: BTreeMap<String, u64>,
+    /// How much of each turn's work the transcript shows.
+    pub density: Density,
+    /// Sessions kept at the top of their folder, most recently pinned first.
+    pub pinned: Vec<String>,
+    /// Right-hand panel: open tab (`None`: closed) and width.
+    pub panel: Option<PanelTab>,
+    pub panel_width: Option<f32>,
+}
+
+/// Transcript density, cycled with Ctrl+O.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Density {
+    /// Work logs collapsed into one row per run; reasoning collapsed.
+    #[default]
+    Normal,
+    /// Work logs and reasoning expanded.
+    Verbose,
+    /// Successful tool calls and reasoning hidden; running, failed,
+    /// approvals and answers stay.
+    Quiet,
+}
+
+impl Density {
+    pub const ALL: [Self; 3] = [Self::Normal, Self::Verbose, Self::Quiet];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Verbose => "Verbose",
+            Self::Quiet => "Hide successful work",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::Verbose,
+            Self::Verbose => Self::Quiet,
+            Self::Quiet => Self::Normal,
+        }
+    }
+}
+
+/// Tabs of the right-hand panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PanelTab {
+    Changes,
+    Tasks,
+    Terminal,
 }
 
 impl Default for Settings {
@@ -82,6 +130,10 @@ impl Default for Settings {
             notifications: true,
             unread: BTreeSet::new(),
             viewed: BTreeMap::new(),
+            density: Density::Normal,
+            pinned: Vec::new(),
+            panel: None,
+            panel_width: None,
         }
     }
 }

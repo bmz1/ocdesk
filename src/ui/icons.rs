@@ -10,7 +10,23 @@ use gpui_kit::{AssetSource, Result, SharedString};
 gpui_kit::assets::icon_assets!(
     Extra,
     [
-        GitBranch, Pencil, Terminal, Slash, Plug, Sparkles, Layers, Workflow
+        GitBranch,
+        Pencil,
+        Terminal,
+        Slash,
+        Plug,
+        Sparkles,
+        Layers,
+        Workflow,
+        Brain,
+        CircleStop,
+        ListChecks,
+        GitFork,
+        Pin,
+        PinOff,
+        Archive,
+        MessageSquare,
+        Shield
     ]
 );
 
@@ -57,4 +73,31 @@ pub fn layers() -> Icon {
 }
 pub fn workflow() -> Icon {
     Icon::new(Lucide::Workflow)
+}
+pub fn brain() -> Icon {
+    Icon::new(Lucide::Brain)
+}
+pub fn circle_stop() -> Icon {
+    Icon::new(Lucide::CircleStop)
+}
+pub fn list_checks() -> Icon {
+    Icon::new(Lucide::ListChecks)
+}
+pub fn git_fork() -> Icon {
+    Icon::new(Lucide::GitFork)
+}
+pub fn pin() -> Icon {
+    Icon::new(Lucide::Pin)
+}
+pub fn pin_off() -> Icon {
+    Icon::new(Lucide::PinOff)
+}
+pub fn archive() -> Icon {
+    Icon::new(Lucide::Archive)
+}
+pub fn message_square() -> Icon {
+    Icon::new(Lucide::MessageSquare)
+}
+pub fn shield() -> Icon {
+    Icon::new(Lucide::Shield)
 }

@@ -77,6 +77,7 @@ fn turn(i: usize) -> [Message; 2] {
         ordinal: 0,
         text: reasoning.into(),
         done: true,
+        time: Default::default(),
     }];
     if i % 3 == 1 {
         blocks.push(Block::Tool(Box::new(ToolCall {
@@ -94,11 +95,14 @@ fn turn(i: usize) -> [Message; 2] {
         ordinal: 0,
         text: answer,
         done: true,
+        time: Default::default(),
     });
     [
         Message::User(UserMessage {
             id: id("msg", 2 * i),
             text: prompt.into(),
+            attachments: vec![],
+            meta: Default::default(),
         }),
         Message::Assistant(AssistantMessage {
             id: id("msg", 2 * i + 1),
@@ -106,6 +110,7 @@ fn turn(i: usize) -> [Message; 2] {
             completed: true,
             finish: Some("stop".into()),
             error: None,
+            meta: Default::default(),
         }),
     ]
 }
@@ -226,6 +231,7 @@ pub fn stream_reply(store: Entity<Store>, prompt: String, cx: &mut App) {
             session_id: sid(),
             message_id: user_id,
             text: prompt.clone(),
+            attachments: vec![],
         },
         cx,
     );
@@ -234,6 +240,8 @@ pub fn stream_reply(store: Entity<Store>, prompt: String, cx: &mut App) {
         Event::StepStarted {
             session_id: sid(),
             message_id: msg_id.clone(),
+            model: None,
+            agent: None,
         },
         cx,
     );
@@ -293,6 +301,8 @@ pub fn stream_reply(store: Entity<Store>, prompt: String, cx: &mut App) {
                     session_id: sid(),
                     message_id: msg_id.clone(),
                     finish: "stop".into(),
+                    tokens: None,
+                    cost: None,
                 },
                 cx,
             );

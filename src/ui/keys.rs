@@ -23,6 +23,21 @@ actions!(
         ShowShortcuts,
         OpenSettings,
         Quit,
+        CommandPalette,
+        FindInThread,
+        CycleDensity,
+        CyclePermissionMode,
+        ChooseModel,
+        CycleEffort,
+        FocusNextArea,
+        FocusPreviousArea,
+        NextSessionTab,
+        PreviousSessionTab,
+        RenameSession,
+        CopyLastReply,
+        ToggleTerminal,
+        ShowActivity,
+        PasteAsText,
     ]
 );
 
@@ -46,10 +61,89 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, &'static str)> {
             Box::new(ToggleTasks),
             "Background tasks (subagents, shells)",
         ),
+        ("secondary-k", Box::new(CommandPalette), "Command palette"),
+        (
+            "secondary-f",
+            Box::new(FindInThread),
+            "Find in conversation",
+        ),
+        (
+            "ctrl-o",
+            Box::new(CycleDensity),
+            "Transcript detail: normal / verbose / quiet",
+        ),
+        (
+            "secondary-shift-m",
+            Box::new(CyclePermissionMode),
+            "Next permission mode",
+        ),
+        ("secondary-shift-i", Box::new(ChooseModel), "Choose model…"),
+        (
+            "secondary-shift-e",
+            Box::new(CycleEffort),
+            "Next reasoning effort",
+        ),
+        ("f6", Box::new(FocusNextArea), "Focus next area"),
+        (
+            "shift-f6",
+            Box::new(FocusPreviousArea),
+            "Focus previous area",
+        ),
+        ("ctrl-tab", Box::new(NextSessionTab), "Next session"),
+        (
+            "ctrl-shift-tab",
+            Box::new(PreviousSessionTab),
+            "Previous session",
+        ),
+        ("f2", Box::new(RenameSession), "Rename session"),
+        (
+            "secondary-shift-c",
+            Box::new(CopyLastReply),
+            "Copy the last reply",
+        ),
+        ("ctrl-`", Box::new(ToggleTerminal), "Toggle terminal"),
+        (
+            "secondary-shift-a",
+            Box::new(ShowActivity),
+            "Sessions that need you",
+        ),
+        (
+            "secondary-shift-v",
+            Box::new(PasteAsText),
+            "Paste large text into the prompt (not as a file)",
+        ),
         ("secondary-/", Box::new(ShowShortcuts), "Keyboard shortcuts"),
         ("secondary-,", Box::new(OpenSettings), "Settings"),
         ("secondary-q", Box::new(Quit), "Quit"),
     ]
+}
+
+/// The shortcut for `action` as display text ("Ctrl+K", "⌘K"), honouring
+/// the user's overrides; `None` when unbound.
+pub fn shortcut_label(
+    action: &dyn Action,
+    overrides: &std::collections::BTreeMap<String, String>,
+    cx: &App,
+) -> Option<String> {
+    let name = action.name().to_string();
+    let (default, ..) = table().into_iter().find(|(_, a, _)| a.name() == name)?;
+    let key: String = overrides
+        .get(&name)
+        .cloned()
+        .unwrap_or_else(|| default.to_string());
+    // `Keystroke::parse` wants a `'static` str; a KeyBinding parses any.
+    let binding = KeyBinding::load(&key, action.boxed_clone(), None, false, None, cx).ok()?;
+    let stroke = binding.keystrokes().first()?.as_keystroke().clone();
+    Some(gpui_kit::component::kbd::Kbd::format(&stroke))
+}
+
+/// Every app action for the command palette, except the palette itself.
+pub fn palette_actions() -> Vec<(Box<dyn Action>, &'static str)> {
+    table()
+        .into_iter()
+        .filter(|(_, a, _)| a.name() != CommandPalette.name())
+        .map(|(_, a, label)| (a, label))
+        .collect()
 }
 
 pub fn editable() -> Vec<(String, String, &'static str)> {
@@ -123,7 +217,15 @@ pub fn bind(cx: &mut App) {
 const COMPOSER_KEYS: &[(&str, &str)] = &[
     ("Enter", "Send"),
     ("Shift+Enter", "New line"),
-    ("Esc", "Close the @ popup, else stop the running turn"),
+    (
+        "Esc",
+        "Close the @ popup, deny a pending approval, else stop the running turn (twice)",
+    ),
+    ("Enter (empty box)", "Allow a pending approval once"),
+    (
+        "Enter (with text)",
+        "Deny a pending approval with that text as feedback",
+    ),
     (
         "Up / Down",
         "Earlier / later prompts (at the start of the box)",
@@ -157,6 +259,12 @@ pub fn show_shortcuts(window: &mut Window, cx: &mut App) {
                         .child(keys.clone()),
                 )
         }));
-        dialog.title("Keyboard shortcuts").child(list)
+        dialog.title("Keyboard shortcuts").w(px(560.)).child(
+            div()
+                .id("shortcuts-scroll")
+                .max_h(px(520.))
+                .overflow_y_scroll()
+                .child(list),
+        )
     });
 }

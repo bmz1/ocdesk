@@ -7,13 +7,18 @@ pub mod frame_stats;
 pub mod git;
 pub mod icons;
 pub mod keys;
+pub mod kit;
 pub mod mention;
 pub mod message;
+pub mod palette;
 pub mod permission;
 pub mod prose;
+pub mod review;
 pub mod settings;
 pub mod sidebar;
 pub mod tasks;
+pub mod terminal;
+pub mod theme;
 pub mod tool_card;
 pub mod usage;
 

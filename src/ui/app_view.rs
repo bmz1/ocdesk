@@ -1,7 +1,7 @@
 //! Root layout: sidebar | conversation, app-wide shortcuts, and persistence
 //! of the window placement and sidebar.
 
-use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Theme, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -87,11 +87,7 @@ impl AppView {
             .ok()
             .or_else(|| settings.theme.clone());
 
-        match theme.as_deref() {
-            Some("light") => Theme::change(ThemeMode::Light, Some(window), cx),
-            Some("system") => Theme::sync_system_appearance(Some(window), cx),
-            _ => Theme::change(ThemeMode::Dark, Some(window), cx),
-        }
+        crate::ui::theme::apply(theme.as_deref(), window, cx);
         let sidebar_width = px(settings
             .sidebar_width
             .unwrap_or(SIDEBAR_W)
@@ -138,11 +134,7 @@ impl AppView {
                 let count = s.unread.len();
                 if theme != last_theme {
                     last_theme = theme.clone();
-                    match theme.as_deref() {
-                        Some("light") => Theme::change(ThemeMode::Light, Some(window), cx),
-                        Some("system") => Theme::sync_system_appearance(Some(window), cx),
-                        _ => Theme::change(ThemeMode::Dark, Some(window), cx),
-                    }
+                    crate::ui::theme::apply(theme.as_deref(), window, cx);
                 }
                 if count != last_badge {
                     last_badge = count;
@@ -199,6 +191,61 @@ impl AppView {
             self.controller.update(cx, |c, cx| {
                 c.update_settings(cx, |s| s.window = Some(placement))
             });
+        }
+    }
+
+    /// F6 / Shift+F6: sidebar → conversation → prompt → right panel,
+    /// skipping hidden areas, wrapping around.
+    fn focus_area(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Area {
+            Sidebar,
+            Transcript,
+            Composer,
+            Panel,
+        }
+        let mut areas = Vec::new();
+        if !self.sidebar_hidden {
+            areas.push(Area::Sidebar);
+        }
+        areas.push(Area::Transcript);
+        areas.push(Area::Composer);
+        if self.conversation.read(cx).panel_open(cx) {
+            areas.push(Area::Panel);
+        }
+        let current = if self
+            .sidebar
+            .read(cx)
+            .focus_handle()
+            .contains_focused(window, cx)
+        {
+            Some(Area::Sidebar)
+        } else {
+            self.conversation
+                .read(cx)
+                .focused_area(window, cx)
+                .map(|a| match a {
+                    crate::ui::conversation::Area::Transcript => Area::Transcript,
+                    crate::ui::conversation::Area::Composer => Area::Composer,
+                    crate::ui::conversation::Area::Panel => Area::Panel,
+                })
+        };
+        let n = areas.len() as isize;
+        let at = current
+            .and_then(|c| areas.iter().position(|a| *a == c))
+            .map_or(if delta > 0 { -1 } else { 0 }, |i| i as isize);
+        let next = areas[((at + delta).rem_euclid(n)) as usize];
+        match next {
+            Area::Sidebar => self.sidebar.update(cx, |s, cx| s.focus(window, cx)),
+            Area::Transcript => self.conversation.update(cx, |c, cx| {
+                c.focus_area(crate::ui::conversation::Area::Transcript, window, cx)
+            }),
+            Area::Composer => self.conversation.update(cx, |c, cx| {
+                c.focus_area(crate::ui::conversation::Area::Composer, window, cx)
+            }),
+            Area::Panel => self.conversation.update(cx, |c, cx| {
+                c.focus_area(crate::ui::conversation::Area::Panel, window, cx)
+            }),
         }
     }
 
@@ -292,16 +339,105 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &keys::StopTurn, _, cx| {
                 this.controller.update(cx, |c, cx| c.abort_if_busy(cx));
             }))
-            .on_action(cx.listener(|this, _: &keys::ToggleChanges, _, cx| {
-                this.conversation.update(cx, |c, cx| c.toggle_changes(cx));
+            .on_action(cx.listener(|this, _: &keys::ToggleChanges, window, cx| {
+                this.conversation
+                    .update(cx, |c, cx| c.toggle_changes(window, cx));
             }))
-            .on_action(cx.listener(|this, _: &keys::ToggleTasks, _, cx| {
-                this.conversation.update(cx, |c, cx| c.toggle_tasks(cx));
+            .on_action(cx.listener(|this, _: &keys::ToggleTasks, window, cx| {
+                this.conversation
+                    .update(cx, |c, cx| c.toggle_tasks(window, cx));
             }))
             .on_action(cx.listener(|this, _: &keys::OpenSettings, window, cx| {
                 crate::ui::settings::open(this.controller.clone(), window, cx)
             }))
             .on_action(|_: &keys::ShowShortcuts, window, cx| keys::show_shortcuts(window, cx))
+            .on_action(cx.listener(|this, _: &keys::CommandPalette, window, cx| {
+                crate::ui::palette::open(
+                    this.controller.clone(),
+                    crate::ui::palette::Mode::All,
+                    window,
+                    cx,
+                )
+            }))
+            .on_action(cx.listener(|this, _: &keys::ChooseModel, window, cx| {
+                crate::ui::palette::open(
+                    this.controller.clone(),
+                    crate::ui::palette::Mode::Models,
+                    window,
+                    cx,
+                )
+            }))
+            .on_action(cx.listener(|this, _: &keys::FindInThread, window, cx| {
+                this.conversation
+                    .update(cx, |c, cx| c.open_find(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::CycleDensity, window, cx| {
+                let msg = this.controller.update(cx, |c, cx| c.cycle_density(cx));
+                crate::ui::kit::toast(window, cx, msg, None);
+            }))
+            .on_action(
+                cx.listener(|this, _: &keys::CyclePermissionMode, window, cx| {
+                    let msg = this
+                        .controller
+                        .update(cx, |c, cx| c.cycle_permission_mode(cx));
+                    crate::ui::kit::toast(window, cx, msg, None);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &keys::CycleEffort, window, cx| {
+                let msg = this.controller.update(cx, |c, cx| c.cycle_effort(cx));
+                crate::ui::kit::toast(window, cx, msg, None);
+            }))
+            .on_action(cx.listener(|this, _: &keys::NextSessionTab, _, cx| {
+                this.controller.update(cx, |c, cx| c.select_adjacent(1, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::PreviousSessionTab, _, cx| {
+                this.controller
+                    .update(cx, |c, cx| c.select_adjacent(-1, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::CopyLastReply, window, cx| {
+                let text = this.controller.read(cx).last_reply(cx);
+                let msg = match text {
+                    Some(t) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(t));
+                        "Copied the last reply"
+                    }
+                    None => "No reply to copy",
+                };
+                crate::ui::kit::toast(window, cx, msg, None);
+            }))
+            .on_action(cx.listener(|this, _: &keys::RenameSession, window, cx| {
+                let store = this.controller.read(cx).view_store();
+                let s = store.read(cx);
+                if let Some(session) = s.selected.as_ref().and_then(|id| s.session(id)) {
+                    let (id, title) = (session.id.clone(), session.display_title());
+                    crate::ui::sidebar::Sidebar::open_rename(
+                        this.controller.clone(),
+                        id,
+                        title,
+                        window,
+                        cx,
+                    );
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keys::ShowActivity, _, cx| {
+                if this.sidebar_hidden {
+                    this.toggle_sidebar(cx);
+                }
+                this.sidebar.update(cx, |s, cx| s.toggle_activity(cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::ToggleTerminal, window, cx| {
+                this.conversation.update(cx, |c, cx| {
+                    c.toggle_panel(crate::settings::PanelTab::Terminal, window, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, _: &keys::FocusNextArea, window, cx| {
+                this.focus_area(1, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &keys::FocusPreviousArea, window, cx| {
+                    this.focus_area(-1, window, cx);
+                }),
+            )
             .on_action(|_: &keys::Quit, _, cx| cx.quit())
             .on_drag_move(
                 cx.listener(|this, e: &DragMoveEvent<SidebarResize>, _, cx| {

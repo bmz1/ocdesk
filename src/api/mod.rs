@@ -7,6 +7,7 @@
 pub mod events;
 pub mod features;
 pub mod model;
+pub mod pty;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -293,17 +294,18 @@ impl Api {
         session_id: &str,
         request_id: &str,
         decision: model::PermissionDecision,
+        message: Option<&str>,
     ) -> Result<()> {
         let path = format!(
             "/api/session/{}/permission/{}/reply",
             id(session_id),
             id(request_id)
         );
-        self.send(
-            self.req(Method::POST, &path)
-                .json(&json!({"decision": decision.as_str()})),
-        )
-        .await?;
+        let mut body = json!({"decision": decision.as_str()});
+        if let Some(m) = message.filter(|m| !m.trim().is_empty()) {
+            body["message"] = m.into();
+        }
+        self.send(self.req(Method::POST, &path).json(&body)).await?;
         Ok(())
     }
 
@@ -401,6 +403,17 @@ impl Api {
         Ok(())
     }
 
+    /// `PATCH /api/session/{id}` `{archived}`: archive or restore.
+    pub async fn set_archived(&self, session_id: &str, archived: bool) -> Result<()> {
+        let path = format!("/api/session/{}", id(session_id));
+        self.send(
+            self.req(Method::PATCH, &path)
+                .json(&json!({ "archived": archived })),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// `DELETE /api/session/{id}` → 204; confirmed by `session.deleted`.
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
         let path = format!("/api/session/{}", id(session_id));
@@ -448,6 +461,40 @@ impl Api {
         let path = format!("/api/session/{}/compact", id(session_id));
         self.send(self.req(Method::POST, &path).json(&json!({})))
             .await?;
+        Ok(())
+    }
+
+    /// `POST /api/session/{id}/fork`: a new session with the messages before
+    /// `before` (all of them when `None`).
+    pub async fn fork_session(
+        &self,
+        session_id: &str,
+        before: Option<&str>,
+    ) -> Result<SessionInfo> {
+        let path = format!("/api/session/{}/fork", id(session_id));
+        let v = self
+            .send(
+                self.req(Method::POST, &path)
+                    .json(&json!({ "before": before })),
+            )
+            .await?;
+        SessionInfo::from_json(&v["data"]).ok_or_else(|| anyhow!("unexpected fork response: {v}"))
+    }
+
+    /// Roll a session back to before `message_id`, including its file
+    /// changes: stage the revert, then commit it.
+    pub async fn revert_to(&self, session_id: &str, message_id: &str) -> Result<()> {
+        let base = format!("/api/session/{}/revert", id(session_id));
+        self.send(
+            self.req(Method::POST, &format!("{base}/stage"))
+                .json(&json!({ "messageID": message_id, "files": true })),
+        )
+        .await?;
+        self.send(
+            self.req(Method::POST, &format!("{base}/commit"))
+                .json(&json!({})),
+        )
+        .await?;
         Ok(())
     }
 
@@ -887,14 +934,14 @@ mod tests {
             ),
         ]);
         assert_eq!(api.permissions("ses_a").await.unwrap()[0].id, "perm_a");
-        api.reply_permission("ses_a", "perm_a", PermissionDecision::Once)
+        api.reply_permission("ses_a", "perm_a", PermissionDecision::Once, None)
             .await
             .unwrap();
-        api.reply_permission("ses_a", "perm_a", PermissionDecision::Always)
+        api.reply_permission("ses_a", "perm_a", PermissionDecision::Always, None)
             .await
             .unwrap();
         assert!(
-            api.reply_permission("ses_a", "perm_a", PermissionDecision::Reject)
+            api.reply_permission("ses_a", "perm_a", PermissionDecision::Reject, None)
                 .await
                 .is_err()
         );
