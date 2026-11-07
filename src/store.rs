@@ -372,7 +372,14 @@ impl Store {
 
     /// The catalog of the folder the composer targets.
     pub fn target_catalog(&self) -> Option<&Catalog> {
-        self.catalogs.get(&self.target_folder()?)
+        self.catalogs.get(&self.catalog_folder()?)
+    }
+
+    /// The sidebar folder whose catalog and `/` menu apply to the target
+    /// folder (a worktree uses its repository's).
+    pub fn catalog_folder(&self) -> Option<PathBuf> {
+        let dir = self.target_folder()?;
+        Some(self.folder_of(&dir).unwrap_or(dir))
     }
 
     /// The model the next prompt runs with: the selected session's, else the

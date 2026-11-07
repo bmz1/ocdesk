@@ -592,20 +592,34 @@ impl Api {
             .ok_or_else(|| anyhow!("unexpected worktree response: {v}"))
     }
 
-    /// `DELETE /api/worktree`. Without `force`, a dirty worktree fails with
-    /// `forceRequired`.
+    /// `DELETE /api/worktree`. Without `force`, a worktree with changes is
+    /// refused with [`WorktreeDirty`] (the server's `forceRequired: true`).
     pub async fn remove_worktree(
         &self,
         project_id: &str,
         directory: &Path,
         force: bool,
     ) -> Result<()> {
-        self.send(
-            self.req(Method::DELETE, "/api/worktree")
-                .json(&json!({ "projectID": project_id, "directory": directory, "force": force })),
-        )
-        .await?;
-        Ok(())
+        let resp = self
+            .req(Method::DELETE, "/api/worktree")
+            .json(&json!({ "projectID": project_id, "directory": directory, "force": force }))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        if body.pointer("/data/forceRequired") == Some(&Value::Bool(true)) {
+            return Err(WorktreeDirty.into());
+        }
+        let msg = body
+            .pointer("/data/message")
+            .or_else(|| body.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        bail!("HTTP {status}: {msg}")
     }
 
     /// Re-pin a session to another directory (e.g. a worktree).
@@ -742,6 +756,18 @@ impl SseParser {
         out
     }
 }
+
+/// A worktree has uncommitted changes; removing it needs `force`.
+#[derive(Debug)]
+pub struct WorktreeDirty;
+
+impl std::fmt::Display for WorktreeDirty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the worktree has uncommitted changes")
+    }
+}
+
+impl std::error::Error for WorktreeDirty {}
 
 fn array(v: &Value) -> Result<&Vec<Value>> {
     v.as_array()

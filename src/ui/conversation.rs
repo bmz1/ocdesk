@@ -1,6 +1,8 @@
 //! The main column: header, virtualized message list, status line, composer.
 //! With no session selected it shows a centered Codex-style start screen.
 
+use std::path::PathBuf;
+
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
@@ -229,6 +231,20 @@ impl ConversationView {
         let store = self.store.read(cx);
         let folders = store.folders.clone();
         let current = store.target_folder();
+        // Each folder followed by its worktrees ("  ⎇ feature-x · branch").
+        let choices: Vec<(PathBuf, String)> = folders
+            .iter()
+            .flat_map(|f| {
+                std::iter::once((f.clone(), folder_name(f))).chain(
+                    store.worktrees.get(f).into_iter().flatten().map(|w| {
+                        (
+                            w.clone(),
+                            format!("   ⎇ {}", super::git::checkout_label(store, w)),
+                        )
+                    }),
+                )
+            })
+            .collect();
         let controller = self.controller.clone();
 
         let chooser = if folders.is_empty() {
@@ -248,10 +264,10 @@ impl ConversationView {
                 .small()
                 .dropdown_caret(true)
                 .dropdown_menu(move |mut menu, _, _| {
-                    for f in &folders {
+                    for (f, label) in &choices {
                         let (c, f2) = (controller.clone(), f.clone());
                         menu = menu.item(
-                            PopupMenuItem::new(folder_name(f))
+                            PopupMenuItem::new(label.clone())
                                 .checked(current.as_ref() == Some(f))
                                 .on_click(move |_, _, cx| {
                                     let f = f2.clone();
@@ -445,6 +461,7 @@ impl Render for ConversationView {
         let title = session.map(|s| s.display_title());
         let folder = session.map(|s| folder_name(&s.directory));
         let has_selection = store.selected.is_some();
+        let branch_pill = super::git::branch_pill(&self.store, &self.controller, cx);
         let store_running = store
             .selected
             .as_ref()
@@ -603,13 +620,9 @@ impl Render for ConversationView {
                         el.child(div().text_color(theme.muted_foreground).child(f))
                             .child(div().text_color(theme.muted_foreground).child("/"))
                     })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(title.unwrap_or_default()),
-                    )
+                    .child(div().min_w_0().truncate().child(title.unwrap_or_default()))
+                    .children(branch_pill)
+                    .child(div().flex_1())
                     .when(has_selection, |el| {
                         let running = store_running;
                         el.child(

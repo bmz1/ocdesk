@@ -251,8 +251,8 @@ impl Composer {
         if let Some((name, rest)) = mention::parse_command(&text) {
             let store = self.store.read(cx);
             let known = store
-                .tooling
-                .get(&folder)
+                .catalog_folder()
+                .and_then(|f| store.tooling.get(&f))
                 .is_some_and(|t| t.commands.iter().any(|c| c.name == name));
             let (name, rest) = (name.to_string(), rest.to_string());
             if known || (name == "compact" && rest.is_empty()) {
@@ -450,11 +450,9 @@ impl Composer {
         let Some(folder) = self.store.read(cx).target_folder() else {
             return;
         };
-        let agents: Vec<MentionItem> = self
-            .store
-            .read(cx)
-            .catalogs
-            .get(&folder)
+        let catalog_folder = self.store.read(cx).catalog_folder();
+        let agents: Vec<MentionItem> = catalog_folder
+            .and_then(|f| self.store.read(cx).catalogs.get(&f))
             .map(|c| {
                 c.agents
                     .iter()
@@ -584,7 +582,7 @@ impl Composer {
     fn open_slash(&mut self, query: String, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
         let tooling = store
-            .target_folder()
+            .catalog_folder()
             .and_then(|f| store.tooling.get(&f).cloned())
             .unwrap_or_default();
         let has_session = store.selected.is_some();

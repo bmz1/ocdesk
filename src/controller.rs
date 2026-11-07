@@ -602,6 +602,85 @@ impl Controller {
         );
     }
 
+    // ── git worktrees ───────────────────────────────────────────────────
+
+    /// Create a worktree of `folder`'s project and open a new session in it.
+    pub fn create_worktree(&mut self, folder: PathBuf, name: String, cx: &mut Context<Self>) {
+        let Some(project) = self.store.read(cx).projects.get(&folder).cloned() else {
+            self.notice(format!("{} is not a git repository", folder.display()), cx);
+            return;
+        };
+        let Some(api) = self.api(cx) else { return };
+        self.run(
+            cx,
+            async move {
+                let dir = api.create_worktree(&project, name.trim()).await?;
+                // Register the new checkout as a location before using it.
+                api.location(&dir).await?;
+                Ok(dir)
+            },
+            move |this, res, cx| match res {
+                Ok(dir) => {
+                    this.refresh_folder_info(folder, cx);
+                    this.new_session(Some(dir), cx);
+                }
+                Err(e) => this.notice(format!("Could not create the worktree: {e:#}"), cx),
+            },
+        );
+    }
+
+    /// Remove a worktree. Without `force`, a dirty checkout is refused;
+    /// `on_needs_force` is then called so the UI can ask.
+    pub fn remove_worktree(
+        &mut self,
+        folder: PathBuf,
+        dir: PathBuf,
+        force: bool,
+        on_needs_force: impl FnOnce(&mut gpui_kit::App) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.store.read(cx).projects.get(&folder).cloned() else {
+            return;
+        };
+        let Some(api) = self.api(cx) else { return };
+        let target = dir.clone();
+        self.run(
+            cx,
+            async move { api.remove_worktree(&project, &target, force).await },
+            move |this, res, cx| match res {
+                Ok(()) => {
+                    if this.store.read(cx).target_folder().as_ref() == Some(&dir) {
+                        this.new_session(Some(folder.clone()), cx);
+                    }
+                    this.refresh_folder_info(folder, cx);
+                }
+                Err(e) if !force && e.is::<crate::api::WorktreeDirty>() => on_needs_force(cx),
+                Err(e) => this.notice(format!("Could not remove the worktree: {e:#}"), cx),
+            },
+        );
+    }
+
+    /// Re-pin the selected session to another checkout of its project.
+    pub fn move_session(&mut self, sid: String, dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else { return };
+        let target = dir.clone();
+        self.run(
+            cx,
+            async move {
+                api.location(&target).await?;
+                api.move_session(&sid, &target).await
+            },
+            move |this, res, cx| match res {
+                // The server confirms with a session update; re-read the list.
+                Ok(()) => {
+                    this.store.update(cx, |s, cx| s.set_current_folder(dir, cx));
+                    this.refresh_sessions(cx);
+                }
+                Err(e) => this.notice(format!("Could not move the session: {e:#}"), cx),
+            },
+        );
+    }
+
     // ── background tasks: subagents and shells ──────────────────────────
 
     /// Re-read a session's subagent sessions and its folder's shells.
