@@ -55,6 +55,8 @@ pub struct FindState {
 
 pub struct ConversationView {
     find: Option<FindState>,
+    /// The todo pill shows its checklist.
+    todos_open: bool,
     expanded_tools: std::collections::HashSet<String>,
     tool_scrolls: super::tool_card::ScrollHandles,
     /// Open right-panel tab.
@@ -115,6 +117,7 @@ impl ConversationView {
         }));
         Self {
             find: None,
+            todos_open: false,
             tasks,
             panel: prefs.panel,
             panel_width: px(prefs
@@ -961,6 +964,7 @@ impl Render for ConversationView {
                                     self.controller.clone(),
                                     cx,
                                 ))
+                                .children(self.render_todos(cx))
                                 .child(super::permission::render_permissions(
                                     self.store.read(cx),
                                     self.controller.clone(),
@@ -1157,6 +1161,26 @@ impl Render for ConversationView {
 }
 
 impl ConversationView {
+    /// The agent's todo progress above the prompt.
+    fn render_todos(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        let busy = store.selected.as_ref().is_some_and(|id| store.is_busy(id));
+        let todos = super::todos::session_todos(&store.selected_conversation()?.messages);
+        let view = cx.entity().downgrade();
+        super::todos::pill(
+            &todos,
+            self.todos_open,
+            busy,
+            move |_, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.todos_open = !this.todos_open;
+                    cx.notify();
+                });
+            },
+            cx,
+        )
+    }
+
     /// Header meter: context ring, tokens and cost; opens usage details.
     fn render_usage(&self, cx: &mut Context<Self>) -> AnyElement {
         let store = self.store.read(cx);

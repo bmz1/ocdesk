@@ -242,6 +242,10 @@ items that depend on server behaviour are marked *unverified live*.
 | — | macOS transparent title bar, traffic-light inset, drag region, menu bar, Dock reopen | Done; *unverified on a Mac* |
 | — | `ui/kit` components, opencode tokens, Inter / IBM Plex Mono, syntect highlighting | Done: code fences, diffs (review panel, approvals, edit cards; both sides highlighted as continuous text), file reads (line-number gutters left plain) and written file content |
 
+Follow-ups: todo progress (pill above the prompt, checklist rows for
+`todowrite`, from the latest completed call, as opencode's own app does) and
+image thumbnails with a full-size viewer, in the transcript and composer.
+
 ## 5. Not recommended
 
 - Porting to Rune today: pre-release, no PRs, weekly API churn, IME still the

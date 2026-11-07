@@ -141,9 +141,39 @@ impl Composer {
             .id("attachment-chips")
             .gap_1()
             .flex_wrap()
+            .items_center()
             .max_h(px(120.))
             .overflow_y_scroll();
         for (i, path) in self.attachments.iter().enumerate() {
+            let remove = cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if i < this.attachments.len() {
+                    this.attachments.remove(i);
+                }
+                cx.notify();
+            });
+            if crate::ui::images::is_image(path) {
+                row = row.child(
+                    div()
+                        .relative()
+                        .child(crate::ui::images::thumbnail(
+                            SharedString::from(format!("attachment-thumb-{i}")),
+                            path,
+                            48.,
+                            cx,
+                        ))
+                        .child(
+                            div().absolute().top(px(2.)).right(px(2.)).child(
+                                Button::new(SharedString::from(format!("attachment-rm-{i}")))
+                                    .icon(gpui_kit::component::IconName::Close)
+                                    .xsmall()
+                                    .tooltip("Remove")
+                                    .on_click(remove),
+                            ),
+                        ),
+                );
+                continue;
+            }
             let label = path
                 .file_name()
                 .unwrap_or_default()
@@ -157,12 +187,7 @@ impl Composer {
                     .tooltip(path.display().to_string())
                     .outline()
                     .xsmall()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if i < this.attachments.len() {
-                            this.attachments.remove(i);
-                        }
-                        cx.notify();
-                    })),
+                    .on_click(remove),
             );
         }
         if self.attachment_writes > 0 {

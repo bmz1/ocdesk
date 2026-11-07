@@ -6,6 +6,7 @@ pub mod form_view;
 pub mod frame_stats;
 pub mod git;
 pub mod icons;
+pub mod images;
 pub mod keys;
 pub mod kit;
 pub mod mention;
@@ -20,6 +21,7 @@ pub mod syntax;
 pub mod tasks;
 pub mod terminal;
 pub mod theme;
+pub mod todos;
 pub mod tool_card;
 pub mod usage;
 

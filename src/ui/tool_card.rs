@@ -137,6 +137,55 @@ fn task_row(
     )
 }
 
+/// A `todowrite` call: "Updated todos · 2/5 done", opening into the list
+/// it set.
+fn todo_row(t: &ToolCall, message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let todos = super::todos::of_call(t);
+    let (done, total) = super::todos::progress(&todos);
+    let key = key(message_id, &t.call_id);
+    let open = ctx.is_open(&key);
+    let toggle = ctx.toggle.clone();
+    let click_key = key.clone();
+    let label = match (t.status, total) {
+        (ToolStatus::Error, _) => "Couldn't update the todo list".to_string(),
+        (_, 0) => "Cleared the todo list".to_string(),
+        _ => format!("Updated todos · {done}/{total} done"),
+    };
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(
+            h_flex()
+                .id(SharedString::from(format!("todo-{key}")))
+                .gap_1p5()
+                .items_center()
+                .text_sm()
+                .text_color(if t.status == ToolStatus::Error {
+                    theme.danger
+                } else {
+                    theme.muted_foreground
+                })
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.foreground))
+                .on_click(move |_, _, cx| toggle(click_key.clone(), cx))
+                .child(super::icons::list_checks().xsmall())
+                .child(label)
+                .when(total > 0, |el| el.child(super::todos::bar(done, total, cx)))
+                .when(total > 0, |el| el.child(chevron(open))),
+        )
+        .when(open && total > 0, |el| {
+            el.child(
+                div()
+                    .pl_3()
+                    .border_l_1()
+                    .border_color(theme.border)
+                    .child(super::todos::checklist(&todos, cx)),
+            )
+        })
+        .into_any_element()
+}
+
 pub fn key(message_id: &str, call_id: &str) -> String {
     format!("{message_id}/{call_id}")
 }
@@ -162,6 +211,11 @@ pub fn render_tools(
     };
     for t in tools {
         if hidden_in(t, ctx.density) && t.name != "subagent" {
+            continue;
+        }
+        if t.name == "todowrite" {
+            flush(&mut run, &mut out);
+            out.push(todo_row(t, message_id, ctx, cx));
             continue;
         }
         if let Some(row) = task_row(t, message_id, ctx.open_task, cx) {
