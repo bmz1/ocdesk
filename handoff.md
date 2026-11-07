@@ -61,8 +61,10 @@ XDG_CONFIG_HOME=$PWD/dev/xdg cargo run -- /some/git/repo
 
 **Without opencode** (e.g. when npm installs are blocked): `OCDESK_DEMO=<turns>`
 runs the UI on synthetic history and streams replies locally (README,
-*Developing*). M2 was verified only this way: the sandbox refused to install
-`@opencode/cli`, so **M2 has not been run against a real opencode server**.
+*Developing*). M2 was mostly verified this way; after the owner approved the
+`@opencode/cli@2.2.6` install it was also run against the real server: a
+`rich` prompt (mock model) renders fully, `OCDESK_VERIFY_ON_IDLE` logs
+`verify: store matches REST`, and `dev/teardown-test.sh` passes 5/5.
 Under Xvfb rendering also needs `mesa-vulkan-drivers` (else "Failed to create
 surface"); `xclip -o -selection clipboard` checks copy.
 
@@ -111,8 +113,8 @@ Data flow: view → `Controller` intent → `Api` on Tokio → result back via
 ## Next steps
 
 **M2 leftovers**
-- Run M2 against real opencode 2.2.6 (only demo mode was exercised) and on
-  macOS (primary target, nothing has run there yet). Measure frame times on
+- Run M2 on macOS (primary target, nothing has run there yet). On Linux it
+  has run against real opencode 2.2.6 (one `rich` turn, verify + teardown). Measure frame times on
   real hardware with `OCDESK_FRAME_LOG=1` in a release build.
 - No syntax highlighting in code blocks: gpui-kit's `syntect` feature
   (or gpui-component's tree-sitter languages) would plug into `TextView`
