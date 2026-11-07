@@ -178,7 +178,7 @@ Data flow: view → `Controller` intent → `Api` on Tokio → result back via
 - Changes displays the latest turn's per-file patches (`context=3`), counts,
   server truncation and copy. Refresh during a turn; an opened view refreshes
   when the turn ends. It is not a full-session/repository diff.
-- `form.*` questions remain unimplemented (separate from permissions).
+- `form.*` questions are implemented in M4 (`ui/form_view.rs`), separate from permissions.
 - The mock write tool now sends `path`, as required by 2.2.6, rather than the
   old `filePath` argument. `dev/m3-protocol-test.py` checks real once/always/
   reject permission flow, restoring pending requests and an edit diff in a
