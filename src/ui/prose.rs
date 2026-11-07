@@ -237,14 +237,15 @@ mod tests {
                     text: "think".into(),
                     done: true,
                 },
-                Block::Tool(ToolCall {
+                Block::Tool(Box::new(ToolCall {
                     call_id: "c".into(),
                     name: "bash".into(),
                     status: ToolStatus::Completed,
                     input: serde_json::Value::Null,
                     output: String::new(),
                     error: None,
-                }),
+                    metadata: serde_json::Value::Null,
+                })),
                 Block::Prose {
                     kind: BlockKind::Text,
                     ordinal: 0,

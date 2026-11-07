@@ -16,6 +16,8 @@ use crate::ui::message::{COLUMN_MAX_W, render_message};
 use crate::ui::prose::{self, ProseCache};
 
 pub struct ConversationView {
+    expanded_tools: std::collections::HashSet<String>,
+    show_changes: bool,
     store: Entity<Store>,
     controller: Entity<Controller>,
     composer: Entity<Composer>,
@@ -39,9 +41,14 @@ impl ConversationView {
             .map_or(0, |c| c.messages.len());
         let scroller = cx.new(|cx| MessageScrollerState::new(rows, cx));
         let prose = cx.new(|_| ProseCache::new(store.clone(), scroller.clone()));
-        let subs = vec![cx.subscribe_in(&store, window, Self::on_store_event)];
+        let subs = vec![
+            cx.subscribe_in(&store, window, Self::on_store_event),
+            cx.observe(&store, |_, _, cx| cx.notify()),
+        ];
         Composer::focus(&composer, window, cx);
         Self {
+            expanded_tools: Default::default(),
+            show_changes: false,
             store,
             controller,
             composer,
@@ -69,6 +76,8 @@ impl ConversationView {
         let is_selected = |sid: &String| selected.as_ref() == Some(sid);
         match ev {
             StoreEvent::SelectionChanged | StoreEvent::FoldersChanged => {
+                self.show_changes = false;
+                self.expanded_tools.clear();
                 if matches!(ev, StoreEvent::SelectionChanged) {
                     self.prose.update(cx, |p, _| p.clear());
                 }
@@ -246,6 +255,25 @@ impl Render for ConversationView {
             self.render_start(cx).into_any_element()
         } else {
             let store = self.store.clone();
+            let expanded = self.expanded_tools.clone();
+            let view = cx.entity().downgrade();
+            let toggle: super::tool_card::ToggleTool = std::rc::Rc::new(move |key, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    let index = this.store.read(cx).selected_conversation().and_then(|c| {
+                        c.messages
+                            .iter()
+                            .position(|m| key.starts_with(&format!("{}/", m.id())))
+                    });
+                    if !this.expanded_tools.remove(&key) {
+                        this.expanded_tools.insert(key);
+                    }
+                    if let Some(i) = index {
+                        this.scroller
+                            .update(cx, |s, cx| s.remeasure_items(i..i + 1, cx));
+                    }
+                    cx.notify();
+                });
+            });
             let cache = self.prose.clone();
             let list = MessageScroller::new("messages", self.scroller.clone(), move |ix, _, cx| {
                 prose::sync_row(&store, &cache, ix, cx);
@@ -253,7 +281,7 @@ impl Render for ConversationView {
                 let row = s
                     .selected_conversation()
                     .and_then(|c| c.messages.get(ix))
-                    .map(|m| render_message(m, &cache, cx))
+                    .map(|m| render_message(m, &cache, &expanded, toggle.clone(), cx))
                     .unwrap_or_else(|| div().into_any_element());
                 h_flex()
                     .w_full()
@@ -263,9 +291,24 @@ impl Render for ConversationView {
                     .child(div().w_full().max_w(px(COLUMN_MAX_W)).child(row))
             })
             .with_bottom_fade(theme.background);
+            let content = if self.show_changes {
+                div()
+                    .id("changes-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .p_6()
+                    .child(super::changes::render_changes(
+                        self.store.read(cx),
+                        self.controller.clone(),
+                        cx,
+                    ))
+                    .into_any_element()
+            } else {
+                list.into_any_element()
+            };
             v_flex()
                 .size_full()
-                .child(div().flex_1().min_h_0().child(list))
+                .child(div().flex_1().min_h_0().child(content))
                 .child(
                     h_flex()
                         .w_full()
@@ -278,6 +321,11 @@ impl Render for ConversationView {
                                 .w_full()
                                 .max_w(px(COLUMN_MAX_W))
                                 .gap_2()
+                                .child(super::permission::render_permissions(
+                                    self.store.read(cx),
+                                    self.controller.clone(),
+                                    cx,
+                                ))
                                 .children(self.render_status(cx))
                                 .child(self.composer.clone()),
                         ),
@@ -301,7 +349,34 @@ impl Render for ConversationView {
                         el.child(div().text_color(theme.muted_foreground).child(f))
                             .child(div().text_color(theme.muted_foreground).child("/"))
                     })
-                    .child(div().truncate().child(title.unwrap_or_default())),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(title.unwrap_or_default()),
+                    )
+                    .when(has_selection, |el| {
+                        el.child(
+                            Button::new("toggle-changes")
+                                .label(if self.show_changes {
+                                    "Conversation"
+                                } else {
+                                    "Changes"
+                                })
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_changes = !this.show_changes;
+                                    if this.show_changes
+                                        && let Some(sid) = this.store.read(cx).selected.clone()
+                                    {
+                                        this.controller.update(cx, |c, cx| c.refresh_diff(sid, cx));
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
             .children(notice_bar)
             .child(div().flex_1().min_h_0().child(body))
