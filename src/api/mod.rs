@@ -5,6 +5,7 @@
 //! through a thin reqwest client.
 
 pub mod events;
+pub mod features;
 pub mod model;
 
 use std::path::{Path, PathBuf};
@@ -131,6 +132,7 @@ impl Api {
     /// `POST /api/session/{id}/prompt`. Returns once the input is admitted;
     /// the turn itself is observed on the event stream.
     pub async fn prompt(&self, session_id: &str, input: &model::PromptInput) -> Result<()> {
+        input.validate_attachments()?;
         self.send(
             self.req(
                 Method::POST,

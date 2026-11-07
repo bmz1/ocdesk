@@ -268,6 +268,7 @@ mod tests {
         let user = Message::User(UserMessage {
             id: "u1".into(),
             text: "hello".into(),
+            attachments: vec![],
         });
         let got: Vec<_> = prose_blocks(&user).map(|(k, t)| (k.slot, t)).collect();
         assert_eq!(got, vec![(Slot::User, "hello")]);

@@ -62,6 +62,11 @@ pub enum Event {
     },
     /// Models, agents or providers changed (config edit, login, …).
     CatalogChanged,
+    UsageUpdated {
+        session_id: String,
+        tokens: Value,
+        cost: f64,
+    },
     /// The session started working on its inbox.
     ExecutionStarted {
         session_id: String,
@@ -126,6 +131,7 @@ pub enum Event {
         session_id: String,
         message_id: String,
         text: String,
+        attachments: Vec<super::model::Attachment>,
     },
     StepStarted {
         session_id: String,
@@ -286,6 +292,11 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
         },
         // Config changes: the model/agent lists may have changed.
         "model.updated" | "agent.updated" | "provider.updated" => Event::CatalogChanged,
+        "session.usage.updated" => Event::UsageUpdated {
+            session_id: sid()?,
+            tokens: d.get("tokens")?.clone(),
+            cost: d.get("cost").and_then(Value::as_f64).unwrap_or(0.),
+        },
         "session.renamed" => Event::SessionRenamed {
             session_id: sid()?,
             title: str_at(d, "/title")?,

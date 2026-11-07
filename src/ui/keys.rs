@@ -21,6 +21,7 @@ actions!(
         ToggleChanges,
         ToggleTasks,
         ShowShortcuts,
+        OpenSettings,
         Quit,
     ]
 );
@@ -46,23 +47,76 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, &'static str)> {
             "Background tasks (subagents, shells)",
         ),
         ("secondary-/", Box::new(ShowShortcuts), "Keyboard shortcuts"),
+        ("secondary-,", Box::new(OpenSettings), "Settings"),
         ("secondary-q", Box::new(Quit), "Quit"),
     ]
 }
 
-pub fn bind(cx: &mut App) {
-    let bindings: Vec<KeyBinding> = table()
+pub fn editable() -> Vec<(String, String, &'static str)> {
+    table()
         .into_iter()
-        .map(|(keys, action, _)| KeyBinding::load(keys, action, None, false, None, cx))
-        .filter_map(|b| match b {
-            Ok(b) => Some(b),
-            Err(e) => {
-                tracing::error!("bad key binding: {e:#}");
-                None
+        .map(|(key, action, label)| (action.name().to_string(), key.to_string(), label))
+        .collect()
+}
+pub fn validate(
+    overrides: &std::collections::BTreeMap<String, String>,
+    cx: &App,
+) -> anyhow::Result<Vec<KeyBinding>> {
+    let mut seen = std::collections::HashSet::new();
+    table()
+        .into_iter()
+        .filter_map(|(default, action, _)| {
+            let key = overrides
+                .get(action.name())
+                .map(String::as_str)
+                .unwrap_or(default);
+            if key.trim().is_empty() {
+                return None;
             }
+            let result = KeyBinding::load(key, action, None, false, None, cx)
+                .map_err(anyhow::Error::from)
+                .and_then(|b| {
+                    // Compare resolved keystrokes as well (Cmd vs secondary, whitespace).
+                    let normalized = b
+                        .keystrokes()
+                        .iter()
+                        .map(|k| format!("{k:?}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !seen.insert(normalized) {
+                        anyhow::bail!("Duplicate shortcut: {key}");
+                    }
+                    Ok(b)
+                });
+            Some(result)
         })
+        .collect()
+}
+pub fn apply(
+    overrides: &std::collections::BTreeMap<String, String>,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    let bindings = validate(overrides, cx)?;
+    let names: std::collections::HashSet<_> =
+        editable().into_iter().map(|(name, _, _)| name).collect();
+    let retained: Vec<_> = cx
+        .key_bindings()
+        .borrow()
+        .bindings()
+        .filter(|b| !names.contains(b.action().name()))
+        .cloned()
         .collect();
+    cx.clear_key_bindings();
+    cx.bind_keys(retained);
     cx.bind_keys(bindings);
+    Ok(())
+}
+pub fn bind(cx: &mut App) {
+    let prefs = crate::settings::Settings::load();
+    if let Err(e) = apply(&prefs.keybindings, cx) {
+        tracing::warn!("invalid saved shortcuts: {e:#}");
+        let _ = apply(&Default::default(), cx);
+    }
 }
 
 /// Composer-local keys that aren't actions of ours, for the sheet.

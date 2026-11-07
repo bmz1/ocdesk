@@ -26,7 +26,7 @@ pub fn render_message(
     let mut keys = prose_blocks(msg);
 
     let a = match msg {
-        Message::User(_) => {
+        Message::User(user) => {
             let body = keys
                 .next()
                 .and_then(|(k, _)| prose.state(&k).map(|s| markdown(&k, s)));
@@ -34,7 +34,8 @@ pub fn render_message(
                 .w_full()
                 .justify_end()
                 .child(
-                    div()
+                    v_flex()
+                        .gap_1()
                         .max_w(relative(0.8))
                         .min_w_0()
                         .px_4()
@@ -42,7 +43,30 @@ pub fn render_message(
                         .rounded_2xl()
                         .bg(theme.secondary)
                         .text_color(theme.secondary_foreground)
-                        .children(body),
+                        .children(body)
+                        .children(user.attachments.iter().map(|a| {
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!(
+                                    "{} {}",
+                                    if a.path()
+                                        .and_then(|p| p
+                                            .extension()
+                                            .map(|s| s.to_string_lossy().to_lowercase()))
+                                        .is_some_and(|e| [
+                                            "png", "jpg", "jpeg", "webp", "gif", "svg", "bmp",
+                                            "tiff"
+                                        ]
+                                        .contains(&e.as_str()))
+                                    {
+                                        "Image:"
+                                    } else {
+                                        "File:"
+                                    },
+                                    a.name
+                                ))
+                        })),
                 )
                 .into_any_element();
         }

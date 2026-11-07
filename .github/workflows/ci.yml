@@ -65,6 +65,9 @@ jobs:
       - name: Protocol smoke test (permissions, diffs)
         run: python3 dev/m3-protocol-test.py "$(command -v opencode2)"
 
+      - name: Desktop feature protocol tests
+        run: python3 dev/desktop-features-test.py "$(command -v opencode2)"
+
       - name: Sidecar teardown test
         run: |
           Xvfb :99 -screen 0 1400x900x24 &
