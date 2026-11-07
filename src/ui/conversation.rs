@@ -169,25 +169,14 @@ impl ConversationView {
         let theme = cx.theme();
         let s = self.store.read(cx);
         let sid = s.selected.as_ref()?;
-        if s.selected_conversation().is_some_and(|c| c.legacy) {
-            return Some(
-                h_flex()
-                    .gap_1p5()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(Icon::new(IconName::Info).xsmall())
-                    .child("Created by an older opencode client: read-only here. Start a new session to continue.")
-                    .into_any_element(),
-            );
-        }
-        if let Some((attempt, message)) = s.retry.get(sid) {
+        if let Some(message) = s.retry.get(sid) {
             return Some(
                 h_flex()
                     .gap_1p5()
                     .text_sm()
                     .text_color(theme.warning)
                     .child(Icon::new(IconName::TriangleAlert).xsmall())
-                    .child(format!("Retrying (attempt {attempt}): {message}"))
+                    .child(format!("Retrying: {message}"))
                     .into_any_element(),
             );
         }

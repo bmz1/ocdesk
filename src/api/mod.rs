@@ -1,9 +1,8 @@
 //! The only place that talks HTTP. Every future here must run on the Tokio
 //! runtime (see [`Runtime`]), never on the GPUI foreground executor.
 //!
-//! ocdesk targets opencode's **v2** API (`/api/*`, see
-//! `docs/protocol-notes.md`). We use a thin reqwest client instead of
-//! `opencode-codes`, whose client wraps the v1 routes.
+//! ocdesk speaks opencode 2.x's API (`/api/*`, see `docs/protocol-notes.md`)
+//! through a thin reqwest client.
 
 pub mod events;
 pub mod model;
@@ -40,16 +39,14 @@ impl Runtime {
     }
 }
 
-/// The server sends `server.heartbeat` about every 10-15 s; silence for this
+/// The server sends a `: heartbeat` comment every ~10 s; silence for this
 /// long means the connection is dead even if TCP hasn't noticed.
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SSE_BACKOFF_MIN: Duration = Duration::from_millis(250);
 const SSE_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const PAGE: usize = 200;
 
-/// Thin client over opencode's **v2** HTTP API (`/api/*`). The few
-/// operations v2 doesn't expose yet (rename, delete, legacy history) use the
-/// v1 routes; each is marked `v1`.
+/// Thin client over opencode 2.x's HTTP API (`/api/*`).
 #[derive(Clone)]
 pub struct Api {
     http: reqwest::Client,
@@ -131,7 +128,7 @@ impl Api {
     /// `POST /api/session/{id}/prompt`. Returns once the input is admitted;
     /// the turn itself is observed on the event stream.
     pub async fn prompt(&self, session_id: &str, text: &str) -> Result<()> {
-        let body = json!({ "prompt": { "text": text } });
+        let body = json!({ "text": text });
         self.send(
             self.req(
                 Method::POST,
@@ -144,13 +141,7 @@ impl Api {
     }
 
     /// Full history in chronological order (`GET /api/session/{id}/message`).
-    /// Falls back to the v1 history for sessions created through the v1 API,
-    /// which have no v2 projection; the bool says whether that happened.
-    pub async fn messages(
-        &self,
-        session_id: &str,
-        directory: &Path,
-    ) -> Result<(Vec<Message>, bool)> {
+    pub async fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let mut raw = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -171,30 +162,13 @@ impl Api {
                 break;
             }
         }
-        if raw.is_empty() {
-            // v1 (legacy) session?
-            let path = format!("/session/{}/message", id(session_id));
-            let v = self
-                .send(
-                    self.req(Method::GET, &path)
-                        .query(&[("directory", directory)]),
-                )
-                .await?;
-            let legacy: Vec<Message> = v
-                .as_array()
-                .map(|a| a.iter().filter_map(model::message_from_v1_json).collect())
-                .unwrap_or_default();
-            if !legacy.is_empty() {
-                return Ok((legacy, true));
-            }
-        }
         let mut msgs: Vec<Message> = raw.iter().filter_map(Message::from_v2_json).collect();
         msgs.sort_by(|a, b| a.id().cmp(b.id()));
-        Ok((msgs, false))
+        Ok(msgs)
     }
 
     /// `POST /api/session/{id}/interrupt`. The turn ends with
-    /// `session.next.step.failed` ("Provider turn interrupted").
+    /// `session.execution.interrupted {reason: "user"}`.
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {
         self.send(self.req(
             Method::POST,
@@ -204,8 +178,8 @@ impl Api {
         Ok(())
     }
 
-    /// Sessions currently running (`GET /api/session/active`). v2 has no
-    /// idle/busy event, so this seeds busy state after every (re)connect.
+    /// Sessions currently running (`GET /api/session/active`); seeds busy
+    /// state after every (re)connect.
     pub async fn active(&self) -> Result<Vec<String>> {
         let v = self
             .send(self.req(Method::GET, "/api/session/active"))
@@ -230,31 +204,21 @@ impl Api {
             .unwrap_or_else(|| directory.to_path_buf()))
     }
 
-    /// v1 `PATCH /session/{id}`: v2 has no rename yet.
-    pub async fn rename_session(
-        &self,
-        session_id: &str,
-        directory: &Path,
-        title: &str,
-    ) -> Result<()> {
-        let path = format!("/session/{}", id(session_id));
+    /// `PATCH /api/session/{id}` → 204; confirmed by `session.renamed`.
+    pub async fn rename_session(&self, session_id: &str, title: &str) -> Result<()> {
+        let path = format!("/api/session/{}", id(session_id));
         self.send(
             self.req(Method::PATCH, &path)
-                .query(&[("directory", directory)])
                 .json(&json!({ "title": title })),
         )
         .await?;
         Ok(())
     }
 
-    /// v1 `DELETE /session/{id}`: v2 has no delete yet.
-    pub async fn delete_session(&self, session_id: &str, directory: &Path) -> Result<()> {
-        let path = format!("/session/{}", id(session_id));
-        self.send(
-            self.req(Method::DELETE, &path)
-                .query(&[("directory", directory)]),
-        )
-        .await?;
+    /// `DELETE /api/session/{id}` → 204; confirmed by `session.deleted`.
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        let path = format!("/api/session/{}", id(session_id));
+        self.send(self.req(Method::DELETE, &path)).await?;
         Ok(())
     }
 

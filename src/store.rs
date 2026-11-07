@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::{Context, EventEmitter};
 
+use crate::api::events::Outcome;
 use crate::api::model::{
     AssistantMessage, Block, BlockKind, Message, SessionInfo, ToolCall, ToolStatus, UserMessage,
 };
@@ -39,8 +40,6 @@ pub struct Conversation {
     /// True once the REST history has been fetched. Events for conversations
     /// that are not loaded are dropped; they are fetched on selection.
     pub loaded: bool,
-    /// Created through the v1 API: no v2 history, shown read-only.
-    pub legacy: bool,
     /// Highest durable sequence number folded in.
     pub last_seq: Option<u64>,
 }
@@ -107,7 +106,7 @@ pub struct Store {
     pub sessions: Vec<SessionInfo>,
     pub selected: Option<String>,
     pub busy: HashSet<String>,
-    pub retry: HashMap<String, (u64, String)>,
+    pub retry: HashMap<String, String>,
     /// Last error per session, cleared when a new prompt is sent.
     pub errors: HashMap<String, String>,
     pub conversations: HashMap<String, Conversation>,
@@ -248,14 +247,8 @@ impl Store {
 
     /// Replace a conversation with the authoritative REST projection,
     /// merging so that text streamed after the snapshot was taken survives.
-    pub fn reconcile(
-        &mut self,
-        session_id: &str,
-        history: Vec<Message>,
-        legacy: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let events = self.reconcile_inner(session_id, history, legacy);
+    pub fn reconcile(&mut self, session_id: &str, history: Vec<Message>, cx: &mut Context<Self>) {
+        let events = self.reconcile_inner(session_id, history);
         self.emit_all(events, cx);
     }
 
@@ -304,18 +297,33 @@ impl Store {
         match &env.event {
             Event::SessionUpserted(s) => {
                 if s.parent_id.is_none() {
+                    let title = self
+                        .session(&s.id)
+                        .map(|old| old.title.clone())
+                        .unwrap_or_default();
                     self.sessions.retain(|x| x.id != s.id);
+                    let mut s = s.clone();
+                    if s.title.is_empty() {
+                        s.title = title;
+                    }
                     let pos = self
                         .sessions
                         .iter()
                         .position(|x| x.updated <= s.updated)
                         .unwrap_or(self.sessions.len());
-                    self.sessions.insert(pos, s.clone());
+                    self.sessions.insert(pos, s);
                     out.push(StoreEvent::SessionsChanged);
                 }
                 return out;
             }
-            Event::SessionDeleted { session_id } => {
+            Event::SessionRenamed { session_id, title } => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| &s.id == session_id) {
+                    s.title = title.clone();
+                    out.push(StoreEvent::SessionsChanged);
+                }
+                return out;
+            }
+            Event::SessionRemoved { session_id } => {
                 self.sessions.retain(|x| &x.id != session_id);
                 self.conversations.remove(session_id);
                 self.busy.remove(session_id);
@@ -326,32 +334,28 @@ impl Store {
                 }
                 return out;
             }
-            Event::Prompted { session_id, .. } | Event::StepStarted { session_id, .. } => {
-                out.extend(self.set_busy_inner(session_id, true));
+            Event::ExecutionStarted { session_id } => {
+                self.errors.remove(session_id);
+                return self.set_busy_inner(session_id, true);
             }
-            Event::StepEnded {
-                session_id, finish, ..
-            } if finish != "tool-calls" => {
-                out.extend(self.set_busy_inner(session_id, false));
-            }
-            Event::StepFailed {
-                session_id, error, ..
+            Event::ExecutionEnded {
+                session_id,
+                outcome,
             } => {
-                out.extend(self.set_busy_inner(session_id, false));
-                if error != "Provider turn interrupted" {
+                if let Outcome::Failed { error } = outcome {
                     self.errors.insert(session_id.clone(), error.clone());
                 }
+                return self.set_busy_inner(session_id, false);
             }
-            Event::Retried {
+            Event::RetryScheduled {
                 session_id,
-                attempt,
                 message,
             } => {
-                self.retry
-                    .insert(session_id.clone(), (*attempt, message.clone()));
+                self.retry.insert(session_id.clone(), message.clone());
                 out.push(StoreEvent::StatusChanged {
                     session_id: session_id.clone(),
                 });
+                return out;
             }
             _ => {}
         }
@@ -380,7 +384,7 @@ impl Store {
         };
 
         match env.event {
-            Event::Prompted {
+            Event::UserPrompt {
                 message_id, text, ..
             } => {
                 if let Err(index) = conv.index_of(&message_id) {
@@ -403,34 +407,34 @@ impl Store {
             Event::BlockStarted {
                 message_id,
                 kind,
-                block_id,
+                ordinal,
                 ..
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
-                prose_mut(msg, kind, &block_id);
+                prose_mut(msg, kind, ordinal);
                 out.push(changed(index, inserted));
             }
             Event::BlockDelta {
                 message_id,
                 kind,
-                block_id,
+                ordinal,
                 delta,
                 ..
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
-                let (text, _) = prose_mut(msg, kind, &block_id);
+                let (text, _) = prose_mut(msg, kind, ordinal);
                 text.push_str(&delta);
                 out.push(changed(index, inserted));
             }
             Event::BlockEnded {
                 message_id,
                 kind,
-                block_id,
+                ordinal,
                 text: full,
                 ..
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
-                let (text, done) = prose_mut(msg, kind, &block_id);
+                let (text, done) = prose_mut(msg, kind, ordinal);
                 *text = full;
                 *done = true;
                 out.push(changed(index, inserted));
@@ -448,13 +452,11 @@ impl Store {
             Event::ToolCalled {
                 message_id,
                 call_id,
-                name,
                 input,
                 ..
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
                 let t = tool_mut(msg, &call_id);
-                t.name = name;
                 t.input = input;
                 t.status = ToolStatus::Running;
                 out.push(changed(index, inserted));
@@ -496,6 +498,7 @@ impl Store {
             } => {
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
                 msg.completed = true;
+                msg.finish = Some("error".into());
                 msg.error = Some(error);
                 out.push(changed(index, inserted));
             }
@@ -508,7 +511,6 @@ impl Store {
         &mut self,
         session_id: &str,
         history: Vec<Message>,
-        legacy: bool,
     ) -> Vec<StoreEvent> {
         let conv = self
             .conversations
@@ -533,7 +535,6 @@ impl Store {
         merged.sort_by(|a, b| a.id().cmp(b.id()));
         conv.messages = merged;
         conv.loaded = true;
-        conv.legacy = legacy;
         vec![StoreEvent::MessagesReset {
             session_id: session_id.to_string(),
         }]
@@ -542,7 +543,7 @@ impl Store {
 
 fn event_session(e: &Event) -> Option<&str> {
     Some(match e {
-        Event::Prompted { session_id, .. }
+        Event::UserPrompt { session_id, .. }
         | Event::StepStarted { session_id, .. }
         | Event::BlockStarted { session_id, .. }
         | Event::BlockDelta { session_id, .. }
@@ -557,18 +558,18 @@ fn event_session(e: &Event) -> Option<&str> {
     })
 }
 
-fn prose_mut<'a>(
-    msg: &'a mut AssistantMessage,
+fn prose_mut(
+    msg: &mut AssistantMessage,
     kind: BlockKind,
-    block_id: &str,
-) -> (&'a mut String, &'a mut bool) {
+    ordinal: u64,
+) -> (&mut String, &mut bool) {
     let pos = msg.blocks.iter().position(
-        |b| matches!(b, Block::Prose { kind: k, id, .. } if *k == kind && id == block_id),
+        |b| matches!(b, Block::Prose { kind: k, ordinal: o, .. } if *k == kind && *o == ordinal),
     );
     let pos = pos.unwrap_or_else(|| {
         msg.blocks.push(Block::Prose {
             kind,
-            id: block_id.to_string(),
+            ordinal,
             text: String::new(),
             done: false,
         });
@@ -624,12 +625,16 @@ fn same_block(a: &Block, b: &Block) -> bool {
     match (a, b) {
         (
             Block::Prose {
-                kind: ka, id: ia, ..
+                kind: ka,
+                ordinal: oa,
+                ..
             },
             Block::Prose {
-                kind: kb, id: ib, ..
+                kind: kb,
+                ordinal: ob,
+                ..
             },
-        ) => ka == kb && ia == ib,
+        ) => ka == kb && oa == ob,
         (Block::Tool(x), Block::Tool(y)) => x.call_id == y.call_id,
         _ => false,
     }
@@ -639,8 +644,6 @@ fn same_block(a: &Block, b: &Block) -> bool {
 mod tests {
     use super::*;
 
-    const SID: &str = "ses_e4a80e891ffeMVuHnRk3ssjEfA";
-
     fn fixture() -> Vec<Envelope> {
         include_str!("../tests/fixtures/v2-events.jsonl")
             .lines()
@@ -648,17 +651,20 @@ mod tests {
             .collect()
     }
 
-    fn loaded_store() -> Store {
-        let mut s = Store::default();
-        s.reconcile_inner(SID, vec![], false);
-        s
+    fn sid() -> String {
+        fixture()
+            .into_iter()
+            .find_map(|e| match e.event {
+                Event::SessionUpserted(s) => Some(s.id),
+                _ => None,
+            })
+            .unwrap()
     }
 
-    fn assistant(s: &Store, i: usize) -> &AssistantMessage {
-        match &s.conversations[SID].messages[i] {
-            Message::Assistant(a) => a,
-            m => panic!("expected assistant, got {m:?}"),
-        }
+    fn loaded_store() -> Store {
+        let mut s = Store::default();
+        s.reconcile_inner(&sid(), vec![]);
+        s
     }
 
     fn summary(m: &Message) -> Vec<String> {
@@ -671,6 +677,7 @@ mod tests {
                     Block::Prose { text, .. } => text.clone(),
                     Block::Tool(t) => format!("{}:{:?}:{}", t.name, t.status, t.output),
                 })
+                .chain(a.error.clone())
                 .collect(),
         }
     }
@@ -681,62 +688,87 @@ mod tests {
         for env in fixture() {
             s.apply_inner(env);
         }
-        // The REST projection of the same session, captured after the first
-        // two turns (the fixture then has an interrupted third turn).
+        // The REST projection of the same session after both turns (the
+        // second was interrupted by the user).
         let v: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/v2-messages.json")).unwrap();
-        let mut rest: Vec<Message> = v["data"]
+        let rest: Vec<Message> = v["data"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(Message::from_v2_json)
             .collect();
-        rest.sort_by(|a, b| a.id().cmp(b.id()));
-        let live = &s.conversations[SID].messages;
-        assert!(live.len() > rest.len());
+        let live = &s.conversations[&sid()].messages;
+        assert_eq!(live.len(), rest.len());
         for (l, r) in live.iter().zip(&rest) {
             assert_eq!(l.id(), r.id());
             assert_eq!(summary(l), summary(r));
         }
-        assert!(!s.is_busy(SID));
-        assert!(!s.errors.contains_key(SID), "an interrupt is not an error");
+        assert!(!s.is_busy(&sid()));
+        assert!(
+            !s.errors.contains_key(&sid()),
+            "an interrupt is not an error"
+        );
+        assert!(
+            !s.session(&sid()).unwrap().title.is_empty(),
+            "session.renamed sets the title"
+        );
     }
 
     #[test]
-    fn busy_follows_steps() {
+    fn busy_follows_execution_lifecycle() {
         let mut s = loaded_store();
-        let mut saw_busy_after_tool_step = false;
+        let mut busy_during_tool = false;
         for env in fixture() {
             let tool_step =
                 matches!(&env.event, Event::StepEnded { finish, .. } if finish == "tool-calls");
             s.apply_inner(env);
             if tool_step {
-                saw_busy_after_tool_step = s.is_busy(SID);
+                busy_during_tool = s.is_busy(&sid());
             }
         }
         assert!(
-            saw_busy_after_tool_step,
-            "a tool-calls step keeps the session busy"
+            busy_during_tool,
+            "busy until session.execution.* ends the turn"
         );
+        assert!(!s.is_busy(&sid()));
     }
 
     #[test]
-    fn events_for_unloaded_sessions_only_touch_status() {
+    fn events_for_unloaded_sessions_only_touch_session_state() {
         let mut s = Store::default();
         for env in fixture().into_iter().take(12) {
             s.apply_inner(env);
         }
-        assert!(!s.conversations.contains_key(SID));
-        assert!(s.is_busy(SID));
+        assert!(!s.conversations.contains_key(&sid()));
+        assert!(s.is_busy(&sid()));
         assert_eq!(s.sessions.len(), 1);
+    }
+
+    #[test]
+    fn failed_execution_records_error() {
+        let mut s = loaded_store();
+        let id = sid();
+        s.apply_inner(Envelope::bare(Event::ExecutionStarted {
+            session_id: id.clone(),
+        }));
+        s.apply_inner(Envelope::bare(Event::ExecutionEnded {
+            session_id: id.clone(),
+            outcome: Outcome::Failed {
+                error: "Model not found".into(),
+            },
+        }));
+        assert!(!s.is_busy(&id));
+        assert_eq!(s.errors[&id], "Model not found");
     }
 
     #[test]
     fn reconcile_keeps_local_text_that_extends_snapshot() {
         let mut s = loaded_store();
+        let id = sid();
         let block = |t: &str| Block::Prose {
             kind: BlockKind::Text,
-            id: "text-0".into(),
+            ordinal: 0,
             text: t.into(),
             done: false,
         };
@@ -747,15 +779,15 @@ mod tests {
                 ..Default::default()
             })
         };
-        s.reconcile_inner(SID, vec![msg("Hello wor")], false);
-        s.reconcile_inner(SID, vec![msg("Hello")], false);
-        assert!(
-            matches!(&assistant(&s, 0).blocks[0], Block::Prose { text, .. } if text == "Hello wor")
-        );
-        s.reconcile_inner(SID, vec![msg("Hello world")], false);
-        assert!(
-            matches!(&assistant(&s, 0).blocks[0], Block::Prose { text, .. } if text == "Hello world")
-        );
+        let text = |s: &Store| match &s.conversations[&id].messages[0] {
+            Message::Assistant(a) => summary(&Message::Assistant(a.clone()))[0].clone(),
+            _ => unreachable!(),
+        };
+        s.reconcile_inner(&id, vec![msg("Hello wor")]);
+        s.reconcile_inner(&id, vec![msg("Hello")]);
+        assert_eq!(text(&s), "Hello wor");
+        s.reconcile_inner(&id, vec![msg("Hello world")]);
+        assert_eq!(text(&s), "Hello world");
     }
 
     #[test]

@@ -1,86 +1,47 @@
 {
  "data": [
   {
-   "id": "msg_1b57f1e7e001jtt9AZOCHVbmnS",
+   "id": "msg_1b593a8a600142fsZBeZgFbpqo",
    "time": {
-    "created": 1794046369406,
-    "completed": 1794046370059
+    "created": 1794047715509
    },
-   "type": "assistant",
-   "agent": "build",
-   "model": {
-    "id": "mock-1",
-    "providerID": "mock",
-    "variant": "default"
-   },
-   "content": [
-    {
-     "type": "reasoning",
-     "id": "reasoning-0",
-     "text": "Thinking about the tool output.",
-     "time": {
-      "created": 1794046369410,
-      "completed": 1794046369569
-     }
-    },
-    {
-     "type": "text",
-     "id": "text-0",
-     "text": "The tool finished. Output was:\n\n```\nhello-from-bash\nopencode.json\n\nCommand exited with code 0.\n```\n"
-    }
-   ],
-   "snapshot": {
-    "start": "b6348aaef47e615edf6f2bd73ce518f521d1ffeb",
-    "end": "b6348aaef47e615edf6f2bd73ce518f521d1ffeb",
-    "files": []
-   },
-   "finish": "stop",
-   "cost": 0,
-   "tokens": {
-    "input": 10,
-    "output": 20,
-    "reasoning": 0,
-    "cache": {
-     "read": 0,
-     "write": 0
-    }
-   }
+   "text": "tool:bash please",
+   "type": "user"
   },
   {
-   "id": "msg_1b57f197b001HtL7G8cQFhKz1e",
+   "id": "msg_1b593a8c7001ZCrybzFU5eAiN8",
    "time": {
-    "created": 1794046368123,
-    "completed": 1794046369087
+    "created": 1794047715534,
+    "streamed": 1794047716032,
+    "completed": 1794047716054
    },
    "type": "assistant",
    "agent": "build",
    "model": {
     "id": "mock-1",
-    "providerID": "mock",
-    "variant": "default"
+    "providerID": "mock"
    },
    "content": [
     {
      "type": "reasoning",
-     "id": "reasoning-0",
      "text": "I should run a command.",
+     "native": {
+      "reasoningField": "reasoning_content"
+     },
      "time": {
-      "created": 1794046368126,
-      "completed": 1794046368271
+      "created": 1794047715557,
+      "completed": 1794047716024
      }
     },
     {
      "type": "text",
-     "id": "text-0",
      "text": "Running a command.\n"
     },
     {
      "type": "tool",
-     "id": "call_1794046368360",
-     "name": "bash",
-     "provider": {
-      "executed": false
-     },
+     "id": "call_1794047715780",
+     "name": "shell",
+     "executed": false,
      "state": {
       "status": "completed",
       "input": {
@@ -90,32 +51,29 @@
       "content": [
        {
         "type": "text",
-        "text": "hello-from-bash\nopencode.json\n"
-       },
-       {
-        "type": "text",
-        "text": "Command exited with code 0."
+        "text": "hello-from-bash\nREADME.md\nmain.rs\n"
        }
       ],
-      "outputPaths": [],
-      "structured": {
-       "exit": 0,
-       "truncated": false
+      "metadata": {
+       "status": "completed",
+       "truncated": false,
+       "exit": 0
       }
      },
      "time": {
-      "created": 1794046368363,
-      "ran": 1794046368612,
-      "completed": 1794046369066
+      "created": 1794047715782,
+      "ran": 1794047716029,
+      "completed": 1794047716045
      }
     }
    ],
    "snapshot": {
-    "start": "b6348aaef47e615edf6f2bd73ce518f521d1ffeb",
-    "end": "b6348aaef47e615edf6f2bd73ce518f521d1ffeb",
+    "start": "67d754857fba4af258b094add0aa140fc1b98157",
+    "end": "67d754857fba4af258b094add0aa140fc1b98157",
     "files": []
    },
    "finish": "tool-calls",
+   "rawFinish": "tool_calls",
    "cost": 0,
    "tokens": {
     "input": 10,
@@ -128,16 +86,121 @@
    }
   },
   {
-   "id": "msg_1b57f17b30016Z1tc1ZlZat2HV",
+   "id": "msg_1b593aadf001ucbQdDtVB7Ut9r",
    "time": {
-    "created": 1794046367668
+    "created": 1794047716068,
+    "streamed": 1794047716594,
+    "completed": 1794047716605
    },
-   "text": "tool:bash please",
+   "type": "assistant",
+   "agent": "build",
+   "model": {
+    "id": "mock-1",
+    "providerID": "mock"
+   },
+   "content": [
+    {
+     "type": "reasoning",
+     "text": "Thinking about the tool output.",
+     "native": {
+      "reasoningField": "reasoning_content"
+     },
+     "time": {
+      "created": 1794047716080,
+      "completed": 1794047716588
+     }
+    },
+    {
+     "type": "text",
+     "text": "The tool finished. Output was:\n\n```\nhello-from-bash\nREADME.md\nmain.rs\n\n```\n"
+    }
+   ],
+   "snapshot": {
+    "start": "67d754857fba4af258b094add0aa140fc1b98157",
+    "end": "67d754857fba4af258b094add0aa140fc1b98157",
+    "files": []
+   },
+   "finish": "stop",
+   "rawFinish": "stop",
+   "cost": 0,
+   "tokens": {
+    "input": 10,
+    "output": 20,
+    "reasoning": 0,
+    "cache": {
+     "read": 0,
+     "write": 0
+    }
+   }
+  },
+  {
+   "id": "msg_1b593ad02001recAOa80sVMyU1",
+   "time": {
+    "created": 1794047716610
+   },
+   "type": "idle",
+   "outcome": "succeeded"
+  },
+  {
+   "id": "msg_1b593aea9001lcU0tDVmQE0m34",
+   "time": {
+    "created": 1794047717045
+   },
+   "text": "long answer please",
    "type": "user"
+  },
+  {
+   "id": "msg_1b593aebb001aVx7o1DeeVw97V",
+   "time": {
+    "created": 1794047717056,
+    "streamed": 1794047719055,
+    "completed": 1794047719064
+   },
+   "type": "assistant",
+   "agent": "build",
+   "model": {
+    "id": "mock-1",
+    "providerID": "mock"
+   },
+   "content": [
+    {
+     "type": "reasoning",
+     "text": "Planning a long answer with many sections.",
+     "native": {
+      "reasoningField": "reasoning_content"
+     },
+     "time": {
+      "created": 1794047717073,
+      "completed": 1794047719053
+     }
+    },
+    {
+     "type": "text",
+     "text": "# A long answer\n\n## Section 1\n\nSome *emphasis*, some `inline code`, and a [link](https://opencode.ai).\n\n```rust\nfn section_1() -> u32 {\n    let x = 1;\n    x * 2\n}\n```\n\n- item one\n- item two\n\n## Section 2\n\nSome *emphasis*, some `inline code`, and "
+    }
+   ],
+   "snapshot": {
+    "start": "67d754857fba4af258b094add0aa140fc1b98157",
+    "end": "67d754857fba4af258b094add0aa140fc1b98157",
+    "files": []
+   },
+   "finish": "error",
+   "error": {
+    "type": "aborted",
+    "message": "Step interrupted"
+   }
+  },
+  {
+   "id": "msg_1b593b69b0015Bt9tELpdHhPGj",
+   "time": {
+    "created": 1794047719067
+   },
+   "type": "idle",
+   "outcome": "interrupted"
   }
  ],
  "cursor": {
-  "previous": "eyJpZCI6Im1zZ18xYjU3ZjFlN2UwMDFqdHQ5QVpPQ0hWYm1uUyIsIm9yZGVyIjoiZGVzYyIsImRpcmVjdGlvbiI6InByZXZpb3VzIn0",
-  "next": "eyJpZCI6Im1zZ18xYjU3ZjE3YjMwMDE2WjF0YzFabFphdDJIViIsIm9yZGVyIjoiZGVzYyIsImRpcmVjdGlvbiI6Im5leHQifQ"
+  "previous": "eyJpZCI6Im1zZ18xYjU5M2E4YTYwMDE0MmZzWkJlWmdGYnBxbyIsIm9yZGVyIjoiYXNjIiwiZGlyZWN0aW9uIjoicHJldmlvdXMifQ",
+  "next": "eyJpZCI6Im1zZ18xYjU5M2I2OWIwMDE1QnQ5dEVMcGRIaFBHaiIsIm9yZGVyIjoiYXNjIiwiZGlyZWN0aW9uIjoibmV4dCJ9"
  }
 }

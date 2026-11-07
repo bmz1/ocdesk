@@ -1,7 +1,7 @@
 //! Turns user intents into API calls and API results into store updates.
 //!
 //! Owns the sidecar lifecycle (start, crash detection, auto-restart), the
-//! SSE pump, and the folder list. One sidecar serves every folder: v2
+//! SSE pump, and the folder list. One sidecar serves every folder:
 //! sessions are pinned to a location (directory) and `/api/event` covers all
 //! locations. All network work runs on the Tokio runtime; results come back
 //! to the GPUI thread through channels awaited in `cx.spawn` tasks.
@@ -118,15 +118,9 @@ impl Controller {
         self.store
             .update(cx, |s, cx| s.set_connection(Connection::Starting, cx));
 
-        // Sessions carry their own location, so the sidecar's own directory
-        // barely matters; use the first folder so v1-only calls resolve.
-        let working_dir = self
-            .settings
-            .folders
-            .first()
-            .cloned()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("/"));
+        // Every session carries its own location, so the sidecar's own
+        // directory doesn't matter.
+        let working_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         self.run(
             cx,
             async move {
@@ -263,48 +257,19 @@ impl Controller {
                 });
             }
             _ => {
-                let (turn_over, maybe_over) = match &env.event {
-                    Event::StepEnded {
-                        session_id, finish, ..
-                    } if finish != "tool-calls" => (Some(session_id.clone()), None),
-                    // Usually another step follows, but not when the turn was
-                    // interrupted during a tool: ask the server.
-                    Event::StepEnded { session_id, .. } => (None, Some(session_id.clone())),
-                    Event::StepFailed { session_id, .. } => (Some(session_id.clone()), None),
-                    _ => (None, None),
+                let turn_over = match &env.event {
+                    Event::ExecutionEnded { session_id, .. } => Some(session_id.clone()),
+                    _ => None,
                 };
                 self.store.update(cx, |s, cx| s.apply(env, cx));
                 if let Some(session_id) = turn_over {
                     self.on_turn_over(session_id, cx);
                 }
-                if let Some(session_id) = maybe_over {
-                    self.confirm_running(session_id, cx);
-                }
             }
         }
     }
 
-    /// v2 has no idle event. Where the step events are ambiguous, ask
-    /// `GET /api/session/active` shortly after and clear busy if the session
-    /// is no longer running.
-    fn confirm_running(&mut self, session_id: String, cx: &mut Context<Self>) {
-        let Some(api) = self.api.clone() else { return };
-        let fut = async move {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            api.active().await
-        };
-        self.run(cx, fut, move |this, res, cx| {
-            let Ok(active) = res else { return };
-            let still_busy = this.store.read(cx).is_busy(&session_id);
-            if still_busy && !active.contains(&session_id) {
-                this.store
-                    .update(cx, |s, cx| s.set_busy(&session_id, false, cx));
-                this.on_turn_over(session_id, cx);
-            }
-        });
-    }
-
-    /// A turn finished (v2 has no idle event; this is inferred from steps).
+    /// A turn finished (`session.execution.succeeded|failed|interrupted`).
     fn on_turn_over(&mut self, _session_id: String, cx: &mut Context<Self>) {
         #[cfg(debug_assertions)]
         if std::env::var_os("OCDESK_VERIFY_ON_IDLE").is_some() {
@@ -344,22 +309,14 @@ impl Controller {
     #[cfg(debug_assertions)]
     fn verify_against_rest(&mut self, session_id: String, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
-        let Some(dir) = self
-            .store
-            .read(cx)
-            .session(&session_id)
-            .map(|s| s.directory.clone())
-        else {
-            return;
-        };
         let sid = session_id.clone();
-        // The projection is written right after the terminal step event.
+        // Give the projection a moment after the terminal event.
         let fut = async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            api.messages(&sid, &dir).await
+            api.messages(&sid).await
         };
         self.run(cx, fut, move |this, res, cx| {
-            let Ok((history, _)) = res else { return };
+            let Ok(history) = res else { return };
             let store = this.store.read(cx);
             let Some(conv) = store.conversations.get(&session_id).filter(|c| c.loaded) else { return };
             if conv.messages == history {
@@ -402,22 +359,14 @@ impl Controller {
 
     fn load_messages(&mut self, session_id: String, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
-        let Some(dir) = self
-            .store
-            .read(cx)
-            .session(&session_id)
-            .map(|s| s.directory.clone())
-        else {
-            return;
-        };
         let sid = session_id.clone();
         self.run(
             cx,
-            async move { api.messages(&sid, &dir).await },
+            async move { api.messages(&sid).await },
             move |this, res, cx| match res {
-                Ok((history, legacy)) => this
+                Ok(history) => this
                     .store
-                    .update(cx, |s, cx| s.reconcile(&session_id, history, legacy, cx)),
+                    .update(cx, |s, cx| s.reconcile(&session_id, history, cx)),
                 Err(e) => this.notice(format!("Could not load messages: {e:#}"), cx),
             },
         );
@@ -507,21 +456,15 @@ impl Controller {
 
     pub fn delete_session(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(api) = self.api(cx) else { return };
-        let Some(dir) = self
-            .store
-            .read(cx)
-            .session(&id)
-            .map(|s| s.directory.clone())
-        else {
-            return;
-        };
         let sid = id.clone();
+        // The stream also confirms with session.deleted; applying it here
+        // makes the row disappear without waiting.
         self.run(
             cx,
-            async move { api.delete_session(&sid, &dir).await },
+            async move { api.delete_session(&sid).await },
             move |this, res, cx| match res {
                 Ok(()) => this.store.update(cx, |s, cx| {
-                    s.apply(Envelope::bare(Event::SessionDeleted { session_id: id }), cx)
+                    s.apply(Envelope::bare(Event::SessionRemoved { session_id: id }), cx)
                 }),
                 Err(e) => this.notice(format!("Could not delete session: {e:#}"), cx),
             },
@@ -534,18 +477,10 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        let Some(dir) = self
-            .store
-            .read(cx)
-            .session(&id)
-            .map(|s| s.directory.clone())
-        else {
-            return;
-        };
-        // The server confirms with session.updated on the stream.
+        // The server confirms with session.renamed on the stream.
         self.run(
             cx,
-            async move { api.rename_session(&id, &dir, &title).await },
+            async move { api.rename_session(&id, &title).await },
             |this, res, cx| {
                 if let Err(e) = res {
                     this.notice(format!("Could not rename session: {e:#}"), cx);
@@ -564,21 +499,13 @@ impl Controller {
         let Some(api) = self.api(cx) else { return };
         let store = self.store.read(cx);
         let selected = store.selected.clone();
-        if selected
-            .as_ref()
-            .and_then(|id| store.conversations.get(id))
-            .is_some_and(|c| c.legacy)
-        {
-            self.notice("This session was created by an older opencode client and is read-only here. Start a new session to continue.", cx);
-            return;
-        }
         let Some(folder) = store.target_folder() else {
             self.notice("Add a folder first", cx);
             return;
         };
         if let Some(sid) = &selected {
             // Flip to busy right away so the composer shows Stop; the server
-            // confirms with session.next.prompted within milliseconds.
+            // confirms with session.execution.started within milliseconds.
             self.store.update(cx, |s, cx| {
                 s.clear_error(sid);
                 s.set_busy(sid, true, cx);
@@ -623,13 +550,11 @@ impl Controller {
         let Some(api) = self.api(cx) else { return };
         self.run(
             cx,
-            {
-                let sid = sid.clone();
-                async move { api.interrupt(&sid).await }
-            },
-            move |this, res, cx| match res {
-                Ok(()) => this.confirm_running(sid, cx),
-                Err(e) => this.notice(format!("Could not stop: {e:#}"), cx),
+            async move { api.interrupt(&sid).await },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    this.notice(format!("Could not stop: {e:#}"), cx);
+                }
             },
         );
     }

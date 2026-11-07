@@ -25,7 +25,9 @@ use tokio::process::Command;
 use tokio::sync::oneshot;
 
 /// The opencode release ocdesk is developed and tested against.
-pub const PINNED_OPENCODE_VERSION: &str = "1.19.5";
+pub const PINNED_OPENCODE_VERSION: &str = "2.2.6";
+/// ocdesk speaks opencode's v2 API only.
+const MIN_MAJOR: u32 = 2;
 
 /// Basic-auth username used by `opencode serve`.
 pub const USERNAME: &str = "opencode";
@@ -58,7 +60,7 @@ pub struct SidecarExit {
     pub last_lines: Vec<String>,
 }
 
-/// `opencode --version`, trimmed.
+/// `opencode --version` → `"2.2.6"` (2.x prints `opencode v2.2.6`).
 pub async fn probe_version(binary: &PathBuf) -> Result<String> {
     let out = Command::new(binary)
         .arg("--version")
@@ -73,27 +75,51 @@ pub async fn probe_version(binary: &PathBuf) -> Result<String> {
             out.status
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(parse_version(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Find `opencode` on PATH, then in the usual install locations.
+fn parse_version(out: &str) -> String {
+    let v = out.trim();
+    let v = v.strip_prefix("opencode").unwrap_or(v).trim();
+    v.strip_prefix('v').unwrap_or(v).to_string()
+}
+
+fn major(version: &str) -> Option<u32> {
+    version.split('.').next()?.parse().ok()
+}
+
+/// `$OCDESK_OPENCODE`, else `opencode2` then `opencode` on PATH and in the
+/// usual install locations. (`@opencode/cli` installs both names; `opencode2`
+/// can't be shadowed by a leftover 1.x `opencode`.)
 pub fn find_binary() -> Option<PathBuf> {
-    let candidates = std::env::var_os("PATH")
+    if let Some(p) = std::env::var_os("OCDESK_OPENCODE") {
+        return Some(PathBuf::from(p));
+    }
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .unwrap_or_default()
         .into_iter()
         .chain(dirs::home_dir().map(|h| h.join(".opencode/bin")))
-        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
-    candidates
-        .map(|dir| dir.join("opencode"))
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
+        .collect();
+    ["opencode2", "opencode"]
+        .iter()
+        .flat_map(|name| dirs.iter().map(move |d| d.join(name)))
         .find(|p| p.is_file())
 }
 
-/// Spawn `opencode serve` and wait until it answers `GET /global/health`.
+/// Spawn `opencode serve` and wait until it answers `GET /api/info`.
 ///
 /// Returns the sidecar plus a receiver that fires once when the child exits.
 pub async fn spawn(cfg: SidecarConfig) -> Result<(Sidecar, oneshot::Receiver<SidecarExit>)> {
     let version = probe_version(&cfg.binary).await?;
+    if major(&version).is_none_or(|m| m < MIN_MAJOR) {
+        bail!(
+            "ocdesk needs opencode 2.x, but {} is version {version}.\n\
+             Install it with: npm i -g @opencode/cli",
+            cfg.binary.display()
+        );
+    }
     if version != PINNED_OPENCODE_VERSION {
         tracing::warn!(
             found = %version,
@@ -104,9 +130,8 @@ pub async fn spawn(cfg: SidecarConfig) -> Result<(Sidecar, oneshot::Receiver<Sid
 
     let password = Alphanumeric.sample_string(&mut rand::rng(), 32);
     let mut cmd = Command::new(&cfg.binary);
-    // `--port 0` does NOT mean "random port" in 1.19.5: it tries 4096 first and
-    // only falls back to a random port when 4096 is taken. We pass 0 anyway and
-    // treat the `listening on` line on stdout as the source of truth.
+    // `--port 0` picks a free port; the `listening on` line on stdout is the
+    // source of truth for the URL.
     cmd.args([
         "serve",
         "--hostname",
@@ -226,7 +251,9 @@ fn tail_context(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
 
 async fn wait_healthy(sidecar: &Sidecar) -> Result<()> {
     let client = reqwest::Client::new();
-    let url = format!("{}/global/health", sidecar.base_url);
+    // `/global/health` is a catch-all for the bundled web UI in 2.x; `/api/info`
+    // needs auth, so it also proves the password works.
+    let url = format!("{}/api/info", sidecar.base_url);
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         let res = client
@@ -279,4 +306,17 @@ pub fn install_panic_hook() {
         kill_sidecar();
         prev(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_both_version_formats() {
+        assert_eq!(parse_version("opencode v2.2.6\n"), "2.2.6");
+        assert_eq!(parse_version("1.19.5\n"), "1.19.5");
+        assert_eq!(major("2.2.6"), Some(2));
+        assert_eq!(major("1.19.5"), Some(1));
+    }
 }

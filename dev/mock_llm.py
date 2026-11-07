@@ -6,12 +6,13 @@ Dev tooling only; never shipped. Usage:
 then run opencode with dev/mock-opencode.json (see README "Developing").
 
 Behaviour is keyed on the last user message:
-    contains "tool:bash"  -> calls the bash tool, then summarizes the result
+    contains "tool:bash"  -> calls the shell tool ("bash" on old servers), then summarizes
     contains "tool:edit"  -> calls the write tool on mock_note.txt, then summarizes
     contains "long"       -> streams a long markdown answer with code blocks
     anything else         -> short reasoning + a short markdown answer
 """
 import json
+import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -79,6 +80,13 @@ class Handler(BaseHTTPRequestHandler):
             for m in msgs if m.get("role") == "system"
         )
         is_title = "title" in sys_text.lower() and not req.get("tools")
+        offered = {t.get("function", {}).get("name") for t in req.get("tools") or []}
+        if offered:
+            sys.stderr.write("mock_llm: tools offered: " + ", ".join(sorted(n for n in offered if n)) + "\n")
+
+        def pick(*names):
+            """First tool name the server offers (opencode 2.x renamed bash -> shell)."""
+            return next((n for n in names if n in offered), names[0])
 
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
@@ -113,7 +121,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             chunk({"role": "assistant"})
             if is_title:
-                stream_text(" ".join(user.split()[:5]) or "Mock session")
+                # opencode 2.x asks: "...<message>\n{prompt}\n</message>\n\nReply with only the title."
+                m = re.search(r"<message>\s*(.*?)\s*</message>", user, re.S)
+                first = (m.group(1) if m else user).strip().splitlines()
+                stream_text(" ".join((first[0] if first else "").split()[:6]) or "Mock session")
                 chunk({}, "stop")
             elif has_tool_result:
                 stream_text("Thinking about the tool output.", "reasoning_content")
@@ -122,10 +133,10 @@ class Handler(BaseHTTPRequestHandler):
             elif "tool:bash" in user:
                 stream_text("I should run a command.", "reasoning_content")
                 stream_text("Running a command.\n")
-                tool_call("bash", {"command": "echo hello-from-bash && ls | head -5", "description": "Say hello and list files"})
+                tool_call(pick("shell", "bash"), {"command": "echo hello-from-bash && ls | head -5", "description": "Say hello and list files"})
             elif "tool:edit" in user:
                 stream_text("Writing a file.\n")
-                tool_call("write", {"filePath": "mock_note.txt", "content": "line one\nline two\n"})
+                tool_call(pick("write", "edit"), {"filePath": "mock_note.txt", "content": "line one\nline two\n"})
             elif "long" in user:
                 stream_text("Planning a long answer with many sections.", "reasoning_content")
                 stream_text(LONG)

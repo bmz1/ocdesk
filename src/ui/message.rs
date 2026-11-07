@@ -61,7 +61,7 @@ pub fn render_message(msg: &Message, cx: &App) -> AnyElement {
         };
     }
     if let Some(err) = &a.error {
-        let stopped = err == "Provider turn interrupted";
+        let stopped = err == "Step interrupted";
         col = col.child(
             h_flex()
                 .gap_1p5()

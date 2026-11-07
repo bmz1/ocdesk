@@ -6,7 +6,7 @@ BIN=${BIN:-target/debug/ocdesk}
 export DISPLAY=${DISPLAY:-:99}
 WORK=$(mktemp -d)
 export OCDESK_DIR=$WORK
-# opencode v2 reads provider config from the config dir, not OPENCODE_CONFIG_CONTENT.
+# opencode reads provider config from its config dir.
 mkdir -p "$WORK/xdg" && cp -r dev/xdg/opencode "$WORK/xdg/"
 export XDG_CONFIG_HOME=$WORK/xdg
 pass=0; fail=0
