@@ -19,7 +19,10 @@ use crate::controller::Controller;
 use crate::store::{Connection, Store};
 use crate::ui::{folder_name, relative_time};
 
+/// Default, minimum and maximum sidebar width (logical px).
 pub const SIDEBAR_W: f32 = 272.;
+pub const SIDEBAR_MIN_W: f32 = 200.;
+pub const SIDEBAR_MAX_W: f32 = 480.;
 
 pub struct Sidebar {
     store: Entity<Store>,
@@ -50,9 +53,14 @@ impl Sidebar {
             Connection::Connecting => (theme.warning, "Connecting…".to_string(), None),
             Connection::Connected => (theme.success, format!("opencode {version}"), None),
             Connection::Reconnecting => (theme.warning, "Reconnecting…".to_string(), None),
-            Connection::SidecarDown { message, .. } => {
-                (theme.danger, "opencode stopped".to_string(), Some(message))
-            }
+            Connection::SidecarDown {
+                message,
+                last_lines,
+            } => (
+                theme.danger,
+                "opencode stopped".to_string(),
+                Some((message, last_lines)),
+            ),
         };
         v_flex()
             .gap_2()
@@ -68,23 +76,51 @@ impl Sidebar {
                     .child(div().size_2().rounded_full().bg(color))
                     .child(label),
             )
-            .when_some(down, |el, message| {
+            .when_some(down, |el, (message, last_lines)| {
+                // Everything needed for a bug report: the error and the
+                // sidecar's last output lines.
+                let details = if last_lines.is_empty() {
+                    message.clone()
+                } else {
+                    format!("{message}\n\n{}", last_lines.join("\n"))
+                };
                 el.child(
                     div()
+                        .id("sidecar-error")
+                        .w_full()
+                        .min_w_0()
+                        .max_h(px(160.))
+                        .overflow_y_scroll()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .line_clamp(3)
                         .child(message),
                 )
                 .child(
-                    Button::new("restart-sidecar")
-                        .label("Restart opencode")
-                        .icon(IconName::RefreshCw)
-                        .small()
-                        .outline()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.controller.update(cx, |c, cx| c.restart(cx));
-                        })),
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .child(
+                            Button::new("restart-sidecar")
+                                .label("Restart opencode")
+                                .icon(IconName::RefreshCw)
+                                .small()
+                                .outline()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.controller.update(cx, |c, cx| c.restart(cx));
+                                })),
+                        )
+                        .child(
+                            Button::new("copy-sidecar-error")
+                                .label("Copy details")
+                                .icon(IconName::Copy)
+                                .small()
+                                .ghost()
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        details.clone(),
+                                    ));
+                                }),
+                        ),
                 )
             })
     }
@@ -371,13 +407,9 @@ impl Render for Sidebar {
         };
 
         v_flex()
-            .w(px(SIDEBAR_W))
-            .h_full()
-            .flex_none()
+            .size_full()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
             .child(
                 v_flex().px_2().pt_3().pb_2().child(nav_row("new-session", IconName::Plus, "New session").on_click(
                     cx.listener(|this, _, _, cx| {

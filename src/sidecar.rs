@@ -84,6 +84,9 @@ fn parse_version(out: &str) -> String {
     v.strip_prefix('v').unwrap_or(v).to_string()
 }
 
+/// Shown wherever opencode is missing or too old.
+pub const INSTALL_HINT: &str = "npm i -g @opencode/cli@2.2.6";
+
 fn major(version: &str) -> Option<u32> {
     version.split('.').next()?.parse().ok()
 }
@@ -115,8 +118,8 @@ pub async fn spawn(cfg: SidecarConfig) -> Result<(Sidecar, oneshot::Receiver<Sid
     let version = probe_version(&cfg.binary).await?;
     if major(&version).is_none_or(|m| m < MIN_MAJOR) {
         bail!(
-            "ocdesk needs opencode 2.x, but {} is version {version}.\n\
-             Install it with: npm i -g @opencode/cli",
+            "ocdesk needs opencode 2.x, but {} is version {version}. \
+             Install it with: {INSTALL_HINT}",
             cfg.binary.display()
         );
     }
