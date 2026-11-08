@@ -3,6 +3,7 @@
 //! ocdesk speaks opencode 2.x's API (`/api/*`, see `docs/protocol-notes.md`)
 //! through a thin reqwest client.
 
+mod error;
 pub mod events;
 pub mod features;
 pub mod fs;
@@ -19,6 +20,7 @@ use reqwest::Method;
 use serde_json::{Value, json};
 
 use crate::sidecar::{Sidecar, USERNAME};
+pub(crate) use error::HttpError;
 pub use events::{Envelope, Event};
 pub use model::{Message, SessionInfo};
 
@@ -81,10 +83,7 @@ impl Api {
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
-            bail!(
-                "HTTP {status}: {}",
-                body.chars().take(300).collect::<String>()
-            );
+            return Err(HttpError::new(status, &body).into());
         }
         if body.trim().is_empty() {
             return Ok(Value::Null);
@@ -943,6 +942,38 @@ mod tests {
             password: "test".into(),
         };
         (api, server)
+    }
+
+    #[tokio::test]
+    async fn http_failure_classification_survives_real_transport_and_anyhow_context() {
+        use super::HttpError;
+        let (api, server) = scripted_server(vec![
+            (
+                "GET /api/session/ses_a/permission ",
+                "",
+                "LocationNotFoundError 404",
+                "500 Internal Server Error",
+            ),
+            (
+                "GET /api/session/ses_a/permission ",
+                "",
+                "unstructured failure",
+                "404 Not Found",
+            ),
+        ]);
+        let internal = api
+            .permissions("ses_a")
+            .await
+            .unwrap_err()
+            .context("load approvals");
+        assert!(!HttpError::is_not_found(&internal));
+        let missing = api
+            .permissions("ses_a")
+            .await
+            .unwrap_err()
+            .context("load approvals");
+        assert!(HttpError::is_not_found(&missing));
+        server.join().unwrap();
     }
 
     /// Exercise the actual reqwest wire requests, including empty 204 replies.

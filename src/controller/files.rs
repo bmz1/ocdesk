@@ -162,11 +162,9 @@ impl Controller {
         path: String,
     ) -> Option<oneshot::Receiver<Result<Vec<FsEntry>>>> {
         let io = self.io()?;
-        let (tx, rx) = oneshot::channel();
-        self.rt.spawn(async move {
-            let _ = tx.send(io.list(&dir, &path).await);
-        });
-        Some(rx)
+        Some(super::reads::spawn_read(&self.rt, "fs_list", async move {
+            io.list(&dir, &path).await
+        }))
     }
 
     /// Read a file (see [`crate::api::Api::read_file`]).
@@ -177,14 +175,10 @@ impl Controller {
         etag: Option<String>,
     ) -> Option<oneshot::Receiver<Result<ReadResult>>> {
         let io = self.io()?;
-        let (tx, rx) = oneshot::channel();
-        self.rt.spawn(async move {
-            let res = io
-                .read(&dir, &rel, etag.as_deref(), crate::files::MAX_EDIT_BYTES)
-                .await;
-            let _ = tx.send(res);
-        });
-        Some(rx)
+        Some(super::reads::spawn_read(&self.rt, "fs_read", async move {
+            io.read(&dir, &rel, etag.as_deref(), crate::files::MAX_EDIT_BYTES)
+                .await
+        }))
     }
 
     /// Write a file. The caller confines `rel` (see [`crate::files::rel_path`]).

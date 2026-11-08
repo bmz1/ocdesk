@@ -8,6 +8,7 @@
 mod features;
 mod files;
 mod github;
+mod reads;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -19,21 +20,16 @@ use futures::channel::{mpsc, oneshot};
 use gpui_kit::{Context, Entity, Task};
 
 use crate::api::model::{FsEntry, ModelRef, PermissionDecision, PromptInput};
-use crate::api::{Api, Envelope, Event};
+use crate::api::{Api, Envelope, Event, HttpError};
+use crate::domain::requests::{
+    ConnectionEpoch, Issued, RequestClock, RequestScope, ServerGeneration,
+};
 use crate::settings::Settings;
 use crate::sidecar::{self, SidecarConfig};
 use crate::store::{Catalog, Connection, Store, StoreEvent, SubmissionTarget, Tooling};
 
 /// Re-reads of a snapshot that raced live events, before applying it anyway.
 const SNAPSHOT_RETRIES: u32 = 4;
-
-/// The sidecar generation and (for per-connection reads) SSE connection
-/// epoch a request was issued on; see [`Controller::run_on`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Issued {
-    generation: u64,
-    epoch: Option<u64>,
-}
 
 /// Give up auto-restarting after this many crashes within [`CRASH_WINDOW`].
 const MAX_QUICK_RESTARTS: u32 = 3;
@@ -49,9 +45,6 @@ const CATALOG_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Quiet period before bursty settings changes (resizes, drags) are written.
 const SETTINGS_DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// A 404 on `permission`/`form` reads right after startup usually means the
-/// session's location has not been registered server-side yet — retry, don't
-/// bother the user.
 /// Built-in tools that never write to the working tree.
 fn is_read_only_tool(name: &str) -> bool {
     matches!(
@@ -71,24 +64,22 @@ fn is_read_only_tool(name: &str) -> bool {
 }
 
 fn is_location_404(e: &anyhow::Error) -> bool {
-    let s = format!("{e:#}");
-    s.contains("404") || s.contains("LocationNotFoundError")
+    HttpError::is_not_found(e)
 }
 
-async fn with_location_retry<F, T>(mut f: F) -> Result<T>
+// Startup may not have registered the session location yet. Retry typed 404s;
+// a diagnostic containing "404" must not turn unrelated failures into retries.
+async fn with_location_retry<F, Fut, T>(mut f: F) -> Result<T>
 where
-    F: FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send>>,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
 {
     let mut attempt = 0;
     loop {
         match f().await {
             Err(e) if attempt < LOCATION_RETRIES && is_location_404(&e) => {
-                tracing::warn!(
-                    "location read not ready yet ({}), retrying ({}/{})",
-                    e,
-                    attempt + 1,
-                    LOCATION_RETRIES
-                );
+                tracing::warn!(attempt = attempt + 1, max_retries = LOCATION_RETRIES,
+                    error = %e, "location read not ready; retrying");
                 attempt += 1;
                 tokio::time::sleep(LOCATION_BACKOFF * attempt as u32).await;
             }
@@ -102,16 +93,14 @@ pub struct Controller {
     store: Entity<Store>,
     settings: Settings,
     api: Option<Api>,
-    /// Bumped on every sidecar (re)start so stale callbacks can be ignored.
-    generation: u64,
-    connection_epoch: u64,
+    requests: RequestClock,
     grant_requests: u64,
     submission_seq: u64,
     mode_requests: std::collections::HashMap<String, u64>,
     usage_revision: std::collections::HashMap<String, u64>,
     /// Connection epoch in which each session's event-maintained state
     /// (history, approvals, inbox, tasks) was last fetched.
-    fetched_epoch: std::collections::HashMap<String, u64>,
+    fetched_epoch: std::collections::HashMap<String, ConnectionEpoch>,
     /// The usage dialog asked for details while a summary was in flight.
     usage_details_pending: std::collections::HashSet<String>,
     attention_seen: std::collections::HashSet<String>,
@@ -165,8 +154,7 @@ impl Controller {
             store,
             settings,
             api: None,
-            generation: 0,
-            connection_epoch: 0,
+            requests: RequestClock::default(),
             diff_requests: Default::default(),
             task_requests: Default::default(),
             mode_requests: Default::default(),
@@ -223,16 +211,12 @@ impl Controller {
     }
 
     /// Where a request was issued, to drop its response if that's gone.
-    fn issued(&self, per_connection: bool) -> Issued {
-        Issued {
-            generation: self.generation,
-            epoch: per_connection.then_some(self.connection_epoch),
-        }
+    fn issued(&self, scope: RequestScope) -> Issued {
+        self.requests.issue(scope)
     }
 
     fn is_current(&self, issued: Issued) -> bool {
-        issued.generation == self.generation
-            && issued.epoch.is_none_or(|e| e == self.connection_epoch)
+        self.requests.accepts(issued)
     }
 
     /// [`Self::run`], but `done` only runs while the sidecar (and, for
@@ -250,6 +234,8 @@ impl Controller {
         self.run(cx, fut, move |this, res, cx| {
             if this.is_current(issued) {
                 done(this, res, cx);
+            } else {
+                tracing::debug!(?issued, generation = ?this.requests.generation(), epoch = ?this.requests.epoch(), "discarded obsolete request completion");
             }
         });
     }
@@ -267,7 +253,7 @@ impl Controller {
         if attempt >= SNAPSHOT_RETRIES {
             return false;
         }
-        let issued = self.issued(true);
+        let issued = self.issued(RequestScope::Connection);
         let delay = Duration::from_millis(100 << attempt);
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
@@ -350,11 +336,12 @@ impl Controller {
     }
 
     fn start_sidecar(&mut self, cx: &mut Context<Self>) {
-        self.generation += 1;
+        self.requests.restart();
         self.fetched_epoch.clear();
-        let generation = self.generation;
+        let generation = self.requests.generation();
         self.api = None;
         self.store.update(cx, |s, cx| {
+            s.cancel_history_loads();
             s.submitting.clear();
             s.interrupting.clear();
             s.permission_sending.clear();
@@ -378,7 +365,7 @@ impl Controller {
         let working_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move {
                 let binary = sidecar::find_binary().ok_or_else(|| {
                     anyhow!(
@@ -424,14 +411,14 @@ impl Controller {
 
     fn watch_exit(
         &mut self,
-        generation: u64,
+        generation: ServerGeneration,
         exit_rx: tokio::sync::oneshot::Receiver<sidecar::SidecarExit>,
         cx: &mut Context<Self>,
     ) {
         self.exit_watch = Some(cx.spawn(async move |this, cx| {
             let Ok(exit) = exit_rx.await else { return };
             let _ = this.update(cx, |this, cx| {
-                if this.generation != generation {
+                if this.requests.generation() != generation {
                     return;
                 }
                 this.api = None;
@@ -457,7 +444,7 @@ impl Controller {
                     cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(Duration::from_secs(1)).await;
                         let _ = this.update(cx, |this, cx| {
-                            if this.generation == generation {
+                            if this.requests.generation() == generation {
                                 this.start_sidecar(cx);
                             }
                         });
@@ -509,7 +496,7 @@ impl Controller {
         self.product_event(&env, cx);
         match env.event {
             Event::Connected => {
-                self.connection_epoch += 1;
+                self.requests.connection_changed();
                 #[cfg(debug_assertions)]
                 if std::env::var_os("OCDESK_DEBUG_PANIC").is_some() {
                     panic!("OCDESK_DEBUG_PANIC: deliberate panic to test sidecar teardown");
@@ -524,8 +511,9 @@ impl Controller {
                 self.files_changed(env.directory, Some(file), removed, cx)
             }
             Event::Disconnected => {
-                self.connection_epoch += 1;
+                self.requests.connection_changed();
                 self.store.update(cx, |s, cx| {
+                    s.cancel_history_loads();
                     s.permission_sending.clear();
                     s.form_sending.clear();
                     cx.notify();
@@ -585,7 +573,7 @@ impl Controller {
                 .read(cx)
                 .conversations
                 .get(&_session_id)
-                .is_some_and(|c| c.loaded)
+                .is_some_and(|c| c.loaded())
         {
             self.load_messages(_session_id.clone(), cx);
         }
@@ -620,7 +608,7 @@ impl Controller {
         let revision = self.store.read(cx).snapshot_revision;
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.active().await },
             move |this, res, cx| {
                 if this.store.read(cx).snapshot_revision != revision
@@ -644,7 +632,7 @@ impl Controller {
             .update(cx, |s, _| s.invalidate_except(selected.as_deref()));
         self.fetched_epoch.clear();
         if let Some(id) = &selected {
-            self.fetched_epoch.insert(id.clone(), self.connection_epoch);
+            self.fetched_epoch.insert(id.clone(), self.requests.epoch());
         }
         self.refresh_sessions(cx);
         self.refresh_active(cx);
@@ -708,7 +696,7 @@ impl Controller {
     pub(crate) fn refresh_catalog(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
         self.refresh_folder_info(folder.clone(), cx);
-        let generation = self.generation;
+        let generation = self.requests.generation();
         let dir = folder.clone();
         self.run(
             cx,
@@ -731,7 +719,7 @@ impl Controller {
                 })
             },
             move |this, res: Result<Catalog>, cx| {
-                if this.generation != generation {
+                if this.requests.generation() != generation {
                     return;
                 }
                 match res {
@@ -749,7 +737,7 @@ impl Controller {
     /// part fails on its own (e.g. a folder that isn't a git repository).
     fn refresh_folder_info(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
-        let generation = self.generation;
+        let generation = self.requests.generation();
         let dir = folder.clone();
         self.run(
             cx,
@@ -792,7 +780,7 @@ impl Controller {
                 Ok((tooling, vcs.ok(), project.ok(), worktrees, wt_vcs))
             },
             move |this, res: Result<_>, cx| {
-                if this.generation != generation {
+                if this.requests.generation() != generation {
                     return;
                 }
                 let Ok((tooling, vcs, project, worktrees, wt_vcs)) = res else {
@@ -909,11 +897,8 @@ impl Controller {
         let request = self.task_requests.entry(dir.clone()).or_default();
         *request += 1;
         let request = *request;
-        let guard = (
-            self.generation,
-            self.connection_epoch,
-            self.store.read(cx).tasks_revision,
-        );
+        let issued = self.issued(RequestScope::Connection);
+        let revision = self.store.read(cx).tasks_revision;
         let target = sid.clone();
         let folder = dir.clone();
         self.run(
@@ -923,12 +908,10 @@ impl Controller {
                 Ok((kids?, shells?))
             },
             move |this, res, cx| {
-                if (this.generation, this.connection_epoch) != (guard.0, guard.1)
-                    || this.task_requests.get(&folder) != Some(&request)
-                {
+                if !this.is_current(issued) || this.task_requests.get(&folder) != Some(&request) {
                     return;
                 }
-                if this.store.read(cx).tasks_revision != guard.2 {
+                if this.store.read(cx).tasks_revision != revision {
                     this.refresh_tasks(target, cx);
                     return;
                 }
@@ -951,7 +934,7 @@ impl Controller {
             .read(cx)
             .conversations
             .get(&child)
-            .is_some_and(|c| c.loaded);
+            .is_some_and(|c| c.loaded());
         if !loaded {
             self.load_messages(child, cx);
         }
@@ -964,11 +947,9 @@ impl Controller {
         shell_id: String,
     ) -> Option<oneshot::Receiver<Result<String>>> {
         let api = self.api.clone()?;
-        let (tx, rx) = oneshot::channel();
-        self.rt.spawn(async move {
-            let _ = tx.send(api.shell_output(&dir, &shell_id).await);
-        });
-        Some(rx)
+        Some(reads::spawn_read(&self.rt, "shell_output", async move {
+            api.shell_output(&dir, &shell_id).await
+        }))
     }
 
     pub fn kill_shell(&mut self, dir: PathBuf, shell_id: String, cx: &mut Context<Self>) {
@@ -1189,22 +1170,20 @@ impl Controller {
         folder: PathBuf,
         query: String,
     ) -> Option<oneshot::Receiver<Result<Vec<FsEntry>>>> {
-        let (tx, rx) = oneshot::channel();
         match (self.api.clone(), self.demo) {
-            (Some(api), _) => {
-                self.rt.spawn(async move {
-                    let _ = tx.send(api.find_files(&folder, &query, 20).await);
-                });
-            }
-            // Offline demo: walk the local folder instead.
+            (Some(api), _) => Some(reads::spawn_read(&self.rt, "find_files", async move {
+                api.find_files(&folder, &query, 20).await
+            })),
+            // Blocking local searches are bounded and finish independently.
             (None, true) => {
+                let (tx, rx) = oneshot::channel();
                 self.rt.spawn_blocking(move || {
                     let _ = tx.send(Ok(files::find_local(&folder, &query, 20)));
                 });
+                Some(rx)
             }
-            (None, false) => return None,
+            (None, false) => None,
         }
-        Some(rx)
     }
 
     /// Debug check (OCDESK_VERIFY_ON_IDLE): the streamed state of a loaded
@@ -1221,7 +1200,7 @@ impl Controller {
         self.run(cx, fut, move |this, res, cx| {
             let Ok(history) = res else { return };
             let store = this.store.read(cx);
-            let Some(conv) = store.conversations.get(&session_id).filter(|c| c.loaded) else { return };
+            let Some(conv) = store.conversations.get(&session_id).filter(|c| c.loaded()) else { return };
             if conv.messages == history {
                 tracing::info!(%session_id, messages = history.len(), "verify: store matches REST");
             } else {
@@ -1277,7 +1256,7 @@ impl Controller {
         let revision = self.store.read(cx).snapshot_revision;
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.list_sessions().await },
             move |this, res, cx| {
                 if this.store.read(cx).snapshot_revision != revision
@@ -1347,7 +1326,7 @@ impl Controller {
         let sid = session_id.clone();
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.messages(&sid).await },
             move |this, res, cx| {
                 if let Err(e) = &res {
@@ -1383,19 +1362,19 @@ impl Controller {
         let d = dir.clone();
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move {
                 let read = |forms: bool| {
                     let (api, d) = (api.clone(), d.clone());
                     with_location_retry(move || {
                         let (api, d) = (api.clone(), d.clone());
-                        Box::pin(async move {
+                        async move {
                             Ok(if forms {
                                 (Vec::new(), api.folder_forms(&d).await?)
                             } else {
                                 (api.folder_permissions(&d).await?, Vec::new())
                             })
-                        })
+                        }
                     })
                 };
                 let (p, f) = futures::join!(read(false), read(true));
@@ -1472,12 +1451,12 @@ impl Controller {
         let id = sid.clone();
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move {
                 with_location_retry(move || {
                     let api = api.clone();
                     let id = id.clone();
-                    Box::pin(async move { api.permissions(&id).await })
+                    async move { api.permissions(&id).await }
                 })
                 .await
             },
@@ -1507,12 +1486,12 @@ impl Controller {
         let id = sid.clone();
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move {
                 with_location_retry(move || {
                     let api = api.clone();
                     let id = id.clone();
-                    Box::pin(async move { api.forms(&id).await })
+                    async move { api.forms(&id).await }
                 })
                 .await
             },
@@ -1563,7 +1542,7 @@ impl Controller {
         let (session, form) = (sid.clone(), fid.clone());
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.reply_form(&session, &form, &answer).await },
             move |this, res, cx| {
                 this.store.update(cx, |s, cx| {
@@ -1630,7 +1609,7 @@ impl Controller {
         let (session, form) = (sid.clone(), fid.clone());
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.cancel_form(&session, &form).await },
             move |this, res, cx| {
                 this.store.update(cx, |s, cx| {
@@ -1690,7 +1669,7 @@ impl Controller {
         let (session, request) = (sid.clone(), rid.clone());
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move {
                 api.reply_permission(&session, &request, decision, message.as_deref())
                     .await
@@ -1749,7 +1728,7 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        let generation = self.generation;
+        let generation = self.requests.generation();
         let request = self.diff_requests.entry(dir.clone()).or_default();
         *request += 1;
         let request = *request;
@@ -1759,7 +1738,9 @@ impl Controller {
             cx,
             async move { api.working_diff(&d).await },
             move |this, res, cx| {
-                if this.generation != generation || this.diff_requests.get(&dir) != Some(&request) {
+                if this.requests.generation() != generation
+                    || this.diff_requests.get(&dir) != Some(&request)
+                {
                     return;
                 }
                 if let Ok(files) = &res {
@@ -1840,14 +1821,14 @@ impl Controller {
                 let s = self.store.read(cx);
                 s.conversations
                     .get(&id)
-                    .is_some_and(|c| c.loaded || c.fetching)
+                    .is_some_and(|c| c.loaded() || c.fetching())
                     && !s.needs_reload.contains(&id)
-                    && self.fetched_epoch.get(&id) == Some(&self.connection_epoch)
+                    && self.fetched_epoch.get(&id) == Some(&self.requests.epoch())
             };
             if current {
                 return;
             }
-            self.fetched_epoch.insert(id.clone(), self.connection_epoch);
+            self.fetched_epoch.insert(id.clone(), self.requests.epoch());
             self.refresh_permissions(id.clone(), cx);
             self.refresh_forms(id.clone(), cx);
             self.refresh_inbox(id.clone(), cx);
@@ -2062,7 +2043,7 @@ impl Controller {
         });
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move {
                 let (sid, created) = match selected {
                     Some(sid) => (sid, None),
@@ -2133,7 +2114,7 @@ impl Controller {
         let revision = inbox_revision(self.store.read(cx), &sid);
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.inbox(&sid).await },
             move |this, res, cx| {
                 if inbox_revision(this.store.read(cx), &target) != revision {
@@ -2204,7 +2185,7 @@ impl Controller {
         });
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.interrupt(&sid).await },
             move |this, res, cx| {
                 if let Err(e) = res {

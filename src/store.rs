@@ -18,6 +18,7 @@ use crate::api::model::{
     SkillInfo, Timing, ToolCall, ToolStatus, UserMessage, VcsInfo,
 };
 use crate::api::{Envelope, Event};
+use crate::domain::history::{HistoryLoad, HistoryRequests, LoadTicket};
 
 use serde_json::Value;
 
@@ -40,15 +41,10 @@ pub enum Connection {
 pub struct Conversation {
     /// Sorted by message id (ids are time-ordered).
     pub messages: Vec<Message>,
-    /// True once the REST history has been fetched. Events for conversations
-    /// that are not loaded are dropped; they are fetched on selection.
-    pub loaded: bool,
+    /// Availability and ownership of the latest REST history request.
+    load: HistoryLoad,
     /// Highest durable sequence number folded in.
     pub last_seq: Option<u64>,
-    /// A history fetch is in flight (see [`Store::begin_load`]).
-    pub fetching: bool,
-    /// Bumped per fetch; only the latest fetch's snapshot is applied.
-    pub load_seq: u64,
     /// Messages that events touched while the fetch was in flight: the only
     /// local messages missing from the snapshot that survive it (others were
     /// reverted, compacted away or deleted on the server).
@@ -68,6 +64,20 @@ const KEEP_CONVERSATIONS: usize = 10;
 const MAX_PENDING: usize = 128;
 
 impl Conversation {
+    pub(crate) fn loaded(&self) -> bool {
+        self.load.loaded()
+    }
+
+    pub(crate) fn fetching(&self) -> bool {
+        self.load.fetching()
+    }
+
+    fn cancel_load(&mut self) {
+        self.load.cancel();
+        self.live.clear();
+        self.pending.clear();
+    }
+
     /// `Ok(index)` of message `id`, else `Err(len)`: new messages append.
     ///
     /// The transcript is in *delivery* order, not id order (a queued prompt
@@ -156,6 +166,13 @@ pub enum StoreEvent {
     },
 }
 
+/// Completion effects stay separate from the pure history transition.
+enum HistoryChange {
+    Ignored,
+    Failed,
+    Reconciled(Vec<StoreEvent>),
+}
+
 /// Result of [`Store::apply_m7`].
 enum M7 {
     Handled(Vec<StoreEvent>),
@@ -227,6 +244,7 @@ pub enum SubmissionTarget {
 
 #[derive(Default)]
 pub struct Store {
+    history_requests: HistoryRequests,
     /// Local HTTP admissions, visible before the server emits execution events.
     pub submitting: HashMap<u64, SubmissionTarget>,
     pub interrupting: HashSet<String>,
@@ -972,7 +990,7 @@ impl Store {
         &'a self,
         sid: &str,
     ) -> Option<impl DoubleEndedIterator<Item = &'a crate::api::model::AssistantMessage>> {
-        let conv = self.conversations.get(sid).filter(|c| c.loaded)?;
+        let conv = self.conversations.get(sid).filter(|c| c.load.loaded())?;
         Some(conv.messages.iter().filter_map(|m| match m {
             Message::Assistant(a) if a.meta.tokens.is_some() => Some(a),
             _ => None,
@@ -1034,7 +1052,7 @@ impl Store {
 
     /// Whether usage details must come from the server's history.
     pub fn usage_needs_history(&self, sid: &str) -> bool {
-        !self.conversations.get(sid).is_some_and(|c| c.loaded)
+        !self.conversations.get(sid).is_some_and(|c| c.load.loaded())
     }
 
     pub fn set_vcs(&mut self, dir: PathBuf, info: VcsInfo, cx: &mut Context<Self>) {
@@ -1086,7 +1104,7 @@ impl Store {
             && self
                 .conversations
                 .get(id)
-                .is_none_or(|c| !c.loaded && c.messages.is_empty())
+                .is_none_or(|c| !c.load.loaded() && c.messages.is_empty())
     }
 
     pub fn selected_conversation(&self) -> Option<&Conversation> {
@@ -1145,7 +1163,7 @@ impl Store {
             .filter(|(id, conv)| {
                 self.recent.contains(id)
                     || keep_children.contains(id.as_str())
-                    || conv.fetching
+                    || conv.load.fetching()
                     || self.busy.contains(*id)
                     || self.permissions.get(*id).is_some_and(|r| !r.is_empty())
                     || self.forms.get(*id).is_some_and(|r| !r.is_empty())
@@ -1227,41 +1245,80 @@ impl Store {
     /// [`Store::finish_load`]. Events that arrive meanwhile are tracked (and,
     /// for an unloaded conversation, buffered) so the snapshot can be merged
     /// without losing or resurrecting anything.
-    pub fn begin_load(&mut self, session_id: &str) -> u64 {
+    pub fn begin_load(&mut self, session_id: &str) -> LoadTicket {
+        let ticket = self.history_requests.issue();
         let conv = self
             .conversations
             .entry(session_id.to_string())
             .or_default();
-        conv.load_seq += 1;
-        conv.fetching = true;
+        conv.load.begin(ticket);
+        tracing::debug!(
+            session_id,
+            ?ticket,
+            refresh = conv.load.loaded(),
+            "history request started"
+        );
         conv.live.clear();
         conv.pending.clear();
-        conv.load_seq
+        ticket
     }
 
     /// Apply the snapshot of fetch `ticket`, unless a newer fetch started.
     pub fn finish_load(
         &mut self,
         session_id: &str,
-        ticket: u64,
+        ticket: LoadTicket,
         history: anyhow::Result<Vec<Message>>,
         cx: &mut Context<Self>,
     ) {
+        match self.finish_load_inner(session_id, ticket, history) {
+            HistoryChange::Ignored => {}
+            HistoryChange::Failed => cx.notify(),
+            HistoryChange::Reconciled(events) => self.emit_all(events, cx),
+        }
+    }
+
+    /// Pure completion path: stale and duplicate responses cannot clear errors,
+    /// mutate messages, or emit notifications for a newer request.
+    fn finish_load_inner(
+        &mut self,
+        session_id: &str,
+        ticket: LoadTicket,
+        history: anyhow::Result<Vec<Message>>,
+    ) -> HistoryChange {
         let Some(conv) = self.conversations.get_mut(session_id) else {
-            return;
+            return HistoryChange::Ignored;
         };
-        if conv.load_seq != ticket {
-            return;
+        if !conv.load.accepts(ticket) {
+            tracing::debug!(session_id, ?ticket, state = ?conv.load, "ignored obsolete history completion");
+            return HistoryChange::Ignored;
         }
         match history {
-            Ok(history) => self.reconcile(session_id, history, cx),
+            Ok(history) => {
+                tracing::debug!(
+                    session_id,
+                    ?ticket,
+                    messages = history.len(),
+                    buffered_events = conv.pending.len(),
+                    "history snapshot accepted"
+                );
+                self.load_errors.remove(session_id);
+                HistoryChange::Reconciled(self.reconcile_inner(session_id, history))
+            }
             Err(e) => {
-                conv.fetching = false;
-                conv.pending.clear();
+                conv.cancel_load();
                 self.load_errors
                     .insert(session_id.to_string(), format!("{e:#}"));
-                cx.notify();
+                HistoryChange::Failed
             }
+        }
+    }
+
+    /// run_on drops obsolete callbacks. Release their loading/buffering state at
+    /// the same boundary, rather than leaving an unreachable fetch in progress.
+    pub(crate) fn cancel_history_loads(&mut self) {
+        for conv in self.conversations.values_mut() {
+            conv.cancel_load();
         }
     }
 
@@ -1270,7 +1327,8 @@ impl Store {
     pub fn invalidate_except(&mut self, keep: Option<&str>) {
         for (id, conv) in self.conversations.iter_mut() {
             if Some(id.as_str()) != keep {
-                conv.loaded = false;
+                conv.cancel_load();
+                conv.load.invalidate();
             }
         }
     }
@@ -1503,13 +1561,11 @@ impl Store {
         let Some(conv) = self.conversations.get_mut(&session_id) else {
             return out;
         };
-        if !conv.loaded {
+        if !conv.load.loaded() {
             // Replayed onto the snapshot when it lands.
-            if conv.fetching {
+            if conv.load.fetching() {
                 if conv.pending.len() >= MAX_PENDING {
-                    conv.load_seq += 1;
-                    conv.fetching = false;
-                    conv.pending.clear();
+                    conv.cancel_load();
                     self.needs_reload.insert(session_id.clone());
                     self.load_errors.insert(
                         session_id,
@@ -1523,7 +1579,7 @@ impl Store {
         }
         // Retain terminal mutations received after the fetch boundary. Do not
         // replay earlier running/progress states over a newer terminal snapshot.
-        if conv.fetching
+        if conv.load.fetching()
             && matches!(
                 env.event,
                 Event::ToolSucceeded { .. }
@@ -1534,15 +1590,13 @@ impl Store {
             )
         {
             if conv.pending.len() >= MAX_PENDING {
-                conv.load_seq += 1;
-                conv.fetching = false;
-                conv.pending.clear();
+                conv.cancel_load();
                 self.needs_reload.insert(session_id.clone());
             } else {
                 conv.pending.push(env.clone());
             }
         }
-        if conv.fetching
+        if conv.load.fetching()
             && let Some(id) = event_message(&env.event)
         {
             conv.live.insert(id.to_string());
@@ -1807,8 +1861,7 @@ impl Store {
         // gone on the server (reverted, compacted, deleted).
         merged.extend(newer.into_iter().filter(|m| conv.live.contains(m.id())));
         conv.messages = merged;
-        conv.loaded = true;
-        conv.fetching = false;
+        conv.load.ready();
         conv.live.clear();
         let pending = std::mem::take(&mut conv.pending);
         // Prose blocks the snapshot has: buffered deltas for them partly
@@ -2351,8 +2404,8 @@ mod tests {
             store.apply_inner(wire(r#"{"type":"session.text.delta","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","ordinal":0,"delta":"x"}}"#));
         }
         let conversation = &store.conversations["ses_a"];
-        assert_ne!(conversation.load_seq, ticket);
-        assert!(!conversation.fetching);
+        assert!(!conversation.load.accepts(ticket));
+        assert!(!conversation.load.fetching());
         assert!(conversation.pending.is_empty());
         assert!(store.needs_reload.contains("ses_a"));
     }
@@ -2398,7 +2451,143 @@ mod tests {
         let first = s.begin_load("ses_c");
         let second = s.begin_load("ses_c");
         assert_ne!(first, second);
-        assert_eq!(s.conversations["ses_c"].load_seq, second);
+        assert!(s.conversations["ses_c"].load.accepts(second));
+    }
+
+    fn history_message(id: &str) -> Message {
+        Message::User(UserMessage {
+            id: id.into(),
+            text: id.into(),
+            attachments: vec![],
+            meta: Default::default(),
+        })
+    }
+
+    #[test]
+    fn history_completion_orders_and_duplicate_responses_preserve_newest_snapshot() {
+        for newest_first in [false, true] {
+            let mut s = Store::default();
+            let a = s.begin_load("ses_a");
+            let b = s.begin_load("ses_a");
+            let replies = if newest_first {
+                [(b, "new"), (a, "old")]
+            } else {
+                [(a, "old"), (b, "new")]
+            };
+            for (ticket, id) in replies {
+                let result = s.finish_load_inner("ses_a", ticket, Ok(vec![history_message(id)]));
+                if ticket == a {
+                    assert!(matches!(result, HistoryChange::Ignored));
+                }
+            }
+            let before = s.conversations["ses_a"].revision;
+            assert!(matches!(
+                s.finish_load_inner("ses_a", b, Ok(vec![])),
+                HistoryChange::Ignored
+            ));
+            assert_eq!(s.conversations["ses_a"].revision, before);
+            assert_eq!(s.conversations["ses_a"].messages[0].id(), "new");
+        }
+    }
+
+    #[test]
+    fn histories_are_session_isolated_even_when_selection_changes_and_a_arrives_last() {
+        let mut s = Store {
+            selected: Some("ses_a".into()),
+            ..Default::default()
+        };
+        let a = s.begin_load("ses_a");
+        s.selected = Some("ses_b".into());
+        let b = s.begin_load("ses_b");
+        assert!(matches!(
+            s.finish_load_inner("ses_b", a, Ok(vec![])),
+            HistoryChange::Ignored
+        ));
+        s.finish_load_inner("ses_b", b, Ok(vec![history_message("b")]));
+        let result = s.finish_load_inner("ses_a", a, Ok(vec![history_message("a")]));
+        assert!(
+            matches!(result, HistoryChange::Reconciled(events) if events == vec![StoreEvent::MessagesReset { session_id: "ses_a".into() }])
+        );
+        assert_eq!(s.selected.as_deref(), Some("ses_b"));
+        assert_eq!(s.conversations["ses_b"].messages[0].id(), "b");
+        assert_eq!(s.conversations["ses_a"].messages[0].id(), "a");
+    }
+
+    #[test]
+    fn deleted_then_recreated_session_rejects_old_success_and_failure() {
+        let mut s = Store::default();
+        let old = s.begin_load("ses_a");
+        s.apply_inner(Envelope::bare(Event::SessionRemoved {
+            session_id: "ses_a".into(),
+        }));
+        assert!(matches!(
+            s.finish_load_inner("ses_a", old, Ok(vec![])),
+            HistoryChange::Ignored
+        ));
+        let new = s.begin_load("ses_a");
+        assert_ne!(old, new);
+        s.finish_load_inner("ses_a", new, Ok(vec![history_message("new")]));
+        assert!(matches!(
+            s.finish_load_inner("ses_a", old, Ok(vec![history_message("old")])),
+            HistoryChange::Ignored
+        ));
+        assert!(matches!(
+            s.finish_load_inner("ses_a", old, Err(anyhow::anyhow!("old failure"))),
+            HistoryChange::Ignored
+        ));
+        assert!(!s.load_errors.contains_key("ses_a"));
+        assert_eq!(s.conversations["ses_a"].messages[0].id(), "new");
+    }
+
+    #[test]
+    fn refresh_failure_keeps_data_and_stale_success_cannot_clear_new_error() {
+        let mut s = Store::default();
+        s.reconcile_inner("ses_a", vec![history_message("cached")]);
+        let old = s.begin_load("ses_a");
+        let current = s.begin_load("ses_a");
+        assert!(matches!(
+            s.finish_load_inner("ses_a", current, Err(anyhow::anyhow!("offline"))),
+            HistoryChange::Failed
+        ));
+        assert!(s.conversations["ses_a"].load.loaded());
+        assert!(!s.conversations["ses_a"].load.fetching());
+        assert!(matches!(
+            s.finish_load_inner("ses_a", old, Ok(vec![])),
+            HistoryChange::Ignored
+        ));
+        assert_eq!(s.load_errors["ses_a"], "offline");
+        assert_eq!(s.conversations["ses_a"].messages[0].id(), "cached");
+    }
+
+    #[test]
+    fn disconnect_releases_buffered_loads_and_reconnect_uses_fresh_snapshot() {
+        use crate::domain::requests::{RequestClock, RequestScope};
+        let mut clock = RequestClock::default();
+        let mut s = Store::default();
+        s.reconcile_inner("ses_a", vec![history_message("cached")]);
+        let a = s.begin_load("ses_a");
+        let b = s.begin_load("ses_b");
+        let issued = clock.issue(RequestScope::Connection);
+        s.apply_inner(wire(r#"{"type":"session.text.delta","data":{"sessionID":"ses_b","assistantMessageID":"msg_a","ordinal":0,"delta":"missed"}}"#));
+        clock.connection_changed();
+        s.cancel_history_loads();
+        assert!(!clock.accepts(issued));
+        for (id, ticket) in [("ses_a", a), ("ses_b", b)] {
+            assert!(!s.conversations[id].load.fetching());
+            assert!(s.conversations[id].pending.is_empty());
+            assert!(matches!(
+                s.finish_load_inner(id, ticket, Ok(vec![])),
+                HistoryChange::Ignored
+            ));
+        }
+        assert!(s.conversations["ses_a"].load.loaded());
+        clock.restart();
+        clock.connection_changed();
+        s.invalidate_except(Some("ses_a"));
+        let current = s.begin_load("ses_a");
+        s.finish_load_inner("ses_a", current, Ok(vec![history_message("fresh")]));
+        assert_eq!(s.conversations["ses_a"].messages[0].id(), "fresh");
+        assert!(!s.conversations["ses_b"].load.loaded());
     }
 
     #[test]

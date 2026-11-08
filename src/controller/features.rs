@@ -82,7 +82,7 @@ impl Controller {
         let version = *self.mode_requests.entry(sid.clone()).or_default();
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.session_mode(&sid).await.map(|m| (sid, m)) },
             move |this, res, cx| {
                 if let Ok((sid, m)) = res
@@ -116,7 +116,7 @@ impl Controller {
         let id = sid.clone();
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.set_session_mode(&id, mode).await },
             move |this, res, cx| {
                 this.store.update(cx, |s, cx| {
@@ -177,7 +177,7 @@ impl Controller {
         let id = sid.clone();
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.usage_report(&id, &folder, details, history).await },
             move |this, res, cx| {
                 let changed = this.usage_revision.get(&sid) != Some(&revision);
@@ -431,7 +431,7 @@ impl Controller {
     pub fn refresh_saved_grants(&mut self, cx: &mut Context<Self>) {
         let Some(api) = self.api(cx) else { return };
         let folders = self.store.read(cx).folders.clone();
-        let generation = self.generation;
+        let generation = self.requests.generation();
         self.grant_requests += 1;
         let request = self.grant_requests;
         self.store.update(cx, |s, cx| {
@@ -443,7 +443,7 @@ impl Controller {
             cx,
             async move { api.saved_grants(&folders).await },
             move |this, res, cx| {
-                if this.generation != generation || this.grant_requests != request {
+                if this.requests.generation() != generation || this.grant_requests != request {
                     return;
                 }
                 this.store.update(cx, |s, cx| {
@@ -471,7 +471,7 @@ impl Controller {
         let target = id.clone();
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.revoke_grant(&target).await },
             move |this, res, cx| {
                 this.grant_requests += 1;
