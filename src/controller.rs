@@ -1105,9 +1105,9 @@ impl Controller {
                         for id in ids {
                             this.refresh_permissions(id, cx);
                         }
-                        Err(e) => this.notice(format!("Could not list sessions: {e:#}"), cx),
+                        this.restore_last_session(cx);
                     }
-                    this.restore_last_session(cx);
+                    Err(e) => this.notice(format!("Could not list sessions: {e:#}"), cx),
                 }
             },
         );
