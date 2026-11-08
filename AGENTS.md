@@ -5,6 +5,10 @@ in sync with Cargo.toml, rust-toolchain.toml and CI; do not implement server age
 logic in the desktop. Read docs/development.md, docs/protocol-notes.md and
 docs/gpui-notes.md before changing orchestration or rendering.
 
+- controller/ and store/ are split by feature (see docs/development.md). Put new
+  intents or state transitions in the matching submodule; keep controller.rs and
+  store.rs to the shared struct, types and request helpers. Methods shared across
+  submodules are pub(super); everything else stays private.
 - Views send intents to Controller; HTTP and SSE stay in api/, off the GPUI
   thread. GPUI owns entity updates and fine-grained StoreEvent notifications.
 - domain/ contains concrete, pure transition mechanisms. It must not import
