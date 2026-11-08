@@ -25,7 +25,8 @@ use crate::api::{Api, Envelope, Event, HttpError};
 use crate::domain::approvals::{PendingRequest, PendingRequests};
 use crate::domain::choice::{ChoiceToken, OptimisticChoices};
 use crate::domain::requests::{
-    ConnectionEpoch, Issued, RequestClock, RequestScope, Revision, Revisions, ServerGeneration,
+    ConnectionEpoch, Freshness, Issued, RequestClock, RequestScope, Revision, Revisions,
+    ServerGeneration,
 };
 use crate::domain::supervisor::{CrashResponse, RestartBudget};
 use crate::settings::Settings;
@@ -1464,13 +1465,29 @@ impl Controller {
                 };
                 let mut stale_permissions = Vec::new();
                 let mut stale_forms = Vec::new();
+                let permissions_failed = permissions.as_ref().is_err_and(|e| !is_location_404(e));
+                let forms_failed = forms.as_ref().is_err_and(|e| !is_location_404(e));
                 this.store.update(cx, |s, cx| {
                     for (sid, p_rev, f_rev) in &revisions {
-                        // A live event (or newer snapshot) wins over this read.
-                        if let Ok(all) = &permissions {
-                            if !s.permissions.is_current(sid, *p_rev) {
-                                stale_permissions.push(sid.clone());
-                            } else {
+                        // A live event (or newer snapshot) wins over this
+                        // read; a session removed meanwhile is not re-read.
+                        let p_fresh = s.permissions.freshness(sid, *p_rev);
+                        let f_fresh = s.forms.freshness(sid, *f_rev);
+                        // A failed folder read falls back to per-session reads.
+                        if (permissions.is_ok() && p_fresh == Freshness::Superseded)
+                            || (p_fresh != Freshness::Forgotten && permissions_failed)
+                        {
+                            stale_permissions.push(sid.clone());
+                        }
+                        if (forms.is_ok() && f_fresh == Freshness::Superseded)
+                            || (f_fresh != Freshness::Forgotten && forms_failed)
+                        {
+                            stale_forms.push(sid.clone());
+                        }
+                        if let Ok(all) = &permissions
+                            && p_fresh == Freshness::Current
+                        {
+                            {
                                 let mine: Vec<_> = all
                                     .iter()
                                     .filter(|r| &r.session_id == sid)
@@ -1482,10 +1499,10 @@ impl Controller {
                                 }
                             }
                         }
-                        if let Ok(all) = &forms {
-                            if !s.forms.is_current(sid, *f_rev) {
-                                stale_forms.push(sid.clone());
-                            } else {
+                        if let Ok(all) = &forms
+                            && f_fresh == Freshness::Current
+                        {
+                            {
                                 let mine: Vec<_> = all
                                     .iter()
                                     .filter(|f| &f.session_id == sid)
@@ -1498,15 +1515,6 @@ impl Controller {
                         }
                     }
                 });
-                // A failed folder read falls back to per-session reads.
-                for (sid, ..) in &revisions {
-                    if permissions.as_ref().is_err_and(|e| !is_location_404(e)) {
-                        stale_permissions.push(sid.clone());
-                    }
-                    if forms.as_ref().is_err_and(|e| !is_location_404(e)) {
-                        stale_forms.push(sid.clone());
-                    }
-                }
                 for e in [permissions.as_ref().err(), forms.as_ref().err()]
                     .into_iter()
                     .flatten()
@@ -1539,10 +1547,16 @@ impl Controller {
                 .await
             },
             move |this, res, cx| {
+                let freshness = this.store.read(cx).permissions.freshness(&sid, revision);
+                if freshness == Freshness::Forgotten {
+                    // Removed while in flight: success or failure, nothing to show.
+                    tracing::debug!(op = "permissions", session_id = %sid, "dropped read of a removed session");
+                    return;
+                }
                 match res {
                     Ok(requests) => {
                         // A live asked/replied event (or newer snapshot) wins over this read.
-                        if this.store.read(cx).permissions.is_current(&sid, revision) {
+                        if freshness == Freshness::Current {
                             this.store
                                 .update(cx, |s, cx| s.set_permissions(&sid, requests, cx));
                         } else {
@@ -1574,10 +1588,15 @@ impl Controller {
                 .await
             },
             move |this, res, cx| {
+                let freshness = this.store.read(cx).forms.freshness(&sid, revision);
+                if freshness == Freshness::Forgotten {
+                    tracing::debug!(op = "forms", session_id = %sid, "dropped read of a removed session");
+                    return;
+                }
                 match res {
                     Ok(forms) => {
                         // A live created/replied event (or newer snapshot) wins over this read.
-                        if this.store.read(cx).forms.is_current(&sid, revision) {
+                        if freshness == Freshness::Current {
                             this.store.update(cx, |s, cx| s.set_forms(&sid, forms, cx));
                         } else {
                             this.refresh_forms(sid, cx);

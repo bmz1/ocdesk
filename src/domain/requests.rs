@@ -66,6 +66,19 @@ impl RequestClock {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Revision(u64);
 
+/// How a completion's revision relates to its resource now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Freshness {
+    /// Nothing changed since the request was issued: apply it.
+    Current,
+    /// The resource changed (a newer request or a live input): the result is
+    /// stale, but the resource still exists, so it may be read again.
+    Superseded,
+    /// The resource was forgotten after the request was issued: drop the
+    /// result and do not read again (that would re-create what was removed).
+    Forgotten,
+}
+
 /// Latest-wins revision guard for per-resource async reads.
 ///
 /// A completion is applied only if its resource has not changed since the
@@ -116,6 +129,17 @@ impl<K: std::hash::Hash + Eq> Revisions<K> {
         self.current.get(key) == Some(&revision)
     }
 
+    /// Like [`Self::is_current`], but tells a superseded result from one
+    /// whose resource is gone. Only meaningful for a `revision` obtained from
+    /// [`Self::current`] or [`Self::bump`], which register the key.
+    pub(crate) fn freshness(&self, key: &K, revision: Revision) -> Freshness {
+        match self.current.get(key) {
+            Some(now) if *now == revision => Freshness::Current,
+            Some(_) => Freshness::Superseded,
+            None => Freshness::Forgotten,
+        }
+    }
+
     /// The resource is gone: every outstanding revision becomes stale.
     pub(crate) fn forget(&mut self, key: &K) {
         self.current.remove(key);
@@ -149,6 +173,25 @@ mod tests {
         assert_ne!(stale, fresh);
         assert!(!revisions.is_current(&"dir", stale));
         assert!(revisions.is_current(&"dir", fresh));
+    }
+
+    #[test]
+    fn freshness_tells_superseded_from_forgotten_and_recreated() {
+        let mut revisions = Revisions::default();
+        let read = revisions.current("A");
+        assert_eq!(revisions.freshness(&"A", read), Freshness::Current);
+        revisions.bump("A");
+        assert_eq!(revisions.freshness(&"A", read), Freshness::Superseded);
+        let read = revisions.current("A");
+        revisions.forget(&"A");
+        assert_eq!(
+            revisions.freshness(&"A", read),
+            Freshness::Forgotten,
+            "removed during the read: drop it, don't re-read"
+        );
+        // Re-created (a live event for the same key): stale but re-readable.
+        revisions.bump("A");
+        assert_eq!(revisions.freshness(&"A", read), Freshness::Superseded);
     }
 
     #[test]

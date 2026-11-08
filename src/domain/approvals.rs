@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use super::requests::{Revision, Revisions};
+use super::requests::{Freshness, Revision, Revisions};
 
 /// What the lifecycle needs to know about a server request.
 pub(crate) trait PendingRequest {
@@ -94,8 +94,11 @@ impl<R: PendingRequest> PendingRequests<R> {
         self.revisions.current(sid.to_owned())
     }
 
-    pub(crate) fn is_current(&self, sid: &str, revision: Revision) -> bool {
-        self.revisions.is_current(&sid.to_owned(), revision)
+    /// See [`Freshness`]: `Forgotten` means the session was removed while
+    /// the read was in flight; its result must neither install state nor
+    /// trigger another read.
+    pub(crate) fn freshness(&self, sid: &str, revision: Revision) -> Freshness {
+        self.revisions.freshness(&sid.to_owned(), revision)
     }
 
     /// Install a snapshot of `sid`'s pending requests. Requests of other
@@ -287,18 +290,27 @@ mod tests {
     fn every_change_supersedes_snapshot_reads_issued_before_it() {
         let mut p = PendingRequests::default();
         let read = p.revision("A");
-        assert!(p.is_current("A", read));
+        assert!((p.freshness("A", read) == Freshness::Current));
         assert_eq!(p.revision("A"), read, "issuing a read supersedes nothing");
         p.asked(Req("A", "1"));
-        assert!(!p.is_current("A", read), "asked");
+        assert!(!(p.freshness("A", read) == Freshness::Current), "asked");
         let read = p.revision("A");
         p.resolved("A", "unknown");
-        assert!(!p.is_current("A", read), "a reply may race the read");
+        assert!(
+            !(p.freshness("A", read) == Freshness::Current),
+            "a reply may race the read"
+        );
         let read = p.revision("A");
         let other = p.revision("B");
         p.replace("A", vec![]);
-        assert!(!p.is_current("A", read), "a newer snapshot wins");
-        assert!(p.is_current("B", other), "sessions are isolated");
+        assert!(
+            !(p.freshness("A", read) == Freshness::Current),
+            "a newer snapshot wins"
+        );
+        assert!(
+            (p.freshness("B", other) == Freshness::Current),
+            "sessions are isolated"
+        );
     }
 
     #[test]
@@ -315,8 +327,23 @@ mod tests {
         p.asked(Req("A", "1"));
         let fresh = p.revision("A");
         assert_ne!(stale, fresh);
-        assert!(!p.is_current("A", stale));
+        assert!(!(p.freshness("A", stale) == Freshness::Current));
         assert!(!p.is_sending("A", "1"), "the old reply did not come back");
+    }
+
+    #[test]
+    fn a_read_overlapping_removal_is_dropped_but_one_after_recreation_rereads() {
+        let mut p: PendingRequests<Req> = PendingRequests::default();
+        p.asked(Req("A", "1"));
+        let read = p.revision("A");
+        p.forget_session("A");
+        assert_eq!(p.freshness("A", read), Freshness::Forgotten);
+        assert!(!p.has_pending("A"), "nothing reinstalled");
+        // The session comes back (a live ask) while the old read is still out.
+        p.asked(Req("A", "2"));
+        assert_eq!(p.freshness("A", read), Freshness::Superseded);
+        let fresh = p.revision("A");
+        assert_eq!(p.freshness("A", fresh), Freshness::Current);
     }
 
     /// Reference model: a small set of sessions/requests and every ordering

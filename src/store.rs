@@ -2703,7 +2703,7 @@ mod tests {
         }));
         assert!(s.forms.of_session("ses_a").is_empty());
         assert!(
-            !s.forms.is_current("ses_a", before),
+            s.forms.freshness("ses_a", before) != crate::domain::requests::Freshness::Current,
             "in-flight snapshots must be invalidated"
         );
         // The draft and scratch of the closed form go away with it.
@@ -2733,7 +2733,7 @@ mod tests {
         }));
         assert!(s.permissions.of_session("ses_a").is_empty());
         assert!(
-            !s.permissions.is_current("ses_a", before),
+            s.permissions.freshness("ses_a", before) != crate::domain::requests::Freshness::Current,
             "in-flight snapshots must be invalidated"
         );
         assert_eq!(s.permissions.of_session("ses_b").len(), 1);
