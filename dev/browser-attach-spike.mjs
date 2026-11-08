@@ -21,7 +21,9 @@
 // (pipe transport, no debugging port). The real thing in ocdesk would be
 // Rust over CDP; this only proves the protocol.
 
-import { chromium } from "playwright";
+import { createRequire } from "node:module";
+// require() honours NODE_PATH (where the dev sandbox has Playwright); ESM import doesn't.
+const { chromium } = createRequire(import.meta.url)("playwright");
 import { randomUUID } from "node:crypto";
 
 const URL_ = process.env.OPENCODE_URL;
@@ -169,7 +171,9 @@ async function run(requestID) {
       const result = out && "files" in out && "value" in out ? out : { value: out, files: [] };
       outcome = { type: "success", result };
     } catch (e) {
-      outcome = { type: "failure", code: e.code ?? "failed", message: String(e.message).slice(0, 2000) };
+      // Playwright appends a call log (with ANSI colours); the first line is the error.
+      const message = String(e.message).split("\n")[0].replace(/\u001b\[[0-9;]*m/g, "");
+      outcome = { type: "failure", code: e.code ?? "failed", message: message.slice(0, 2000) };
     }
   }
   log("result", type, outcome.type, outcome.type === "failure" ? outcome.message : "");

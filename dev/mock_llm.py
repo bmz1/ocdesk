@@ -191,7 +191,7 @@ class Handler(BaseHTTPRequestHandler):
                 tool_call(pick("execute"), {"code": (
                     f"const tab = await tools.browser.tabs.open({{ url: {json.dumps(url)} }});\n"
                     "const snap = await tools.browser.snapshot({ tabID: tab.id });\n"
-                    "const ref = (snap.content.match(/button[^\\n]*\\[ref=(e\\d+)\\]/) || [])[1];\n"
+                    "const ref = (snap.content.match(/button(?![^\\n]*\\[disabled\\])[^\\n]*\\[ref=(e\\d+)\\]/) || [])[1];\n"
                     "if (ref) await tools.browser.click({ tabID: tab.id, ref });\n"
                     "await tools.browser.tabs.focus({ tabID: tab.id });\n"
                     "const shot = await tools.browser.screenshot({ tabID: tab.id });\n"
