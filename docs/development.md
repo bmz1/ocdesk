@@ -234,9 +234,27 @@ Per-resource "latest wins" guards use `Revisions<K>` from the same module
 session). Every revision comes from one counter, so `forget` on folder removal or
 session deletion can never let a pre-removal response alias a fresh request.
 Removing a folder also forgets its worktree checkouts' revisions
-(`Store::forget_folder` returns the directories it dropped). Scalar debounce
-tokens (notices, catalog bursts, settings saves, saved grants) are never
-forgotten and stay plain counters.
+(`Store::forget_folder` returns the directories it dropped). Saved-grant
+refreshes keep a plain counter: it is never forgotten, so it cannot alias.
+
+Debounces and timers are owned GPUI tasks, not counters: the notice auto-clear,
+catalog-refresh debounce and settings-save debounce are `Option<Task<()>>` fields
+on the controller. Replacing one drops (cancels) the previous timer;
+`flush_settings` drops the pending save. `Controller::run` is unfenced and
+detached by design: it is for mutations whose outcome is persisted server state
+(delete, rename, archive, worktrees, inbox) or local work (opening an editor).
+Reads and completions that roll back or show transient state use `run_on`.
+
+`domain/fetch.rs` holds the request status of re-fetchable cached data (saved
+grants, folder diffs, usage): `FetchStatus` is `Idle | Loading | Failed`, so
+loading and failed are exclusive. The cached value stays beside it, so a refresh
+or a failed refresh still shows the last data. Sidecar restart abandons
+in-flight fetches and keeps shown errors.
+
+`gh` failures are a typed `GhFailed` with the CLI's stderr; "no pull request" is
+classified there (gh has no distinct exit code), never on a formatted error chain.
+Controller warnings use structured fields (`op`, `session_id`/`dir`, `generation`,
+`error`).
 
 `domain/choice.rs` orders optimistic model/agent choices. The display changes at
 once; only the newest outstanding choice of a session may roll it back, and only

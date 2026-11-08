@@ -38,10 +38,17 @@ it does not claim that every lifecycle in the application has been refactored.
   `run_on(RequestScope::Server)` instead of hand-compared generations.
 - A usage response for a session deleted mid-flight no longer recreates its
   usage entry.
+- Notice auto-clear, catalog debounce and settings-save debounce are owned
+  GPUI tasks (replace = cancel) instead of detached tasks + sequence counters.
+- `domain::fetch::FetchStatus(es)` replaces loading-bool/error-option pairs for
+  saved grants, folder diffs and usage.
+- Typed `GhFailed` for `gh` failures; "no pull request" is classified on its
+  stderr, not on `e.to_string()`.
+- Structured tracing fields for controller warnings/errors.
 
 Continuation verification (this executor, Linux): `cargo fmt --all -- --check`,
-strict Clippy, `cargo test --locked` (**154 passed**), the standalone domain
-build (17 passed), shellcheck, both live protocol suites against OpenCode 2.2.6,
+strict Clippy, `cargo test --locked` (**158 passed**), the standalone domain
+build (20 passed, no warnings), shellcheck, both live protocol suites against OpenCode 2.2.6,
 and `dev/teardown-test.sh` under Xvfb with the mock model: all five exit paths
 passed (sigterm, sigint, sigkill, panic, quit-after-idle). Desktop smoke checks
 by hand (item 2 below) and macOS remain unverified.

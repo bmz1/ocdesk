@@ -171,5 +171,12 @@ mod tests {
         assert_eq!(m.error(&"b"), Some("e"), "errors survive a restart");
         assert!(m.finish("b", None));
         assert!(!m.finish("b", None), "idle stays idle");
+        m.finish("c", Some("gone".into()));
+        m.remove("c");
+        assert_eq!(
+            m.get("c"),
+            &FetchStatus::Idle,
+            "removed resources forget errors"
+        );
     }
 }

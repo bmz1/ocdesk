@@ -18,6 +18,11 @@ docs/gpui-notes.md before changing orchestration or rendering.
 - Optimistic model/agent changes go through domain::choice (show_model /
   show_agent, settle_*). Only the newest choice may roll back; never capture
   "previous" per request and restore it unconditionally.
+- Debounce/timer work is an owned Option<Task<()>> (replace = cancel), not a
+  detached task plus sequence counter. Controller::run is only for mutations
+  whose result is persisted server state or local work; reads use run_on.
+- Fetch status of cached data is domain::fetch::FetchStatus(es), never a
+  loading bool plus error Option. Keep the cached value beside it.
 - RequestScope::Connection fences stream-sensitive snapshots. RequestScope::Server
   allows an accepted mutation to finish across SSE reconnects on the same server.
   Per-resource revisions still protect newer state within either scope.
