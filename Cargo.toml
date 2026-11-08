@@ -5,6 +5,8 @@ edition = "2024"
 rust-version = "1.99"
 description = "Native GPUI desktop client for the opencode coding agent"
 license = "MIT"
+repository = "https://github.com/bmz1/ocdesk"
+readme = "README.md"
 publish = false
 
 [dependencies]
