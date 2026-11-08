@@ -499,6 +499,7 @@ fn render_tool(t: &ToolCall, message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyEl
         .when(is_running(t), |el| {
             el.child(Spinner::new().xsmall().color(theme.muted_foreground))
         })
+        .children(open_file_button(t, &key))
         .child(chevron(open));
     v_flex()
         .w_full()
@@ -506,6 +507,40 @@ fn render_tool(t: &ToolCall, message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyEl
         .child(header)
         .when(open, |col| col.child(tool_details(t, &key, ctx, cx)))
         .into_any_element()
+}
+
+/// "Open in tab" for calls about one file (reads and edits).
+fn open_file_button(t: &ToolCall, key: &str) -> Option<AnyElement> {
+    if !matches!(kind(&t.name), Kind::Read | Kind::Edited) {
+        return None;
+    }
+    let path = str_input(t, "filePath")
+        .or(str_input(t, "path"))?
+        .to_string();
+    // `read`'s offset is a 0-based line.
+    let line = t
+        .input
+        .get("offset")
+        .and_then(serde_json::Value::as_u64)
+        .map(|o| o as u32 + 1);
+    Some(
+        Button::new(SharedString::from(format!("open-file-{key}")))
+            .icon(IconName::ExternalLink)
+            .ghost()
+            .xsmall()
+            .tooltip("Open in a tab")
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                window.dispatch_action(
+                    Box::new(super::keys::OpenFile {
+                        path: path.clone(),
+                        line,
+                    }),
+                    cx,
+                );
+            })
+            .into_any_element(),
+    )
 }
 
 /// The expanded card: tool name, its input (a `$ command` for shells),

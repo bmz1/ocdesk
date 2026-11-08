@@ -1,5 +1,4 @@
-//! The main column: header, virtualized message list, status line, composer.
-//! With no session selected it shows a centered Codex-style start screen.
+//! The main column: header, virtualized message list, status line, composer.//! With no session selected it shows a centered Codex-style start screen.
 
 use std::path::PathBuf;
 
@@ -66,6 +65,9 @@ pub struct ConversationView {
     panel_width: Pixels,
     changes: Entity<super::review::ChangesPanel>,
     terminal: Entity<super::terminal::TerminalView>,
+    /// Editor tabs next to the chat, and the Files panel.
+    files: Entity<super::editor_tabs::FileTabs>,
+    explorer: Entity<super::explorer::FileExplorer>,
     agents: Entity<super::agents::AgentsPanel>,
     transcript_focus: FocusHandle,
     density: crate::settings::Density,
@@ -106,10 +108,17 @@ impl ConversationView {
             cx.new(|cx| super::review::ChangesPanel::new(store.clone(), controller.clone(), cx));
         let terminal =
             cx.new(|cx| super::terminal::TerminalView::new(store.clone(), controller.clone(), cx));
+        let files = cx.new(|cx| {
+            super::editor_tabs::FileTabs::new(store.clone(), controller.clone(), window, cx)
+        });
+        let explorer = cx.new(|cx| {
+            super::explorer::FileExplorer::new(store.clone(), controller.clone(), files.clone(), cx)
+        });
         let agents =
             cx.new(|cx| super::agents::AgentsPanel::new(store.clone(), controller.clone(), cx));
-        let prefs = store.read(cx).preferences.clone();
         let mut subs = subs;
+        subs.push(cx.observe(&files, |_, _, cx| cx.notify()));
+        let prefs = store.read(cx).preferences.clone();
         // Density changes every row's height.
         subs.push(cx.observe(&store, |this: &mut Self, store, cx| {
             let d = store.read(cx).preferences.density;
@@ -131,6 +140,8 @@ impl ConversationView {
                 .clamp(PANEL_MIN_W, PANEL_MAX_W)),
             changes,
             terminal,
+            files,
+            explorer,
             agents,
             transcript_focus: cx.focus_handle(),
             density: prefs.density,
@@ -418,8 +429,9 @@ impl ConversationView {
                 let focus = self.terminal.read(cx).focus_handle().clone();
                 focus.focus(window, cx);
             }
+            Some(PanelTab::Files) => {}
             Some(PanelTab::Agents) => self.agents.update(cx, |a, cx| a.reload(cx)),
-            None => Composer::focus(&self.composer, window, cx),
+            None => self.focus_main(window, cx),
         }
         let saved = self.panel;
         self.controller
@@ -435,6 +447,31 @@ impl ConversationView {
         self.panel = Some(crate::settings::PanelTab::Tasks);
         self.tasks.update(cx, |t, cx| t.show(view, cx));
         cx.notify();
+    }
+
+    /// The editor tabs (for app-level shortcuts).
+    pub fn files(&self) -> &Entity<super::editor_tabs::FileTabs> {
+        &self.files
+    }
+
+    /// The Files panel (Cmd/Ctrl+Shift+E).
+    pub fn toggle_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_panel(crate::settings::PanelTab::Files, window, cx);
+    }
+
+    /// Show the Chat tab and focus the prompt.
+    pub fn show_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.files.update(cx, |f, cx| f.activate(None, window, cx));
+        Composer::focus(&self.composer, window, cx);
+    }
+
+    /// Focus what the main area shows: the open file, else the prompt.
+    fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.files.read(cx).file_active(cx) {
+            self.files.update(cx, |f, cx| f.cycle(0, window, cx));
+        } else {
+            Composer::focus(&self.composer, window, cx);
+        }
     }
 
     /// The Changes tab (Cmd/Ctrl+Shift+D).
@@ -604,6 +641,21 @@ impl ConversationView {
         cx.notify();
     }
 
+    fn render_failed_submission(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.controller.read(cx).has_failed_submission() {
+            return None;
+        }
+        Some(
+            Button::new("retry-failed-submission")
+                .label("Retry last unconfirmed prompt (check history first)")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.controller
+                        .update(cx, |c, cx| c.retry_failed_submission(cx));
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_start(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let banner = self.render_connection_banner(cx);
         let theme = cx.theme();
@@ -695,6 +747,7 @@ impl ConversationView {
                         .max_w(px(COLUMN_MAX_W))
                         .gap_2()
                         .children(banner)
+                        .children(self.render_failed_submission(cx))
                         .child(self.composer.clone()),
                 )
             })
@@ -1056,6 +1109,7 @@ impl Render for ConversationView {
                             PanelTab::Changes => "Changes: review diffs and comment",
                             PanelTab::Tasks => "Background tasks: subagents and shells",
                             PanelTab::Terminal => "Terminal for this session",
+                            PanelTab::Files => "Files: browse and open in a tab",
                             PanelTab::Agents => "Agents: opencode agent files for this folder",
                         },
                         action,
@@ -1140,6 +1194,13 @@ impl Render for ConversationView {
                         &super::keys::ToggleTasks,
                     ))
                     .child(tab_button(
+                        "toggle-files",
+                        PanelTab::Files,
+                        "Files".into(),
+                        super::icons::files(),
+                        &super::keys::ToggleFiles,
+                    ))
+                    .child(tab_button(
                         "toggle-agents",
                         PanelTab::Agents,
                         "Agents".into(),
@@ -1171,6 +1232,11 @@ impl Render for ConversationView {
                     .into_any_element(),
                 PanelTab::Terminal => self
                     .terminal
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                PanelTab::Files => self
+                    .explorer
                     .clone()
                     .cached(StyleRefinement::default().size_full())
                     .into_any_element(),
@@ -1218,6 +1284,7 @@ impl Render for ConversationView {
             .bg(theme.background)
             .child(header)
             .children(notice_bar)
+            .children(self.render_failed_submission(cx))
             .children(self.render_find_bar(cx))
             .child({
                 // Side by side when there's room for the column and the
@@ -1231,7 +1298,29 @@ impl Render for ConversationView {
                     .on_drag_move(cx.listener(|this, e: &DragMoveEvent<PanelResize>, _, cx| {
                         this.resize_panel(e.bounds.right(), e.event.position.x, cx);
                     }))
-                    .child(div().flex_1().min_w_0().h_full().child(body))
+                    .child({
+                        let weak = cx.entity().downgrade();
+                        let on_chat: super::editor_tabs::OnChat =
+                            std::rc::Rc::new(move |window, cx| {
+                                let _ = weak.update(cx, |this, cx| this.show_chat(window, cx));
+                            });
+                        let strip = has_selection
+                            .then(|| {
+                                super::editor_tabs::FileTabs::render_strip(&self.files, on_chat, cx)
+                            })
+                            .flatten();
+                        let main = if has_selection && self.files.read(cx).file_active(cx) {
+                            self.files.clone().into_any_element()
+                        } else {
+                            body
+                        };
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .children(strip)
+                            .child(div().flex_1().min_h_0().child(main))
+                    })
                     .when_some(panel, |el, panel| {
                         if split {
                             el.child(panel)

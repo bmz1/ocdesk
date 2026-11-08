@@ -133,9 +133,14 @@ impl AppView {
         let mut last_badge = usize::MAX;
         let mut subs = vec![
             cx.observe_window_activation(window, |this, window, cx| {
-                this.controller.update(cx, |c, cx| {
-                    c.set_window_active(window.is_window_active(), cx)
-                })
+                let active = window.is_window_active();
+                this.controller
+                    .update(cx, |c, cx| c.set_window_active(active, cx));
+                // Files may have been edited elsewhere while we were away.
+                if active {
+                    let tabs = this.conversation.read(cx).files().clone();
+                    tabs.update(cx, |t, cx| t.revalidate_all(window, cx));
+                }
             }),
             cx.observe_in(&store, window, move |_, store, window, cx| {
                 let s = store.read(cx);
@@ -164,6 +169,22 @@ impl AppView {
                 async {}
             }),
         ];
+        // Closing the window with unsaved editor tabs asks first.
+        let conversation_for_close = conversation.downgrade();
+        let me = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let dirty = conversation_for_close
+                .upgrade()
+                .map(|c| c.read(cx).files().read(cx).dirty_files())
+                .unwrap_or_default();
+            if dirty.is_empty() {
+                return true;
+            }
+            let _ = me.update(cx, |this, cx| {
+                this.confirm_discard(window, cx, |_, cx| cx.quit())
+            });
+            false
+        });
         subs.push(cx.observe_window_appearance(window, |this, window, cx| {
             if this.controller.read(cx).preferences().theme.as_deref() == Some("system") {
                 Theme::sync_system_appearance(Some(window), cx);
@@ -180,6 +201,34 @@ impl AppView {
             frames: FrameStats::new(),
             _subs: subs,
         }
+    }
+
+    /// Run `then` now, or after the user agreed to drop unsaved editor tabs.
+    fn confirm_discard(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Window, &mut App) + 'static,
+    ) {
+        let dirty = self.conversation.read(cx).files().read(cx).dirty_files();
+        if dirty.is_empty() {
+            then(window, cx);
+            return;
+        }
+        let detail = dirty.join("\n");
+        let rx = window.prompt(
+            PromptLevel::Warning,
+            &format!("Discard unsaved changes in {} file(s)?", dirty.len()),
+            Some(&detail),
+            &["Discard and Quit", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            if rx.await == Ok(0) {
+                let _ = cx.update(|window, cx| then(window, cx));
+            }
+        })
+        .detach();
     }
 
     fn remember_placement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -452,7 +501,41 @@ impl Render for AppView {
                     this.focus_area(-1, window, cx);
                 }),
             )
-            .on_action(|_: &keys::Quit, _, cx| cx.quit())
+            .on_action(cx.listener(|this, _: &keys::ToggleFiles, window, cx| {
+                this.conversation
+                    .update(cx, |c, cx| c.toggle_files(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::GoToFile, window, cx| {
+                let tabs = this.conversation.read(cx).files().clone();
+                crate::ui::goto_file::open(this.controller.clone(), tabs, window, cx);
+            }))
+            .on_action(cx.listener(|this, a: &keys::OpenFile, window, cx| {
+                let tabs = this.conversation.read(cx).files().clone();
+                tabs.update(cx, |t, cx| t.open(&a.path, a.line, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::SaveFile, window, cx| {
+                let tabs = this.conversation.read(cx).files().clone();
+                tabs.update(cx, |t, cx| t.save_active(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::CloseTab, window, cx| {
+                let tabs = this.conversation.read(cx).files().clone();
+                tabs.update(cx, |t, cx| t.close_active(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::NextTab, window, cx| {
+                let tabs = this.conversation.read(cx).files().clone();
+                tabs.update(cx, |t, cx| t.cycle(1, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::PreviousTab, window, cx| {
+                let tabs = this.conversation.read(cx).files().clone();
+                tabs.update(cx, |t, cx| t.cycle(-1, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::ShowChat, window, cx| {
+                this.conversation
+                    .update(cx, |c, cx| c.show_chat(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::Quit, window, cx| {
+                this.confirm_discard(window, cx, |_, cx| cx.quit());
+            }))
             .on_drag_move(
                 cx.listener(|this, e: &DragMoveEvent<SidebarResize>, _, cx| {
                     this.resize_sidebar(e.event.position.x - e.bounds.left(), cx);

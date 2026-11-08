@@ -1,5 +1,4 @@
-//! Session terminals: opencode's persistent PTYs (`/api/experimental/…`).
-//!
+//! Session terminals: opencode's persistent PTYs (`/api/experimental/…`).//!
 //! Protocol, as opencode's own desktop client speaks it
 //! (`packages/client/src/solid/pty.ts`):
 //! - create with `POST /api/experimental/session/{id}/terminal`;
@@ -13,7 +12,7 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::channel::mpsc::{Receiver, Sender, channel};
 use futures::{SinkExt as _, StreamExt as _};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -131,7 +130,7 @@ impl Api {
         pty_id: &str,
         cursor: u64,
         attachment_id: &str,
-    ) -> Result<(UnboundedSender<Vec<u8>>, UnboundedReceiver<PtyMsg>)> {
+    ) -> Result<(Sender<Vec<u8>>, Receiver<PtyMsg>)> {
         use tokio_tungstenite::tungstenite::{
             Message as Ws, client::IntoClientRequest as _, http::HeaderValue,
         };
@@ -173,10 +172,19 @@ impl Api {
             "authorization",
             HeaderValue::from_str(&format!("Basic {auth}"))?,
         );
-        let (socket, _) = tokio_tungstenite::connect_async(request).await?;
+        let (socket, _) = tokio_tungstenite::connect_async_with_config(
+            request,
+            Some(
+                tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                    .max_message_size(Some(1024 * 1024))
+                    .max_frame_size(Some(1024 * 1024)),
+            ),
+            false,
+        )
+        .await?;
         let (mut sink, mut stream) = socket.split();
-        let (in_tx, mut in_rx) = unbounded::<Vec<u8>>();
-        let (out_tx, out_rx) = unbounded::<PtyMsg>();
+        let (in_tx, mut in_rx) = channel::<Vec<u8>>(32);
+        let (mut out_tx, out_rx) = channel::<PtyMsg>(32);
         tokio::spawn(async move {
             while let Some(bytes) = in_rx.next().await {
                 if sink.send(Ws::Binary(bytes.into())).await.is_err() {
@@ -189,14 +197,14 @@ impl Api {
             let reason = loop {
                 match stream.next().await {
                     Some(Ok(Ws::Binary(b))) => {
-                        if out_tx.unbounded_send(PtyMsg::Output(b.to_vec())).is_err() {
+                        if out_tx.send(PtyMsg::Output(b.to_vec())).await.is_err() {
                             return;
                         }
                     }
                     Some(Ok(Ws::Text(t))) => {
                         let v = serde_json::from_str(t.as_str())
                             .unwrap_or(Value::String(t.to_string()));
-                        if out_tx.unbounded_send(PtyMsg::Control(v)).is_err() {
+                        if out_tx.send(PtyMsg::Control(v)).await.is_err() {
                             return;
                         }
                     }
@@ -206,7 +214,7 @@ impl Api {
                     None => break None,
                 }
             };
-            let _ = out_tx.unbounded_send(PtyMsg::Closed(reason));
+            let _ = out_tx.send(PtyMsg::Closed(reason)).await;
         });
         Ok((in_tx, out_rx))
     }
@@ -286,10 +294,10 @@ mod tests {
             base: format!("http://127.0.0.1:{port}"),
             password: "pw".into(),
         };
-        let (tx, mut rx) = api.connect_pty("pty_1", 42, "att").await.unwrap();
+        let (mut tx, mut rx) = api.connect_pty("pty_1", 42, "att").await.unwrap();
         assert!(matches!(rx.next().await, Some(PtyMsg::Output(b)) if b == b"hi"));
         assert!(matches!(rx.next().await, Some(PtyMsg::Control(v)) if v["type"] == "exited"));
-        tx.unbounded_send(frame(80, 24, Some(b"ls\r"))).unwrap();
+        tx.send(frame(80, 24, Some(b"ls\r"))).await.unwrap();
         let (uri, auth, frame_in) = server.await.unwrap();
         assert!(uri.contains("ticket=t123"), "{uri}");
         assert!(

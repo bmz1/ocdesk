@@ -1,5 +1,4 @@
-//! The Terminal tab of the right panel: the selected session's opencode
-//! PTY (see `api::pty`), emulated with `alacritty_terminal` and drawn as
+//! The Terminal tab of the right panel: the selected session's opencode//! PTY (see `api::pty`), emulated with `alacritty_terminal` and drawn as
 //! styled monospace rows.
 //!
 //! One terminal per session, created on first open and kept by opencode, so
@@ -17,9 +16,9 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as TColor, NamedColor, Processor, Rgb};
 use futures::StreamExt as _;
-use futures::channel::mpsc::UnboundedSender;
+use futures::channel::mpsc::Sender;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 
 use crate::api::pty::{PtyMsg, frame};
@@ -48,7 +47,7 @@ struct Session {
     term: Term<Listener>,
     parser: Processor,
     listener: Listener,
-    input: Option<UnboundedSender<Vec<u8>>>,
+    input: Option<Sender<Vec<u8>>>,
     status: Status,
     _io: Option<Task<()>>,
 }
@@ -56,6 +55,7 @@ struct Session {
 #[derive(Clone, Debug, PartialEq)]
 enum Status {
     Connecting,
+    Restarting,
     Live,
     Exited(Option<i64>),
     Failed(String),
@@ -150,7 +150,7 @@ impl TerminalView {
                 Ok(r) => r,
                 Err(e) => Err(anyhow::anyhow!(e)),
             };
-            let (info, checkpoint, tx, mut rx) = match opened {
+            let (info, checkpoint, mut tx, mut rx) = match opened {
                 Ok(x) => x,
                 Err(e) => {
                     let _ = this.update(cx, |this, cx| {
@@ -164,7 +164,7 @@ impl TerminalView {
                 if let Some(s) = this.sessions.get_mut(&sid) {
                     s.feed(&checkpoint);
                     // Claim the viewport size; the server resizes the PTY.
-                    let _ = tx.unbounded_send(frame(cols, rows, None));
+                    let _ = tx.try_send(frame(cols, rows, None));
                     s.input = Some(tx);
                     s.status = match info.exit_code {
                         Some(code) => Status::Exited(Some(code)),
@@ -203,15 +203,36 @@ impl TerminalView {
         let Some((api, rt)) = self.controller.read(cx).api_and_runtime() else {
             return;
         };
-        self.sessions.remove(&sid);
-        let removing = rt.spawn(async move {
-            for p in api.session_terminals(&sid).await.unwrap_or_default() {
-                let _ = api.remove_pty(&p.id).await;
+        if let Some(s) = self.sessions.get_mut(&sid) {
+            if matches!(s.status, Status::Restarting | Status::Connecting) {
+                return;
             }
+            s.input = None;
+            s._io = None;
+            s.status = Status::Restarting;
+        }
+        let target = sid.clone();
+        let removing = rt.spawn(async move {
+            for p in api.session_terminals(&target).await? {
+                api.remove_pty(&p.id).await?;
+            }
+            anyhow::Ok(())
         });
         cx.spawn(async move |this, cx| {
-            let _ = removing.await;
-            let _ = this.update(cx, |_, cx| cx.notify());
+            let result = removing.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(Ok(())) => {
+                        this.sessions.remove(&sid);
+                    }
+                    _ => this.set_status(
+                        &sid,
+                        Status::Failed("Could not restart shell; reconnect or retry.".into()),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
         })
         .detach();
         cx.notify();
@@ -229,9 +250,16 @@ impl TerminalView {
         let Some(sid) = self.selected(cx) else { return };
         let (cols, rows) = (self.cols, self.rows);
         if let Some(s) = self.sessions.get_mut(&sid)
-            && let Some(tx) = &s.input
+            && let Some(tx) = &mut s.input
         {
-            let _ = tx.unbounded_send(frame(cols, rows, Some(bytes)));
+            if tx.try_send(frame(cols, rows, Some(bytes))).is_err() {
+                s.status = Status::Failed(
+                    "Terminal input is full or disconnected; reconnect before typing again.".into(),
+                );
+                s.input = None;
+                cx.notify();
+                return;
+            }
             s.term.scroll_display(Scroll::Bottom);
         }
     }
@@ -248,8 +276,8 @@ impl TerminalView {
         self.rows = rows;
         for s in self.sessions.values_mut() {
             s.term.resize(TermSize::new(cols as usize, rows as usize));
-            if let Some(tx) = &s.input {
-                let _ = tx.unbounded_send(frame(cols, rows, None));
+            if let Some(tx) = &mut s.input {
+                let _ = tx.try_send(frame(cols, rows, None));
             }
         }
         cx.notify();
@@ -285,10 +313,10 @@ impl Session {
             .lock()
             .map(|mut q| std::mem::take(&mut *q))
             .unwrap_or_default();
-        if let Some(tx) = &self.input {
+        if let Some(tx) = &mut self.input {
             let (cols, rows) = (self.term.columns() as u16, self.term.screen_lines() as u16);
             for r in replies {
-                let _ = tx.unbounded_send(frame(cols, rows, Some(r.as_bytes())));
+                let _ = tx.try_send(frame(cols, rows, Some(r.as_bytes())));
             }
         }
     }
@@ -576,7 +604,9 @@ impl Render for TerminalView {
         )
         .absolute()
         .size_full();
+        let restarting = matches!(status, Some(Status::Restarting | Status::Connecting));
         let banner = match status {
+            Some(Status::Restarting) => Some(("Restarting shell…".to_string(), false)),
             Some(Status::Connecting) => Some(("Connecting to the terminal…".to_string(), false)),
             Some(Status::Exited(code)) => Some((
                 format!(
@@ -606,6 +636,7 @@ impl Render for TerminalView {
                         .child(
                             Button::new("terminal-new-shell")
                                 .label("New shell")
+                                .disabled(restarting)
                                 .xsmall()
                                 .ghost()
                                 .on_click(cx.listener(|this, _, _, cx| this.restart_shell(cx))),

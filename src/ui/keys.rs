@@ -39,8 +39,25 @@ actions!(
         ToggleTerminal,
         ShowActivity,
         PasteAsText,
+        ToggleFiles,
+        GoToFile,
+        SaveFile,
+        CloseTab,
+        NextTab,
+        PreviousTab,
+        ShowChat,
     ]
 );
+
+/// Open a file in an editor tab (from tool cards, the Changes panel, …).
+/// `path` is relative to the current folder or absolute inside it.
+#[derive(Clone, PartialEq, Debug, gpui_kit::Action)]
+#[action(namespace = ocdesk, no_json)]
+pub struct OpenFile {
+    pub path: String,
+    /// 1-based line to reveal.
+    pub line: Option<u32>,
+}
 
 /// (keystroke, action, description) — also the source of the shortcuts sheet.
 fn table() -> Vec<(&'static str, Box<dyn Action>, &'static str)> {
@@ -123,6 +140,17 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, &'static str)> {
             Box::new(PasteAsText),
             "Paste large text into the prompt (not as a file)",
         ),
+        (
+            "secondary-shift-e",
+            Box::new(ToggleFiles),
+            "Toggle files panel",
+        ),
+        ("secondary-p", Box::new(GoToFile), "Go to file…"),
+        ("secondary-s", Box::new(SaveFile), "Save file"),
+        ("secondary-w", Box::new(CloseTab), "Close file tab"),
+        ("secondary-shift-]", Box::new(NextTab), "Next tab"),
+        ("secondary-shift-[", Box::new(PreviousTab), "Previous tab"),
+        ("secondary-1", Box::new(ShowChat), "Show the chat tab"),
         ("secondary-/", Box::new(ShowShortcuts), "Keyboard shortcuts"),
         ("secondary-,", Box::new(OpenSettings), "Settings"),
         ("secondary-q", Box::new(Quit), "Quit"),
@@ -295,6 +323,10 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("New Session", NewSession),
             MenuItem::action("Add Folder…", AddFolder),
             MenuItem::separator(),
+            MenuItem::action("Go to File…", GoToFile),
+            MenuItem::action("Save File", SaveFile),
+            MenuItem::action("Close Tab", CloseTab),
+            MenuItem::separator(),
             MenuItem::action("Rename Session", RenameSession),
         ]),
         Menu::new("Edit").items([
@@ -318,6 +350,11 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Background Tasks", ToggleTasks),
             MenuItem::action("Agents", ToggleAgents),
             MenuItem::action("Terminal", ToggleTerminal),
+            MenuItem::action("Files", ToggleFiles),
+            MenuItem::separator(),
+            MenuItem::action("Chat Tab", ShowChat),
+            MenuItem::action("Next Tab", NextTab),
+            MenuItem::action("Previous Tab", PreviousTab),
             MenuItem::separator(),
             MenuItem::action("Transcript Detail", CycleDensity),
         ]),
