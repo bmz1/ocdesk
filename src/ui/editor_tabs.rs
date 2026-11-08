@@ -20,10 +20,13 @@ use anyhow::{Result, anyhow};
 use futures::channel::oneshot;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::lifecycle::{BufferIo, BufferOperation};
 use crate::api::fs::ReadResult;
 use crate::controller::Controller;
 use crate::files::{self, Content};
@@ -68,10 +71,8 @@ struct Buffer {
     truncated: bool,
     dirty: bool,
     conflict: Option<Conflict>,
-    /// A load, save or revalidation is in flight.
-    busy: bool,
-    saving: bool,
-    revalidate_pending: bool,
+    /// Serialized I/O plus one coalesced disk invalidation.
+    io: BufferIo,
     close_after_save: bool,
     /// Line to reveal once loaded (1-based).
     pending_line: Option<u32>,
@@ -358,9 +359,7 @@ impl FileTabs {
             truncated: false,
             dirty: false,
             conflict: None,
-            busy: false,
-            saving: false,
-            revalidate_pending: false,
+            io: BufferIo::default(),
             close_after_save: false,
             pending_line: line,
             _sub: sub,
@@ -390,8 +389,10 @@ impl FileTabs {
         let Some(b) = self.buffer_mut(&dir, id) else {
             return;
         };
+        if !b.io.begin(BufferOperation::Load) {
+            return;
+        }
         b.status = Status::Loading;
-        b.busy = true;
         let rel = b.rel.clone();
         let rx = self.controller.read(cx).fs_read(dir.clone(), rel, None);
         cx.spawn_in(window, async move |this, cx| {
@@ -400,7 +401,7 @@ impl FileTabs {
                 let Some(b) = this.buffer_mut(&dir, id) else {
                     return;
                 };
-                b.busy = false;
+                let pending = b.io.finish();
                 match res {
                     Ok(ReadResult::Body { bytes, etag, total }) => {
                         apply(b, files::decode(&bytes, total), etag, window, cx)
@@ -411,7 +412,6 @@ impl FileTabs {
                     }
                     Err(e) => b.status = Status::Failed(format!("{e:#}")),
                 }
-                let pending = std::mem::take(&mut b.revalidate_pending);
                 let pending_file = b.rel.clone();
                 cx.notify();
                 if pending {
@@ -442,11 +442,9 @@ impl FileTabs {
                 if !matches {
                     continue;
                 }
-                if b.busy || b.status == Status::Loading {
-                    b.revalidate_pending = true;
+                if !b.io.refresh() {
                     continue;
                 }
-                b.busy = true;
                 todo.push((d.clone(), b.id, b.rel.clone(), b.etag.clone()));
             }
         }
@@ -458,7 +456,7 @@ impl FileTabs {
                     let Some(b) = this.buffer_mut(&dir, id) else {
                         return;
                     };
-                    b.busy = false;
+                    let pending = b.io.finish();
                     match res {
                         Ok(ReadResult::NotModified) => {}
                         Ok(ReadResult::Missing) => {
@@ -492,7 +490,6 @@ impl FileTabs {
                         }
                         Err(e) => tracing::warn!("revalidate {}: {e:#}", b.rel),
                     }
-                    let pending = std::mem::take(&mut b.revalidate_pending);
                     let pending_file = b.rel.clone();
                     cx.notify();
                     if pending {
@@ -523,7 +520,7 @@ impl FileTabs {
         let Some(b) = self.buffer_mut(&dir, id) else {
             return;
         };
-        if !b.editable() || b.busy {
+        if !b.editable() || b.io.busy() {
             return;
         }
         let deleted = b.conflict == Some(Conflict::Deleted);
@@ -537,8 +534,9 @@ impl FileTabs {
         let text = b.editor.read(cx).value().to_string();
         let bytes = files::encode(&text, b.crlf);
         let (rel, etag, disk) = (b.rel.clone(), b.etag.clone(), b.disk.clone());
-        b.busy = true;
-        b.saving = true;
+        if !b.io.begin(BufferOperation::Save) {
+            return;
+        }
         cx.notify();
         let controller = self.controller.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -587,10 +585,8 @@ impl FileTabs {
                 let Some(b) = this.buffer_mut(&dir, id) else {
                     return;
                 };
-                b.busy = false;
-                b.saving = false;
+                let pending = b.io.finish();
                 let close = std::mem::take(&mut b.close_after_save);
-                let pending = std::mem::take(&mut b.revalidate_pending);
                 let pending_file = b.rel.clone();
                 match res {
                     Ok(Saved::Done { etag }) => {
@@ -741,6 +737,9 @@ impl FileTabs {
         let Some(b) = self.buffer_mut(&dir, id) else {
             return;
         };
+        if b.io.busy() {
+            return;
+        }
         match b.conflict.take() {
             Some(Conflict::Changed { .. }) | None => self.load(dir, id, window, cx),
             Some(Conflict::Deleted) => self.remove(&dir, id, cx),
@@ -754,6 +753,9 @@ impl FileTabs {
         let Some(b) = self.buffer_mut(&dir, id) else {
             return;
         };
+        if b.io.busy() {
+            return;
+        }
         match b.conflict.take() {
             Some(Conflict::Changed { text, etag, crlf }) => {
                 b.disk = text;
@@ -815,7 +817,11 @@ impl FileTabs {
             let (w1, w2) = (weak.clone(), weak.clone());
             let (id, d) = (b.id, dir.clone());
             let path = b.rel.clone();
-            let mark = if b.dirty || b.saving { "●" } else { "×" };
+            let mark = if b.dirty || b.io.saving() {
+                "●"
+            } else {
+                "×"
+            };
             tab(("tab-file", b.id as usize).into(), f.active == Some(ix))
                 .tooltip(move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(path.clone()).build(window, cx)
@@ -890,9 +896,14 @@ impl FileTabs {
              cx: &mut Context<Self>,
              f: fn(&mut Self, PathBuf, u64, &mut Window, &mut Context<Self>)| {
                 let d = d.clone();
-                Button::new(key).label(label).small().outline().on_click(
-                    cx.listener(move |this, _, window, cx| f(this, d.clone(), id, window, cx)),
-                )
+                Button::new(key)
+                    .label(label)
+                    .small()
+                    .outline()
+                    .disabled(b.io.busy())
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| f(this, d.clone(), id, window, cx)),
+                    )
             };
         match &b.conflict {
             Some(Conflict::Changed { .. }) => Some(
@@ -1033,7 +1044,7 @@ impl Render for FileTabs {
                 )
                 .into_any_element(),
         };
-        let state = if b.saving {
+        let state = if b.io.saving() {
             "Saving…"
         } else if b.truncated || b.status == Status::Binary {
             "Read-only"
