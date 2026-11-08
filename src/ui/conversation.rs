@@ -1199,6 +1199,13 @@ impl Render for ConversationView {
             .bg(theme.background)
             .child(header)
             .children(notice_bar)
+            .when(self.controller.read(cx).has_failed_submission(), |el| {
+                el.child(Button::new("retry-failed-submission")
+                    .label("Retry last unconfirmed prompt (check history first)")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.controller.update(cx, |c, cx| c.retry_failed_submission(cx));
+                    })))
+            })
             .children(self.render_find_bar(cx))
             .child({
                 // Side by side when there's room for the column and the
@@ -1468,3 +1475,4 @@ fn row_matches(
         }
     }
 }
+

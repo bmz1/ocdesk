@@ -59,7 +59,7 @@ pub struct Conversation {
 }
 
 /// Events buffered per loading conversation, at most.
-const MAX_PENDING: usize = 20_000;
+const MAX_PENDING: usize = 128;
 
 impl Conversation {
     /// `Ok(index)` of message `id`, else `Err(len)`: new messages append.
@@ -171,6 +171,7 @@ impl Catalog {
 
 #[derive(Default)]
 pub struct Store {
+    pub snapshot_revision: u64,
     pub saved_grants: Vec<crate::api::features::SavedGrant>,
     pub saved_grants_loading: bool,
     pub saved_grants_error: Option<String>,
@@ -906,6 +907,9 @@ impl Store {
     }
 
     pub(crate) fn apply_inner(&mut self, mut env: Envelope) -> Vec<StoreEvent> {
+        if !matches!(env.event, Event::Other(_) | Event::BlockDelta { .. }) {
+            self.snapshot_revision += 1;
+        }
         // Inbox, background tasks and folder info are session-/folder-level.
         let mut out = match self.apply_m7(&mut env) {
             M7::Handled(events) => return events,
@@ -1079,10 +1083,28 @@ impl Store {
         };
         if !conv.loaded {
             // Replayed onto the snapshot when it lands.
-            if conv.fetching && conv.pending.len() < MAX_PENDING {
-                conv.pending.push(env);
+            if conv.fetching {
+                if conv.pending.len() >= MAX_PENDING {
+                    conv.load_seq += 1;
+                    conv.fetching = false;
+                    conv.pending.clear();
+                    self.needs_reload.insert(session_id.clone());
+                    self.load_errors.insert(session_id, "History changed too quickly; retry loading.".into());
+                } else {
+                    conv.pending.push(env);
+                }
             }
             return out;
+        }
+        if conv.fetching && !matches!(env.event, Event::BlockDelta { .. }) {
+            if conv.pending.len() >= MAX_PENDING {
+                conv.load_seq += 1;
+                conv.fetching = false;
+                conv.pending.clear();
+                self.needs_reload.insert(session_id.clone());
+            } else {
+                conv.pending.push(env.clone());
+            }
         }
         if conv.fetching
             && let Some(id) = event_message(&env.event)
@@ -1648,6 +1670,51 @@ mod tests {
     }
 
     #[test]
+    fn completion_during_loaded_fetch_survives_snapshot() {
+        let mut store = Store::default();
+        store.reconcile_inner("ses_a", vec![]);
+        store.apply_inner(wire(r#"{"type":"session.tool.called","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","id":"tool_a","input":{}}}"#));
+        let snapshot = store.conversations["ses_a"].messages.clone();
+        store.begin_load("ses_a");
+        store.apply_inner(wire(r#"{"type":"session.tool.success","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","id":"tool_a","content":[{"type":"text","text":"done"}]}}"#));
+        store.apply_inner(wire(r#"{"type":"session.step.ended","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","finish":"stop"}}"#));
+        store.reconcile_inner("ses_a", snapshot);
+        let Message::Assistant(message) = &store.conversations["ses_a"].messages[0] else { panic!() };
+        assert!(message.completed);
+        let Block::Tool(tool) = &message.blocks[0] else { panic!() };
+        assert_eq!(tool.status, ToolStatus::Completed);
+        assert_eq!(tool.output, "done");
+    }
+
+    #[test]
+    fn snapshot_revision_tracks_session_execution_and_inbox_events() {
+        let mut store = Store::default();
+        for json in [
+            r#"{"type":"session.execution.started","data":{"sessionID":"ses_a"}}"#,
+            r#"{"type":"session.execution.succeeded","data":{"sessionID":"ses_a"}}"#,
+            r#"{"type":"session.inbox.cancelled","data":{"sessionID":"ses_a","inboxID":"msg_a"}}"#,
+        ] {
+            let before = store.snapshot_revision;
+            store.apply_inner(wire(json));
+            assert!(store.snapshot_revision > before);
+        }
+    }
+
+    #[test]
+    fn loading_overflow_invalidates_snapshot_instead_of_silently_losing_events() {
+        let mut store = Store::default();
+        let ticket = store.begin_load("ses_a");
+        for _ in 0..=MAX_PENDING {
+            store.apply_inner(wire(r#"{"type":"session.text.delta","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","ordinal":0,"delta":"x"}}"#));
+        }
+        let conversation = &store.conversations["ses_a"];
+        assert_ne!(conversation.load_seq, ticket);
+        assert!(!conversation.fetching);
+        assert!(conversation.pending.is_empty());
+        assert!(store.needs_reload.contains("ses_a"));
+    }
+
+    #[test]
     fn deltas_buffered_during_a_load_join_the_snapshot_without_gaps_or_repeats() {
         let mut s = Store::default();
         let sid = "ses_b";
@@ -2106,3 +2173,4 @@ mod tests {
         assert_eq!(s.session("ses_x").unwrap().title, "t");
     }
 }
+
