@@ -1,5 +1,4 @@
-//! App state: the single source of truth for folders, sessions and
-//! conversations.
+//! App state: the single source of truth for folders, sessions and//! conversations.
 //!
 //! The controller folds v2 events into it with [`Store::apply`] and replaces
 //! a conversation with the REST projection via [`Store::reconcile`]. Views
@@ -907,7 +906,20 @@ impl Store {
     }
 
     pub(crate) fn apply_inner(&mut self, mut env: Envelope) -> Vec<StoreEvent> {
-        if !matches!(env.event, Event::Other(_) | Event::BlockDelta { .. }) {
+        if matches!(
+            env.event,
+            Event::ExecutionStarted { .. }
+                | Event::ExecutionEnded { .. }
+                | Event::SessionUpserted(_)
+                | Event::SessionRemoved { .. }
+                | Event::SessionRenamed { .. }
+                | Event::ModelSelected { .. }
+                | Event::AgentSelected { .. }
+                | Event::InboxEnqueued { .. }
+                | Event::InboxDelivered { .. }
+                | Event::InboxCancelled { .. }
+                | Event::InboxDeliveryChanged { .. }
+        ) {
             self.snapshot_revision += 1;
         }
         // Inbox, background tasks and folder info are session-/folder-level.
@@ -1089,14 +1101,28 @@ impl Store {
                     conv.fetching = false;
                     conv.pending.clear();
                     self.needs_reload.insert(session_id.clone());
-                    self.load_errors.insert(session_id, "History changed too quickly; retry loading.".into());
+                    self.load_errors.insert(
+                        session_id,
+                        "History changed too quickly; retry loading.".into(),
+                    );
                 } else {
                     conv.pending.push(env);
                 }
             }
             return out;
         }
-        if conv.fetching && !matches!(env.event, Event::BlockDelta { .. }) {
+        // Retain terminal mutations received after the fetch boundary. Do not
+        // replay earlier running/progress states over a newer terminal snapshot.
+        if conv.fetching
+            && matches!(
+                env.event,
+                Event::ToolSucceeded { .. }
+                    | Event::ToolFailed { .. }
+                    | Event::StepEnded { .. }
+                    | Event::StepFailed { .. }
+                    | Event::BlockEnded { .. }
+            )
+        {
             if conv.pending.len() >= MAX_PENDING {
                 conv.load_seq += 1;
                 conv.fetching = false;
@@ -1679,9 +1705,13 @@ mod tests {
         store.apply_inner(wire(r#"{"type":"session.tool.success","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","id":"tool_a","content":[{"type":"text","text":"done"}]}}"#));
         store.apply_inner(wire(r#"{"type":"session.step.ended","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","finish":"stop"}}"#));
         store.reconcile_inner("ses_a", snapshot);
-        let Message::Assistant(message) = &store.conversations["ses_a"].messages[0] else { panic!() };
+        let Message::Assistant(message) = &store.conversations["ses_a"].messages[0] else {
+            panic!()
+        };
         assert!(message.completed);
-        let Block::Tool(tool) = &message.blocks[0] else { panic!() };
+        let Block::Tool(tool) = &message.blocks[0] else {
+            panic!()
+        };
         assert_eq!(tool.status, ToolStatus::Completed);
         assert_eq!(tool.output, "done");
     }
@@ -2173,4 +2203,3 @@ mod tests {
         assert_eq!(s.session("ses_x").unwrap().title, "t");
     }
 }
-

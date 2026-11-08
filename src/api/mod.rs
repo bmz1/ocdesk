@@ -1,5 +1,4 @@
-//! The only place that talks HTTP. Every future here must run on the Tokio
-//! runtime (see [`Runtime`]), never on the GPUI foreground executor.
+//! The only place that talks HTTP. Every future here must run on the Tokio//! runtime (see [`Runtime`]), never on the GPUI foreground executor.
 //!
 //! ocdesk speaks opencode 2.x's API (`/api/*`, see `docs/protocol-notes.md`)
 //! through a thin reqwest client.
@@ -13,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use futures::{SinkExt as _, StreamExt as _};
 use futures::channel::mpsc::Sender;
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -706,10 +704,7 @@ impl Api {
                 }
                 Err(e) => tracing::warn!(target: "sse", "event stream connect failed: {e:#}"),
             }
-            if tx
-                .send(Envelope::bare(Event::Disconnected))
-                .await.is_err()
-            {
+            if tx.send(Envelope::bare(Event::Disconnected)).await.is_err() {
                 return;
             }
             tokio::time::sleep(backoff).await;
@@ -1059,4 +1054,3 @@ mod tests {
         assert_eq!(p.push(b"data: y\n\n"), ["x\ny"]);
     }
 }
-

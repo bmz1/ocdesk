@@ -1,5 +1,4 @@
-mod api;
-mod controller;
+mod api;mod controller;
 mod demo;
 mod notifications;
 mod settings;
@@ -27,12 +26,13 @@ fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
         .join("ocdesk")
         .join("logs");
     std::fs::create_dir_all(&dir)?;
-    let (file, guard) =
-        tracing_appender::non_blocking(tracing_appender::rolling::Builder::new()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix("ocdesk.log")
-                .max_log_files(7)
-                .build(&dir)?);
+    let (file, guard) = tracing_appender::non_blocking(
+        tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("ocdesk.log")
+            .max_log_files(7)
+            .build(&dir)?,
+    );
     let filter = EnvFilter::try_from_env("OCDESK_LOG")
         .unwrap_or_else(|_| EnvFilter::new("info,ocdesk=info,sse=info,sidecar=info"));
     tracing_subscriber::registry()
@@ -101,4 +101,3 @@ fn main() -> Result<()> {
     drop(runtime);
     Ok(())
 }
-

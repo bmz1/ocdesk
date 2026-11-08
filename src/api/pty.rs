@@ -1,5 +1,4 @@
-//! Session terminals: opencode's persistent PTYs (`/api/experimental/…`).
-//!
+//! Session terminals: opencode's persistent PTYs (`/api/experimental/…`).//!
 //! Protocol, as opencode's own desktop client speaks it
 //! (`packages/client/src/solid/pty.ts`):
 //! - create with `POST /api/experimental/session/{id}/terminal`;
@@ -175,11 +174,14 @@ impl Api {
         );
         let (socket, _) = tokio_tungstenite::connect_async_with_config(
             request,
-            Some(tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-                .max_message_size(Some(1024 * 1024))
-                .max_frame_size(Some(1024 * 1024))),
+            Some(
+                tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                    .max_message_size(Some(1024 * 1024))
+                    .max_frame_size(Some(1024 * 1024)),
+            ),
             false,
-        ).await?;
+        )
+        .await?;
         let (mut sink, mut stream) = socket.split();
         let (in_tx, mut in_rx) = channel::<Vec<u8>>(32);
         let (mut out_tx, out_rx) = channel::<PtyMsg>(32);
@@ -316,4 +318,3 @@ mod tests {
         assert_eq!((i.cols, i.rows, i.tail), (120, 30, 42));
     }
 }
-

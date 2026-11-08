@@ -1,5 +1,4 @@
-//! The Terminal tab of the right panel: the selected session's opencode
-//! PTY (see `api::pty`), emulated with `alacritty_terminal` and drawn as
+//! The Terminal tab of the right panel: the selected session's opencode//! PTY (see `api::pty`), emulated with `alacritty_terminal` and drawn as
 //! styled monospace rows.
 //!
 //! One terminal per session, created on first open and kept by opencode, so
@@ -205,7 +204,9 @@ impl TerminalView {
             return;
         };
         if let Some(s) = self.sessions.get_mut(&sid) {
-            if matches!(s.status, Status::Restarting | Status::Connecting) { return; }
+            if matches!(s.status, Status::Restarting | Status::Connecting) {
+                return;
+            }
             s.input = None;
             s._io = None;
             s.status = Status::Restarting;
@@ -221,8 +222,14 @@ impl TerminalView {
             let result = removing.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(Ok(())) => { this.sessions.remove(&sid); }
-                    _ => this.set_status(&sid, Status::Failed("Could not restart shell; reconnect or retry.".into()), cx),
+                    Ok(Ok(())) => {
+                        this.sessions.remove(&sid);
+                    }
+                    _ => this.set_status(
+                        &sid,
+                        Status::Failed("Could not restart shell; reconnect or retry.".into()),
+                        cx,
+                    ),
                 }
                 cx.notify();
             });
@@ -246,7 +253,9 @@ impl TerminalView {
             && let Some(tx) = &mut s.input
         {
             if tx.try_send(frame(cols, rows, Some(bytes))).is_err() {
-                s.status = Status::Failed("Terminal input is full or disconnected; reconnect before typing again.".into());
+                s.status = Status::Failed(
+                    "Terminal input is full or disconnected; reconnect before typing again.".into(),
+                );
                 s.input = None;
                 cx.notify();
                 return;
@@ -718,4 +727,3 @@ mod tests {
         assert_eq!(key_bytes(&ks("ctrl-shift-t"), false), None);
     }
 }
-

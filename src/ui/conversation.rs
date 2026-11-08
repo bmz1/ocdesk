@@ -1,5 +1,4 @@
-//! The main column: header, virtualized message list, status line, composer.
-//! With no session selected it shows a centered Codex-style start screen.
+//! The main column: header, virtualized message list, status line, composer.//! With no session selected it shows a centered Codex-style start screen.
 
 use std::path::PathBuf;
 
@@ -599,6 +598,21 @@ impl ConversationView {
         cx.notify();
     }
 
+    fn render_failed_submission(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.controller.read(cx).has_failed_submission() {
+            return None;
+        }
+        Some(
+            Button::new("retry-failed-submission")
+                .label("Retry last unconfirmed prompt (check history first)")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.controller
+                        .update(cx, |c, cx| c.retry_failed_submission(cx));
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_start(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let banner = self.render_connection_banner(cx);
         let theme = cx.theme();
@@ -690,6 +704,7 @@ impl ConversationView {
                         .max_w(px(COLUMN_MAX_W))
                         .gap_2()
                         .children(banner)
+                        .children(self.render_failed_submission(cx))
                         .child(self.composer.clone()),
                 )
             })
@@ -1199,13 +1214,7 @@ impl Render for ConversationView {
             .bg(theme.background)
             .child(header)
             .children(notice_bar)
-            .when(self.controller.read(cx).has_failed_submission(), |el| {
-                el.child(Button::new("retry-failed-submission")
-                    .label("Retry last unconfirmed prompt (check history first)")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.controller.update(cx, |c, cx| c.retry_failed_submission(cx));
-                    })))
-            })
+            .children(self.render_failed_submission(cx))
             .children(self.render_find_bar(cx))
             .child({
                 // Side by side when there's room for the column and the
@@ -1475,4 +1484,3 @@ fn row_matches(
         }
     }
 }
-
