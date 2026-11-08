@@ -116,18 +116,19 @@ pub struct Controller {
     pump: Option<(tokio::task::AbortHandle, Task<()>)>,
     exit_watch: Option<Task<()>>,
     recent_crashes: Vec<Instant>,
-    /// Bumped per notice so a stale auto-clear timer can't hide a newer one.
-    notice_seq: u64,
-    /// Bumped per catalog refresh request, to debounce bursts.
-    catalog_seq: u64,
+    /// Auto-clear timer of the current notice. Replacing it cancels the old
+    /// timer, so a stale one can't hide a newer notice.
+    notice_clear: Option<Task<()>>,
+    /// Pending debounced catalog refresh; replaced (cancelled) per burst event.
+    catalog_debounce: Option<Task<()>>,
     /// Offline UI demo (`OCDESK_DEMO`): no sidecar; prompts get synthetic replies.
     demo: bool,
     failed_submission: Option<(Submission, Option<String>, PathBuf)>,
     /// Session to reopen once the first session list arrives (last one open
     /// when ocdesk quit). Taken on first use.
     restore_session: Option<String>,
-    /// Bumped per debounced settings save.
-    save_seq: u64,
+    /// Pending debounced settings save; replaced per change, dropped on flush.
+    save_debounce: Option<Task<()>>,
 }
 
 impl Controller {
@@ -176,12 +177,12 @@ impl Controller {
             pump: None,
             exit_watch: None,
             recent_crashes: Vec::new(),
-            notice_seq: 0,
-            catalog_seq: 0,
+            notice_clear: None,
+            catalog_debounce: None,
             demo: false,
             failed_submission: None,
             restore_session,
-            save_seq: 0,
+            save_debounce: None,
         };
         this.reset_draft_choices(cx);
         this.save_settings();
@@ -198,6 +199,16 @@ impl Controller {
     }
 
     /// Run `fut` on the Tokio runtime and hand the result back on the UI thread.
+    ///
+    /// Unfenced: `done` runs even after a sidecar restart. Use it for
+    /// mutations whose outcome is persisted server state (delete, rename,
+    /// archive, worktrees, inbox) or for local work (opening an editor), where
+    /// a completion stays true on the next server. Reads, and anything whose
+    /// completion rolls back or shows transient state, use [`Self::run_on`].
+    ///
+    /// Both halves are detached on purpose: an admitted mutation cannot be
+    /// cancelled, and the GPUI half holds only a weak controller handle, so it
+    /// does nothing once the controller is gone.
     fn run<T, F>(
         &self,
         cx: &mut Context<Self>,
@@ -301,23 +312,17 @@ impl Controller {
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        self.save_seq += 1;
-        let seq = self.save_seq;
         let exec = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
+        // Dropping the previous GPUI task cancels its timer.
+        self.save_debounce = Some(cx.spawn(async move |this, cx| {
             exec.timer(SETTINGS_DEBOUNCE).await;
-            let _ = this.update(cx, |this, _| {
-                if this.save_seq == seq {
-                    this.save_settings();
-                }
-            });
-        })
-        .detach();
+            let _ = this.update(cx, |this, _| this.save_settings());
+        }));
     }
 
     /// Write pending settings now (on quit).
     pub fn flush_settings(&mut self) {
-        self.save_seq += 1;
+        self.save_debounce = None;
         // The newest snapshot: it waits for any write in flight, then wins.
         if let Err(e) = self.settings.snapshot_for_save().write() {
             tracing::warn!("could not save settings: {e:#}");
@@ -684,18 +689,11 @@ impl Controller {
     // ── models and agents ────────────────────────────────────────────────
 
     fn schedule_catalog_refresh(&mut self, cx: &mut Context<Self>) {
-        self.catalog_seq += 1;
-        let seq = self.catalog_seq;
         let exec = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
+        self.catalog_debounce = Some(cx.spawn(async move |this, cx| {
             exec.timer(CATALOG_DEBOUNCE).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.catalog_seq == seq {
-                    this.refresh_catalogs(cx);
-                }
-            });
-        })
-        .detach();
+            let _ = this.update(cx, |this, cx| this.refresh_catalogs(cx));
+        }));
     }
 
     /// Re-read models, default model and agents for every folder.
@@ -899,18 +897,18 @@ impl Controller {
             return;
         };
         let request = self.task_requests.bump(dir.clone());
-        let issued = self.issued(RequestScope::Connection);
         let revision = self.store.read(cx).tasks_revision;
         let target = sid.clone();
         let folder = dir.clone();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Connection),
             async move {
                 let (kids, shells) = futures::join!(api.children(&sid), api.shells(&dir));
                 Ok((kids?, shells?))
             },
             move |this, res, cx| {
-                if !this.is_current(issued) || !this.task_requests.is_current(&folder, request) {
+                if !this.task_requests.is_current(&folder, request) {
                     return;
                 }
                 if this.store.read(cx).tasks_revision != revision {
@@ -1290,28 +1288,20 @@ impl Controller {
     fn notice(&mut self, msg: impl Into<String>, cx: &mut Context<Self>) {
         let msg = msg.into();
         tracing::warn!("{msg}");
-        self.notice_seq += 1;
-        let seq = self.notice_seq;
         self.store.update(cx, |s, cx| {
             s.notice = Some(msg);
             cx.notify();
         });
         let exec = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
+        let store = self.store.clone();
+        self.notice_clear = Some(cx.spawn(async move |_, cx| {
             exec.timer(NOTICE_LINGER).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.notice_seq != seq {
-                    return;
+            store.update(cx, |s, cx| {
+                if s.notice.take().is_some() {
+                    cx.notify();
                 }
-                this.store.update(cx, |s, cx| {
-                    if s.notice.is_some() {
-                        s.notice = None;
-                        cx.notify();
-                    }
-                });
             });
-        })
-        .detach();
+        }));
     }
 
     pub fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
