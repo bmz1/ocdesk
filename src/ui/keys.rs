@@ -46,6 +46,7 @@ actions!(
         NextTab,
         PreviousTab,
         ShowChat,
+        TogglePullRequest,
     ]
 );
 
@@ -151,6 +152,11 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, &'static str)> {
         ("secondary-shift-]", Box::new(NextTab), "Next tab"),
         ("secondary-shift-[", Box::new(PreviousTab), "Previous tab"),
         ("secondary-1", Box::new(ShowChat), "Show the chat tab"),
+        (
+            "secondary-shift-g",
+            Box::new(TogglePullRequest),
+            "Pull request: checks and review comments",
+        ),
         ("secondary-/", Box::new(ShowShortcuts), "Keyboard shortcuts"),
         ("secondary-,", Box::new(OpenSettings), "Settings"),
         ("secondary-q", Box::new(Quit), "Quit"),

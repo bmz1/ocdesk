@@ -175,9 +175,32 @@ impl Catalog {
     }
 }
 
+/// What we know about a checkout's pull request.
+#[derive(Default)]
+pub struct PrEntry {
+    /// `None` until the first fetch, then `Some(None)` when there's no PR.
+    pub pr: Option<Option<crate::github::PullRequest>>,
+    pub error: Option<String>,
+    pub loading: bool,
+    pub fetched: Option<std::time::Instant>,
+}
+
+/// A failed check's log excerpt, by check link.
+#[derive(Clone)]
+pub enum CheckLog {
+    Loading,
+    Ready(String),
+    Failed(String),
+}
+
 #[derive(Default)]
 pub struct Store {
     pub snapshot_revision: u64,
+    /// The `gh` CLI is installed: the Pull request tab and chip show.
+    pub gh_available: bool,
+    /// Per checkout directory.
+    pub pull_requests: HashMap<PathBuf, PrEntry>,
+    pub check_logs: HashMap<String, CheckLog>,
     pub saved_grants: Vec<crate::api::features::SavedGrant>,
     pub saved_grants_loading: bool,
     pub saved_grants_error: Option<String>,

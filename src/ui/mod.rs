@@ -18,6 +18,7 @@ pub mod message;
 pub mod palette;
 pub mod permission;
 pub mod prose;
+pub mod pull_request;
 pub mod review;
 pub mod settings;
 pub mod sidebar;

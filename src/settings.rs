@@ -113,6 +113,7 @@ pub enum PanelTab {
     Terminal,
     Files,
     Agents,
+    PullRequest,
 }
 
 impl Default for Settings {

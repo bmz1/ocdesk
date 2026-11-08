@@ -7,6 +7,7 @@
 
 mod features;
 mod files;
+mod github;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -157,6 +158,7 @@ impl Controller {
             crate::demo::start(&this.store, turns, cx);
         } else {
             this.start_sidecar(cx);
+            this.start_github(cx);
         }
         this
     }
