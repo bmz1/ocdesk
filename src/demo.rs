@@ -48,7 +48,8 @@ pub fn start(store: &Entity<Store>, turns: usize, cx: &mut App) {
         model: None,
         agent: None,
     };
-    let history: Vec<Message> = (0..turns).flat_map(turn).collect();
+    let mut history: Vec<Message> = (0..turns).flat_map(turn).collect();
+    history.extend(showcase(now));
     tracing::info!(messages = history.len(), "demo mode: seeded history");
     store.update(cx, |s, cx| {
         if s.folders.is_empty() {
@@ -59,10 +60,222 @@ pub fn start(store: &Entity<Store>, turns: usize, cx: &mut App) {
         s.set_sessions(vec![session], cx);
         s.reconcile(SESSION_ID, history, cx);
         s.select(Some(SESSION_ID.into()), cx);
+        seed_showcase_state(s, cx);
     });
     if let Ok(prompt) = std::env::var("OCDESK_DEMO_AUTOPLAY") {
         stream_reply(store.clone(), prompt, cx);
     }
+}
+
+/// Turns that show the transcript's other states: a work log with many
+/// tools, a plan-agent turn, and a failed step.
+fn showcase(now: u64) -> Vec<Message> {
+    use crate::api::model::{Meta, ModelRef, Timing, UserMessage};
+    let tool = |id: &str, name: &str, input: serde_json::Value, out: &str, status| {
+        Block::Tool(Box::new(ToolCall {
+            call_id: id.into(),
+            name: name.into(),
+            status,
+            input,
+            output: out.into(),
+            error: None,
+            metadata: serde_json::Value::Null,
+        }))
+    };
+    let prose = |kind, ordinal, text: &str, secs: u64| Block::Prose {
+        kind,
+        ordinal,
+        text: text.into(),
+        done: true,
+        time: Timing {
+            created: Some(now - 60_000),
+            completed: Some(now - 60_000 + secs * 1000),
+        },
+    };
+    let meta = |agent: &str, secs: u64| Meta {
+        created: Some(now - 60_000),
+        completed: Some(now - 60_000 + secs * 1000),
+        model: Some(ModelRef {
+            provider_id: "anthropic".into(),
+            id: "claude-opus-5-5".into(),
+            variant: Some("high".into()),
+        }),
+        agent: Some(agent.into()),
+        tokens: Some(crate::api::features::Tokens {
+            input: 41_200,
+            output: 2_300,
+            ..Default::default()
+        }),
+        cost: Some(0.42),
+    };
+    let user = |id: &str, text: &str| {
+        Message::User(UserMessage {
+            id: id.into(),
+            text: text.into(),
+            attachments: vec![],
+            meta: Meta {
+                created: Some(now - 60_000),
+                ..Default::default()
+            },
+        })
+    };
+    use serde_json::json;
+    // OCDESK_DEMO_IMAGE=/path/to.png attaches an image to the first prompt.
+    let mut first = user(
+        "msg_z1",
+        "Find why the sidebar goes stale after sleep and fix it",
+    );
+    if let (Message::User(u), Ok(path)) = (&mut first, std::env::var("OCDESK_DEMO_IMAGE")) {
+        u.attachments.push(crate::api::model::Attachment {
+            name: "screenshot.png".into(),
+            uri: Some(crate::api::model::file_uri(std::path::Path::new(&path))),
+        });
+    }
+    vec![
+        first,
+        Message::Assistant(AssistantMessage {
+            id: "msg_z2".into(),
+            blocks: vec![
+                prose(
+                    BlockKind::Reasoning,
+                    0,
+                    "Start with how the client opens the stream.",
+                    4,
+                ),
+                tool(
+                    "c0",
+                    "todowrite",
+                    json!({"todos": [
+                        {"content": "Find where the stream reconnects", "status": "completed"},
+                        {"content": "Add a heartbeat watchdog", "status": "completed"},
+                        {"content": "Fix backoff resetting on every message", "status": "in_progress"},
+                        {"content": "Test a flapping server", "status": "pending"},
+                        {"content": "Rewrite the stream in WebSockets", "status": "cancelled"}
+                    ]}),
+                    "",
+                    ToolStatus::Completed,
+                ),
+                tool(
+                    "c1",
+                    "grep",
+                    json!({"pattern": "EventSource", "path": "src"}),
+                    "src/stream.ts:12",
+                    ToolStatus::Completed,
+                ),
+                tool(
+                    "c2",
+                    "read",
+                    json!({"filePath": "src/stream.ts"}),
+                    "<file>\n00001| import { backoff } from \"./backoff\"\n00002| \n00003| // Opens the stream and reconnects on error.\n00004| export function open(url: string): EventSource {\n00005|   const es = new EventSource(url)\n00006|   es.onerror = () => backoff(open, 1_000)\n00007|   return es\n00008| }\n</file>",
+                    ToolStatus::Completed,
+                ),
+                tool(
+                    "c3",
+                    "read",
+                    json!({"filePath": "src/backoff.ts"}),
+                    "…",
+                    ToolStatus::Completed,
+                ),
+                tool(
+                    "c4",
+                    "shell",
+                    json!({"command": "bun test stream"}),
+                    "3 pass\n1 fail",
+                    ToolStatus::Completed,
+                ),
+                tool(
+                    "c5",
+                    "edit",
+                    json!({"filePath": "src/stream.ts"}),
+                    "",
+                    ToolStatus::Completed,
+                ),
+                prose(
+                    BlockKind::Text,
+                    0,
+                    "The stream only reconnects on an `error` event; a half-open socket after sleep never raises one. I added a 25 s heartbeat watchdog.",
+                    0,
+                ),
+            ],
+            completed: true,
+            finish: Some("stop".into()),
+            error: None,
+            meta: meta("build", 48),
+        }),
+        user("msg_z3", "Plan the retry-budget refactor"),
+        Message::Assistant(AssistantMessage {
+            id: "msg_z4".into(),
+            blocks: vec![
+                prose(BlockKind::Reasoning, 0, "List the call sites first.", 2),
+                prose(BlockKind::Reasoning, 1, "Then group them by owner.", 3),
+                prose(
+                    BlockKind::Text,
+                    0,
+                    "## Plan\n\n1. Move the budget into `RetryPolicy`.\n2. Thread it through `Client::send`.\n3. Delete the per-call counters.",
+                    0,
+                ),
+            ],
+            completed: true,
+            finish: Some("stop".into()),
+            error: None,
+            meta: meta("plan", 21),
+        }),
+        user("msg_z5", "Run the migration against staging"),
+        Message::Assistant(AssistantMessage {
+            id: "msg_z6".into(),
+            blocks: vec![tool(
+                "c6",
+                "shell",
+                json!({"command": "bun run migrate --env staging"}),
+                "",
+                ToolStatus::Error,
+            )],
+            completed: true,
+            finish: Some("error".into()),
+            error: Some("Provider returned 529: overloaded".into()),
+            meta: meta("build", 7),
+        }),
+    ]
+}
+
+/// A pending approval, usage and a diff, so those surfaces show offline.
+fn seed_showcase_state(s: &mut Store, cx: &mut gpui_kit::Context<Store>) {
+    use crate::api::model::{FileDiff, PermissionRequest};
+    if std::env::var("OCDESK_DEMO_APPROVAL").is_ok()
+        && let Some(r) = PermissionRequest::from_json(&serde_json::json!({
+            "id": "perm_demo", "sessionID": SESSION_ID, "action": "shell",
+            "resources": ["git push --force origin main"], "save": ["git push *"],
+            "metadata": {"command": "git push --force origin main"}
+        }))
+    {
+        s.set_permissions(SESSION_ID, vec![r], cx);
+    }
+    s.usage.insert(
+        SESSION_ID.into(),
+        crate::api::features::UsageReport {
+            tokens: crate::api::features::Tokens {
+                input: 52_000,
+                output: 12_600,
+                ..Default::default()
+            },
+            cost: 1.84,
+            context: Some(64_600),
+            context_limit: Some(200_000),
+            ..Default::default()
+        },
+    );
+    s.diffs.insert(
+        SESSION_ID.into(),
+        vec![FileDiff {
+            file: "src/stream.ts".into(),
+            patch: "diff --git a/src/stream.ts b/src/stream.ts\nindex 1..2 100644\n--- a/src/stream.ts\n+++ b/src/stream.ts\n@@ -10,4 +10,8 @@ export function open() {\n   const es = new EventSource(url)\n-  es.onerror = reconnect\n+  const QUIET_MS = 25_000\n+  let timer = setTimeout(reconnect, QUIET_MS)\n+  es.onmessage = () => {\n+    clearTimeout(timer)\n+    timer = setTimeout(reconnect, QUIET_MS)\n+  }\n   return es\n }\n".into(),
+            status: "modified".into(),
+            additions: 5,
+            deletions: 1,
+            more: false,
+        }],
+    );
+    cx.notify();
 }
 
 fn id(prefix: &str, n: usize) -> String {
@@ -77,6 +290,7 @@ fn turn(i: usize) -> [Message; 2] {
         ordinal: 0,
         text: reasoning.into(),
         done: true,
+        time: Default::default(),
     }];
     if i % 3 == 1 {
         blocks.push(Block::Tool(Box::new(ToolCall {
@@ -94,11 +308,14 @@ fn turn(i: usize) -> [Message; 2] {
         ordinal: 0,
         text: answer,
         done: true,
+        time: Default::default(),
     });
     [
         Message::User(UserMessage {
             id: id("msg", 2 * i),
             text: prompt.into(),
+            attachments: vec![],
+            meta: Default::default(),
         }),
         Message::Assistant(AssistantMessage {
             id: id("msg", 2 * i + 1),
@@ -106,6 +323,7 @@ fn turn(i: usize) -> [Message; 2] {
             completed: true,
             finish: Some("stop".into()),
             error: None,
+            meta: Default::default(),
         }),
     ]
 }
@@ -226,6 +444,7 @@ pub fn stream_reply(store: Entity<Store>, prompt: String, cx: &mut App) {
             session_id: sid(),
             message_id: user_id,
             text: prompt.clone(),
+            attachments: vec![],
         },
         cx,
     );
@@ -234,6 +453,8 @@ pub fn stream_reply(store: Entity<Store>, prompt: String, cx: &mut App) {
         Event::StepStarted {
             session_id: sid(),
             message_id: msg_id.clone(),
+            model: None,
+            agent: None,
         },
         cx,
     );
@@ -293,6 +514,8 @@ pub fn stream_reply(store: Entity<Store>, prompt: String, cx: &mut App) {
                     session_id: sid(),
                     message_id: msg_id.clone(),
                     finish: "stop".into(),
+                    tokens: None,
+                    cost: None,
                 },
                 cx,
             );

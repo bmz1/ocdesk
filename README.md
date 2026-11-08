@@ -13,10 +13,11 @@ ocdesk (Rust/GPUI) ──HTTP──▶ opencode serve   (child process, 127.0.0.
                    ◀──SSE───  GET /api/event   (one stream for every folder)
 ```
 
-**Status:** M1–M3: folders and sessions, streaming markdown, selectable text,
-collapsible reasoning, expandable tool cards, permission replies and latest-turn
-file diffs. Send/stop, reconnect, crash recovery and dark theme included.
-See *Roadmap* and [handoff.md](handoff.md).
+**Status:** M0–M7 plus attachments, permission modes, native notifications/unread,
+Settings, branch/commit diff review and usage/context details. The queue/steer,
+background-task and worktree controls are preserved. See
+[desktop features](docs/desktop-features.md) for behavior and API limitations,
+and [handoff.md](handoff.md) for current verification and next steps.
 
 ![ocdesk markdown](docs/screenshots/m2-markdown.png)
 
@@ -89,15 +90,47 @@ Drag the sidebar's right edge to resize it (double-click resets it).
 
 | Keys | Action |
 |---|---|
+| `Mod+K` | Command palette: sessions, folders, actions, models, view |
+| `Mod+F` | Find in the conversation (Enter / Shift+Enter step) |
 | `Mod+N` | New session |
 | `Mod+O` | Add folder… |
 | `Mod+B` | Show/hide sidebar |
-| `Alt+↑` / `Alt+↓` | Previous / next session (sidebar order, expanded folders) |
+| `Mod+Shift+U` | Sessions that need you (approvals, questions, failures, news) |
+| `Alt+↑` / `Alt+↓`, `Ctrl+Tab` / `Ctrl+Shift+Tab` | Previous / next session |
+| `↑` / `↓`, `Enter`, `Delete`, `P` (sidebar focused) | Move, open, archive, pin |
+| `F2` | Rename session |
+| `F6` / `Shift+F6` | Focus sidebar → conversation → prompt → panel |
 | `Mod+L` | Focus the prompt |
-| `Mod+.` or `Esc` in the prompt | Stop the running turn |
-| `Mod+Shift+D` | Toggle Changes / Conversation |
+| `Mod+.` or `Esc Esc` in the prompt | Stop the running turn |
+| `Enter` / `Esc` with an empty prompt | Allow once / deny a pending approval (typed text + Enter denies with feedback) |
+| `Ctrl+O` (macOS) / `Ctrl+Shift+O` | Transcript detail: normal → verbose → hide successful work |
+| `Mod+Shift+I` / `Mod+Shift+R` / `Mod+Shift+M` | Choose model / next reasoning effort / next permission mode |
+| `Mod+Shift+D` / `Mod+Shift+T` / `` Ctrl+` `` | Right panel: Changes / Tasks / Terminal |
+| `Mod+Shift+C` | Copy the last reply |
+| `Mod+Shift+V` | Paste large text inline instead of as a file |
 | `Mod+/` | Keyboard shortcuts |
 | `Mod+Q` | Quit |
+
+**Transcript.** Tool calls fold into one work-log row ("Ran 2 commands,
+edited 3 files and 2 more"); while a call runs the row names it. Reasoning
+shows as "Thought for 4s". Under a turn's last reply: Copy, and on hover
+its duration, model, tokens, cost and **Fork from here**. Hovering a prompt
+offers **Undo from here** (removes it, its replies and their file changes).
+Failed steps get **Retry**; a finished plan-agent turn offers **Implement
+plan**. The header shows context use (ring), tokens and cost; at 80 % a
+**Compact** button appears.
+
+**Todos and images.** When the agent keeps a todo list (`todowrite`), a
+pill above the prompt shows progress and the current step; click it for the
+checklist. Each update appears in the work log as "Updated todos · 3/5
+done". Image attachments show as thumbnails in the prompt box and in the
+transcript; click one to see it full size.
+
+**Right panel.** **Changes** reviews the latest turn, working tree, branch or
+commits file by file; hover a line and press `+` to comment, then **Send to
+agent** turns the comments into one prompt. **Tasks** lists subagents and
+background shells. **Terminal** opens the session's shell (opencode's
+persistent PTY), which survives switching sessions and restarts.
 
 **Errors.** If opencode is missing, too old or crashes, the sidebar footer
 shows why, with **Restart opencode** and **Copy details** (the error plus
@@ -105,8 +138,11 @@ opencode's last output lines); a banner above the composer explains why
 prompts are paused. A conversation whose history can't be loaded shows the
 error with a **Retry** button.
 
-**Theme.** Dark by default. Set `"theme": "light"` or `"system"` in
-`settings.json`, or `OCDESK_THEME=light|system`.
+**Theme.** opencode's own colours (generated from `@opencode/ui`'s tokens,
+see `dev/gen-opencode-theme.py`) with Inter and IBM Plex Mono bundled
+(SIL OFL, `assets/fonts/`). Dark by default; set `"theme": "light"` or
+`"system"` in `settings.json` or the command palette, or
+`OCDESK_THEME=light|system`.
 
 Logs go to the platform data dir, e.g. `~/.local/share/ocdesk/logs/ocdesk.log`
 (Linux) or `~/Library/Application Support/ocdesk/logs/ocdesk.log` (macOS).
@@ -234,16 +270,25 @@ src/
   api/mod.rs         thin HTTP client + SSE reader (the only place that does HTTP)
   api/model.rs       our view of sessions/messages/blocks (lenient JSON parsing)
   api/events.rs      server events → our normalized Event enum
+  api/pty.rs         session terminals: persistent PTYs over a WebSocket
   store.rs           Entity<Store>: folders, sessions, conversations, busy; folds events
   controller.rs      intents → API calls; folders, sidecar lifecycle, auto-restart, SSE pump
   ui/app_view.rs     root layout: sidebar | conversation; theme; window/sidebar persistence
-  ui/keys.rs         app-wide shortcuts and the shortcuts sheet
-  ui/sidebar.rs      folders with their sessions; new / rename / delete; connection
-  ui/conversation.rs virtualized message list (MessageScroller), start screen
-  ui/message.rs      one message: plain text, reasoning, tool cards
-  ui/tool_card.rs    expandable tool input/output, errors, exit/truncation metadata
-  ui/permission.rs   pending permissions with explicit allow/reject actions
-  ui/changes.rs      read-only, color-coded latest-turn file patches
+  ui/keys.rs         app-wide shortcuts, menu bar and the shortcuts sheet
+  ui/kit.rs          shared components (status slot, monogram, context ring, toast…)
+  ui/theme.rs        opencode theme + bundled fonts
+  ui/palette.rs      command palette (Mod+K)
+  ui/sidebar.rs      folders and sessions: status, pin, archive/undo, sections, Needs you
+  ui/conversation.rs header, virtualized message list, find bar, right panel, status strip
+  ui/message.rs      one message: prose, reasoning rows, turn footer, plan bar
+  ui/tool_card.rs    work-log rows and tool cards, density
+  ui/permission.rs   approvals above the prompt (keyboard: Enter / Esc / typed reply)
+  ui/changes.rs      patch parsing and the diff view
+  ui/review.rs       Changes tab: scopes, files, inline review comments
+  ui/terminal.rs     Terminal tab (alacritty_terminal emulator)
+  ui/syntax.rs       syntax colours for diffs, file reads and written files
+  ui/todos.rs        todo list from todowrite: progress pill and checklists
+  ui/images.rs       image thumbnails and the full-size viewer
   ui/composer.rs     prompt box, Send ↔ Stop, agent/model/variant pickers, @ popup, history
   ui/mention.rs      @ query detection, tokens → prompt attachments, history (pure)
   ui/form_view.rs    question forms (form.*) above the composer
@@ -301,6 +346,8 @@ handoff.md                       state of the project for the next session
 - [x] **M4** Question forms, @mentions (files, subagents), model/variant/agent picker, prompt history
 - [x] **M5** Keyboard, persistence of window/sidebar, error states
 - [x] **M6** Packaging (.app, AppImage), CI
+- [x] **M7** Queue/steer, slash commands/skills, background tasks, branches/worktrees
+- [x] **Desktop feature batch** Attachments, permission modes, notifications/unread, Settings, full diff review, usage/context (items 4–8 and 10; Git write actions excluded)
 
 ## Design
 

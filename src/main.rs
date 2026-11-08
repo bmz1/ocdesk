@@ -1,6 +1,7 @@
 mod api;
 mod controller;
 mod demo;
+mod notifications;
 mod settings;
 mod shell_env;
 mod sidecar;
@@ -69,25 +70,29 @@ fn main() -> Result<()> {
     });
 
     let _sidecar_guard = SidecarGuard;
-    gpui_kit::application()
-        .with_assets(ui::icons::AppAssets)
-        .run(move |cx| {
-            gpui_kit::init(cx);
-            cx.on_app_quit(|_| {
-                sidecar::kill_sidecar();
-                async {}
-            })
-            .detach();
-            ui::keys::bind(cx);
-            let settings = settings::Settings::load();
-            let opts = ui::app_view::window_options(&settings, cx);
-            if let Err(e) = gpui_kit::open_window(opts, cx, |window, cx| {
-                cx.new(|cx| AppView::new(rt, settings, window, cx))
-            }) {
-                tracing::error!("failed to open window: {e:#}");
-                cx.quit();
-            }
-        });
+    let app = gpui_kit::application().with_assets(ui::icons::AppAssets);
+    // Dock click while the window is in the background: bring it forward.
+    app.on_reopen(|cx| cx.activate(true));
+    app.run(move |cx| {
+        gpui_kit::init(cx);
+        ui::theme::install(cx);
+        cx.set_app_identity(ui::app_view::APP_ID, "ocdesk");
+        cx.on_app_quit(|_| {
+            sidecar::kill_sidecar();
+            async {}
+        })
+        .detach();
+        ui::keys::bind(cx);
+        ui::keys::set_menus(cx);
+        let settings = settings::Settings::load();
+        let opts = ui::app_view::window_options(&settings, cx);
+        if let Err(e) = gpui_kit::open_window(opts, cx, |window, cx| {
+            cx.new(|cx| AppView::new(rt, settings, window, cx))
+        }) {
+            tracing::error!("failed to open window: {e:#}");
+            cx.quit();
+        }
+    });
     tracing::info!("event loop ended");
     drop(runtime);
     Ok(())

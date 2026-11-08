@@ -22,7 +22,6 @@ use crate::controller::Controller;
 use crate::store::{Store, StoreEvent};
 use crate::ui::icons;
 
-pub const DRAWER_W: f32 = 420.;
 const POLL: Duration = Duration::from_secs(1);
 
 /// What the drawer shows.
@@ -173,16 +172,6 @@ impl TasksDrawer {
                     .font_weight(FontWeight::MEDIUM)
                     .when(!back, |d| d.pl_2())
                     .child(title),
-            )
-            .child(
-                Button::new("tasks-close")
-                    .icon(IconName::Close)
-                    .ghost()
-                    .small()
-                    .tooltip_with_action("Close", &super::keys::ToggleTasks, None)
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(super::keys::ToggleTasks), cx)
-                    }),
             )
     }
 
@@ -493,15 +482,7 @@ impl Render for TasksDrawer {
             }
         };
         v_flex()
-            .id("tasks-drawer")
-            .w(px(DRAWER_W))
-            .h_full()
-            .flex_none()
-            // The drawer can float over the conversation: keep wheel and
-            // mouse events from reaching the message list behind it.
-            .occlude()
-            .border_l_1()
-            .border_color(theme.border)
+            .size_full()
             .bg(theme.background)
             .child(self.header(title, cx))
             .child(
@@ -572,44 +553,19 @@ pub fn background_shell(t: &ToolCall) -> Option<String> {
 
 /// "Ran 3 commands, read 2 files, edited 1 file" from a child transcript.
 pub fn activity_summary(messages: &[Message]) -> Option<String> {
-    let mut counts = [0usize; 4]; // ran, read, edited, searched
-    for m in messages {
-        if let Message::Assistant(a) = m {
-            for b in &a.blocks {
-                if let Block::Tool(t) = b {
-                    let slot = match t.name.as_str() {
-                        "shell" | "bash" | "execute" => 0,
-                        "read" => 1,
-                        "edit" | "write" | "patch" => 2,
-                        "grep" | "glob" | "list" | "websearch" | "webfetch" => 3,
-                        _ => continue,
-                    };
-                    counts[slot] += 1;
-                }
-            }
+    super::tool_card::tools_summary(messages.iter().flat_map(|m| {
+        match m {
+            Message::Assistant(a) => a
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Tool(t) => Some(&**t),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
         }
-    }
-    let plural =
-        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    let parts: Vec<String> = [
-        (counts[0], "Ran", "command", "commands"),
-        (counts[1], "read", "file", "files"),
-        (counts[2], "edited", "file", "files"),
-        (counts[3], "searched", "time", "times"),
-    ]
-    .into_iter()
-    .filter(|(n, ..)| *n > 0)
-    .map(|(n, verb, one, many)| format!("{verb} {}", plural(n, one, many)))
-    .collect();
-    if parts.is_empty() {
-        return None;
-    }
-    let mut s = parts.join(", ");
-    // Capitalize the first verb only.
-    if let Some(first) = s.get_mut(0..1) {
-        first.make_ascii_uppercase();
-    }
-    Some(s)
+    }))
 }
 
 /// The child's final answer: the last assistant text.
@@ -680,7 +636,7 @@ mod tests {
         });
         assert_eq!(
             activity_summary(&[msg]).as_deref(),
-            Some("Ran 2 commands, read 1 file, searched 1 time")
+            Some("Ran 2 commands, read 1 file and 1 more")
         );
         assert_eq!(activity_summary(&[]), None);
     }

@@ -20,6 +20,8 @@ pub struct Envelope {
     /// Durable per-session sequence number, if the event is durable.
     pub seq: Option<u64>,
     pub directory: Option<PathBuf>,
+    /// Server time of the event (epoch ms); 0 for local events.
+    pub created: u64,
 }
 
 /// How a turn (an "execution") ended.
@@ -62,6 +64,11 @@ pub enum Event {
     },
     /// Models, agents or providers changed (config edit, login, …).
     CatalogChanged,
+    UsageUpdated {
+        session_id: String,
+        tokens: Value,
+        cost: f64,
+    },
     /// The session started working on its inbox.
     ExecutionStarted {
         session_id: String,
@@ -126,10 +133,13 @@ pub enum Event {
         session_id: String,
         message_id: String,
         text: String,
+        attachments: Vec<super::model::Attachment>,
     },
     StepStarted {
         session_id: String,
         message_id: String,
+        model: Option<ModelRef>,
+        agent: Option<String>,
     },
     BlockStarted {
         session_id: String,
@@ -206,6 +216,8 @@ pub enum Event {
         session_id: String,
         message_id: String,
         finish: String,
+        tokens: Option<Value>,
+        cost: Option<f64>,
     },
     StepFailed {
         session_id: String,
@@ -226,6 +238,7 @@ impl Envelope {
             event,
             seq: None,
             directory: None,
+            created: 0,
         }
     }
 
@@ -245,6 +258,7 @@ impl Envelope {
             event,
             seq,
             directory,
+            created,
         })
     }
 }
@@ -286,6 +300,11 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
         },
         // Config changes: the model/agent lists may have changed.
         "model.updated" | "agent.updated" | "provider.updated" => Event::CatalogChanged,
+        "session.usage.updated" => Event::UsageUpdated {
+            session_id: sid()?,
+            tokens: d.get("tokens")?.clone(),
+            cost: d.get("cost").and_then(Value::as_f64).unwrap_or(0.),
+        },
         "session.renamed" => Event::SessionRenamed {
             session_id: sid()?,
             title: str_at(d, "/title")?,
@@ -348,6 +367,8 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
         "session.step.started" => Event::StepStarted {
             session_id: sid()?,
             message_id: mid()?,
+            model: d.get("model").and_then(ModelRef::from_json),
+            agent: str_at(d, "/agent"),
         },
         "session.text.started" | "session.reasoning.started" => Event::BlockStarted {
             session_id: sid()?,
@@ -420,6 +441,8 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
             session_id: sid()?,
             message_id: mid()?,
             finish: str_at(d, "/finish").unwrap_or_default(),
+            tokens: d.get("tokens").cloned(),
+            cost: d.get("cost").and_then(Value::as_f64),
         },
         "session.step.failed" => Event::StepFailed {
             session_id: sid()?,

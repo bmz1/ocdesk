@@ -10,8 +10,8 @@ publish = false
 [dependencies]
 # gpui-kit 0.9.0 bundles gpui-pre =0.3.11 (snapshot of zed@f816e1f), the native
 # platform crate and gpui-component. Pinned exactly: any snapshot can change GPUI's API.
-gpui-kit = { version = "=0.9.0" }
-tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "signal"] }
+gpui-kit = { version = "=0.9.0", features = ["syntect"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "signal", "fs"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -23,6 +23,14 @@ dirs = "6"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 libc = "0.2"
+# Terminal tab: opencode PTYs over a WebSocket, emulated locally.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake"] }
+alacritty_terminal = "0.25"
+base64 = "0.22"
+# Highlighting outside markdown (diffs, file reads): the same syntect and
+# syntax set gpui-component's `syntect` feature already builds.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
+two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
 
 [profile.dev.package."*"]
 opt-level = 2

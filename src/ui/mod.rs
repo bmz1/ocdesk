@@ -6,14 +6,24 @@ pub mod form_view;
 pub mod frame_stats;
 pub mod git;
 pub mod icons;
+pub mod images;
 pub mod keys;
+pub mod kit;
 pub mod mention;
 pub mod message;
+pub mod palette;
 pub mod permission;
 pub mod prose;
+pub mod review;
+pub mod settings;
 pub mod sidebar;
+pub mod syntax;
 pub mod tasks;
+pub mod terminal;
+pub mod theme;
+pub mod todos;
 pub mod tool_card;
+pub mod usage;
 
 use std::path::PathBuf;
 

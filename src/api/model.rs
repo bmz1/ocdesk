@@ -209,6 +209,7 @@ pub struct PromptInput {
     pub text: String,
     /// Absolute paths; the server reads and inlines them (`file://` URIs).
     pub files: Vec<(std::path::PathBuf, Mention)>,
+    pub attachments: Vec<std::path::PathBuf>,
     /// Subagent ids to delegate to.
     pub agents: Vec<(String, Mention)>,
     /// Skill ids to load for this prompt (`/skill` picks).
@@ -253,6 +254,7 @@ pub struct InboxItem {
     pub kind: String,
     pub text: String,
     pub delivery: Delivery,
+    pub attachments: Vec<Attachment>,
 }
 
 impl InboxItem {
@@ -269,6 +271,7 @@ impl InboxItem {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            attachments: Attachment::list(v.pointer("/payload/files").unwrap_or(&Value::Null)),
             delivery: v
                 .get("delivery")
                 .and_then(Value::as_str)
@@ -279,9 +282,15 @@ impl InboxItem {
 }
 
 impl PromptInput {
+    pub fn validate_attachments(&self) -> anyhow::Result<()> {
+        if self.files.len() + self.attachments.len() > 100 {
+            anyhow::bail!("A prompt can contain at most 100 files, including @ mentions");
+        }
+        Ok(())
+    }
     pub fn to_json(&self) -> Value {
         let mut v = serde_json::json!({ "text": self.text });
-        if !self.files.is_empty() {
+        if !self.files.is_empty() || !self.attachments.is_empty() {
             v["files"] = self
                 .files
                 .iter()
@@ -292,6 +301,9 @@ impl PromptInput {
                         "mention": m.to_json(),
                     })
                 })
+                .chain(self.attachments.iter().map(|path| serde_json::json!({
+                    "uri": file_uri(path), "name": path.file_name().unwrap_or_default().to_string_lossy()
+                })))
                 .collect();
         }
         if !self.agents.is_empty() {
@@ -363,6 +375,88 @@ pub struct MarkerMessage {
 pub struct UserMessage {
     pub id: String,
     pub text: String,
+    pub attachments: Vec<Attachment>,
+    pub meta: Meta,
+}
+
+/// When a block started and ended (epoch ms). Display only; equality
+/// ignores it, like [`Meta`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Timing {
+    pub created: Option<u64>,
+    pub completed: Option<u64>,
+}
+
+impl PartialEq for Timing {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// Display-only facts about a message or block: times (epoch ms), the
+/// model and agent that produced it, and its usage.
+///
+/// Equality ignores it on purpose: streamed state stamps times from event
+/// envelopes while the REST projection has its own, and the store's
+/// "matches REST" check (`OCDESK_VERIFY_ON_IDLE`) is about content.
+#[derive(Clone, Debug, Default)]
+pub struct Meta {
+    pub created: Option<u64>,
+    pub completed: Option<u64>,
+    pub model: Option<ModelRef>,
+    pub agent: Option<String>,
+    pub tokens: Option<crate::api::features::Tokens>,
+    pub cost: Option<f64>,
+}
+
+impl PartialEq for Meta {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Meta {
+    /// `{time: {created, completed}, model, agent, tokens, cost}` as the
+    /// projection writes it on messages and blocks.
+    pub fn from_json(v: &Value) -> Self {
+        Self {
+            created: u64_at(v, "/time/created"),
+            completed: u64_at(v, "/time/completed"),
+            model: v.get("model").and_then(ModelRef::from_json),
+            agent: str_at(v, "/agent"),
+            tokens: v.get("tokens").map(crate::api::features::Tokens::parse),
+            cost: v.get("cost").and_then(Value::as_f64),
+        }
+    }
+}
+/// Metadata only: never clone the base64 file bodies into the view store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attachment {
+    pub name: String,
+    pub uri: Option<String>,
+}
+impl Attachment {
+    pub fn list(value: &Value) -> Vec<Self> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|v| Self {
+                name: v["name"].as_str().unwrap_or("Attached file").to_string(),
+                uri: v
+                    .pointer("/source/uri")
+                    .or_else(|| v.get("uri"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+            .collect()
+    }
+    pub fn path(&self) -> Option<PathBuf> {
+        reqwest::Url::parse(self.uri.as_deref()?)
+            .ok()?
+            .to_file_path()
+            .ok()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -372,6 +466,7 @@ pub struct AssistantMessage {
     pub completed: bool,
     pub finish: Option<String>,
     pub error: Option<String>,
+    pub meta: Meta,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -389,6 +484,8 @@ pub enum Block {
         ordinal: u64,
         text: String,
         done: bool,
+        /// When the block started and ended (display only).
+        time: Timing,
     },
     Tool(Box<ToolCall>),
 }
@@ -422,6 +519,8 @@ pub struct PermissionRequest {
     pub save: Vec<String>,
     pub message: Option<String>,
     pub metadata: Value,
+    /// The tool call that asked (`source.id`), when a tool did.
+    pub call_id: Option<String>,
 }
 
 impl PermissionRequest {
@@ -445,6 +544,7 @@ impl PermissionRequest {
             save: strings("save"),
             message: str_at(v, "/message"),
             metadata: v.get("metadata").cloned().unwrap_or(Value::Null),
+            call_id: str_at(v, "/source/id"),
         })
     }
 }
@@ -603,6 +703,8 @@ impl Message {
             "user" => Some(Message::User(UserMessage {
                 id,
                 text: str_at(v, "/text").unwrap_or_default(),
+                attachments: Attachment::list(&v["files"]),
+                meta: Meta::from_json(v),
             })),
             "assistant" => {
                 let mut ordinals = [0u64; 2];
@@ -621,6 +723,7 @@ impl Message {
                     completed: v.pointer("/time/completed").is_some(),
                     finish: str_at(v, "/finish"),
                     error: error_text(v.get("error")),
+                    meta: Meta::from_json(v),
                 }))
             }
             "compaction" => {
@@ -696,6 +799,10 @@ impl Block {
             ordinal,
             text: str_at(v, "/text").unwrap_or_default(),
             done: true,
+            time: Timing {
+                created: u64_at(v, "/time/created"),
+                completed: u64_at(v, "/time/completed"),
+            },
         })
     }
 }
@@ -1035,5 +1142,46 @@ mod marker_tests {
         .unwrap();
         assert!(matches!(&skill, Message::Marker(m) if m.text == "Skill: greeter"));
         assert!(Message::from_v2_json(&json!({"type":"idle","id":"msg_i"})).is_none());
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    #[test]
+    fn regular_attachments_have_encoded_uris_without_fabricated_mention_offsets() {
+        let mut input = PromptInput {
+            attachments: (0..100)
+                .map(|i| PathBuf::from(format!("/tmp/file {i}#.txt")))
+                .collect(),
+            ..Default::default()
+        };
+        input.validate_attachments().unwrap();
+        let v = input.to_json();
+        assert_eq!(v["files"].as_array().unwrap().len(), 100);
+        assert_eq!(v["files"][0]["uri"], "file:///tmp/file%200%23.txt");
+        assert!(v["files"][0].get("mention").is_none());
+        input.files.push((
+            PathBuf::from("/tmp/mention"),
+            Mention {
+                start: 0,
+                end: 8,
+                text: "@mention".into(),
+            },
+        ));
+        assert!(
+            input.validate_attachments().is_err(),
+            "@ mentions share the 100-file limit"
+        );
+    }
+    #[test]
+    fn attachment_metadata_survives_inbox_delivery_and_rest_without_retaining_bytes() {
+        let inbox=InboxItem::from_json(None,&serde_json::json!({"id":"msg_1","type":"user","delivery":"queue","payload":{"text":"","files":[{"uri":"file:///tmp/a%20b.png","name":"a b.png"}]}})).unwrap();
+        let Message::User(message)=Message::from_v2_json(&serde_json::json!({"id":"msg_1","type":"user","text":"","files":[{"name":"a b.png","mime":"image/png","data":"VERY LARGE BYTES","source":{"type":"uri","uri":"file:///tmp/a%20b.png"}}]})).unwrap()else{panic!()};
+        assert_eq!(inbox.attachments, message.attachments);
+        assert_eq!(
+            message.attachments[0].path(),
+            Some(PathBuf::from("/tmp/a b.png"))
+        );
     }
 }
