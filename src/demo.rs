@@ -276,7 +276,9 @@ fn showcase(now: u64) -> Vec<Message> {
             )],
             completed: true,
             finish: Some("error".into()),
-            error: Some("Provider returned 529: overloaded".into()),
+            error: Some(
+                "Migration 0042_retry_budget failed: column \"budget\" already exists".into(),
+            ),
             meta: meta("build", 7),
         }),
     ]
