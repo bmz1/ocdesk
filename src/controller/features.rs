@@ -30,8 +30,8 @@ impl Controller {
         let store = self.store.read(cx);
         if !store.busy.is_empty()
             || !store.submitting.is_empty()
-            || store.permissions.values().any(|r| !r.is_empty())
-            || store.forms.values().any(|r| !r.is_empty())
+            || store.permissions.any_pending()
+            || store.forms.any_pending()
         {
             anyhow::bail!(
                 "Finish running turns and pending approvals before reloading configuration."
@@ -79,14 +79,14 @@ impl Controller {
     }
     pub fn refresh_session_mode(&mut self, sid: String, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
-        let version = *self.mode_requests.entry(sid.clone()).or_default();
+        let version = self.mode_requests.current(sid.clone());
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.session_mode(&sid).await.map(|m| (sid, m)) },
             move |this, res, cx| {
                 if let Ok((sid, m)) = res
-                    && this.mode_requests.get(&sid) == Some(&version)
+                    && this.mode_requests.is_current(&sid, version)
                 {
                     this.store.update(cx, |s, cx| {
                         s.session_modes.insert(sid, m);
@@ -108,7 +108,7 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        *self.mode_requests.entry(sid.clone()).or_default() += 1;
+        self.mode_requests.bump(sid.clone());
         self.store.update(cx, |s, cx| {
             s.mode_sending.insert(sid.clone());
             cx.notify();
@@ -116,7 +116,7 @@ impl Controller {
         let id = sid.clone();
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.set_session_mode(&id, mode).await },
             move |this, res, cx| {
                 this.store.update(cx, |s, cx| {
@@ -157,7 +157,7 @@ impl Controller {
             return;
         };
         // Coalesce stream bursts. A newer cumulative total invalidates the old REST response.
-        if self.store.read(cx).usage_loading.contains(&sid) {
+        if self.store.read(cx).usage_status.is_loading(&sid) {
             if details {
                 self.usage_details_pending.insert(sid);
             }
@@ -166,10 +166,9 @@ impl Controller {
         let details = details || self.usage_details_pending.remove(&sid);
         // A loaded conversation already holds the per-model numbers.
         let history = details && self.store.read(cx).usage_needs_history(&sid);
-        let revision = *self.usage_revision.entry(sid.clone()).or_default();
+        let revision = self.usage_revision.current(sid.clone());
         self.store.update(cx, |s, cx| {
-            s.usage_loading.insert(sid.clone());
-            s.usage_errors.remove(&sid);
+            s.usage_status.begin(sid.clone());
             cx.emit(StoreEvent::UsageChanged {
                 session_id: sid.clone(),
             });
@@ -177,34 +176,35 @@ impl Controller {
         let id = sid.clone();
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.usage_report(&id, &folder, details, history).await },
             move |this, res, cx| {
-                let changed = this.usage_revision.get(&sid) != Some(&revision);
+                if this.store.read(cx).session(&sid).is_none() {
+                    // Deleted while in flight: don't resurrect its usage entry.
+                    this.store.update(cx, |s, _| s.usage_status.remove(&sid));
+                    return;
+                }
+                let changed = !this.usage_revision.is_current(&sid, revision);
                 this.store.update(cx, |s, cx| {
-                    s.usage_loading.remove(&sid);
-                    match res {
-                        Ok(mut report) => {
-                            let old = s.usage.remove(&sid);
-                            if let Some(old) = &old
-                                && changed
-                            {
-                                report.tokens = old.tokens.clone();
-                                report.cost = old.cost;
-                            }
-                            // A summary keeps what the last details fetch found.
-                            if !details && let Some(old) = old {
-                                report = crate::api::features::UsageReport {
-                                    tokens: report.tokens,
-                                    cost: report.cost,
-                                    ..old
-                                };
-                            }
-                            s.usage.insert(sid.clone(), report);
+                    let error = res.as_ref().err().map(|e| format!("{e:#}"));
+                    s.usage_status.finish(sid.clone(), error);
+                    if let Ok(mut report) = res {
+                        let old = s.usage.remove(&sid);
+                        if let Some(old) = &old
+                            && changed
+                        {
+                            report.tokens = old.tokens.clone();
+                            report.cost = old.cost;
                         }
-                        Err(e) => {
-                            s.usage_errors.insert(sid.clone(), format!("{e:#}"));
+                        // A summary keeps what the last details fetch found.
+                        if !details && let Some(old) = old {
+                            report = crate::api::features::UsageReport {
+                                tokens: report.tokens,
+                                cost: report.cost,
+                                ..old
+                            };
                         }
+                        s.usage.insert(sid.clone(), report);
                     }
                     cx.emit(StoreEvent::UsageChanged {
                         session_id: sid.clone(),
@@ -361,8 +361,10 @@ impl Controller {
     pub(super) fn product_event(&mut self, env: &Envelope, cx: &mut Context<Self>) {
         if let Event::SessionRemoved { session_id } = &env.event {
             // The store forgets its own state when it applies the event.
-            self.mode_requests.remove(session_id);
-            self.usage_revision.remove(session_id);
+            self.mode_requests.forget(session_id);
+            self.usage_revision.forget(session_id);
+            self.model_choices.forget(session_id);
+            self.agent_choices.forget(session_id);
             self.usage_details_pending.remove(session_id);
             self.fetched_epoch.remove(session_id);
             self.update_settings(cx, |s| {
@@ -371,13 +373,23 @@ impl Controller {
             cx.dismiss_system_notification(&format!("ocdesk:{session_id}"));
             return;
         }
+        // Server reports keep optimistic rollbacks pointed at its value.
+        match &env.event {
+            Event::ModelSelected { session_id, model } => {
+                self.model_choices.observed(session_id, model)
+            }
+            Event::AgentSelected { session_id, agent } => {
+                self.agent_choices.observed(session_id, agent)
+            }
+            _ => {}
+        }
         if let Event::UsageUpdated {
             session_id,
             tokens,
             cost,
         } = &env.event
         {
-            *self.usage_revision.entry(session_id.clone()).or_default() += 1;
+            self.usage_revision.bump(session_id.clone());
             self.store.update(cx, |s, cx| {
                 let r = s.usage.entry(session_id.clone()).or_default();
                 r.tokens = crate::api::features::Tokens::parse(tokens);
@@ -431,26 +443,25 @@ impl Controller {
     pub fn refresh_saved_grants(&mut self, cx: &mut Context<Self>) {
         let Some(api) = self.api(cx) else { return };
         let folders = self.store.read(cx).folders.clone();
-        let generation = self.generation;
         self.grant_requests += 1;
         let request = self.grant_requests;
         self.store.update(cx, |s, cx| {
-            s.saved_grants_loading = true;
-            s.saved_grants_error = None;
+            s.saved_grants_status.begin();
             cx.notify();
         });
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move { api.saved_grants(&folders).await },
             move |this, res, cx| {
-                if this.generation != generation || this.grant_requests != request {
+                if this.grant_requests != request {
                     return;
                 }
                 this.store.update(cx, |s, cx| {
-                    s.saved_grants_loading = false;
-                    match res {
-                        Ok(grants) => s.saved_grants = grants,
-                        Err(e) => s.saved_grants_error = Some(format!("{e:#}")),
+                    let error = res.as_ref().err().map(|e| format!("{e:#}"));
+                    s.saved_grants_status.finish(error);
+                    if let Ok(grants) = res {
+                        s.saved_grants = grants;
                     }
                     cx.notify();
                 });
@@ -464,14 +475,14 @@ impl Controller {
         let Some(api) = self.api(cx) else { return };
         self.grant_requests += 1;
         self.store.update(cx, |s, cx| {
-            s.saved_grants_loading = false;
+            s.saved_grants_status.abandon();
             s.grant_sending.insert(id.clone());
             cx.notify();
         });
         let target = id.clone();
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.revoke_grant(&target).await },
             move |this, res, cx| {
                 this.grant_requests += 1;

@@ -129,6 +129,9 @@ verify registration in an isolated directory.
 
 ## Architecture
 
+See [State machines and transition ownership](state-machines.md) for the lifecycle
+inventory, async ownership contracts and regression scenarios.
+
 ```
 src/
   main.rs            bootstrap: logging, tokio runtime thread, signals, window
@@ -204,3 +207,98 @@ packaging/                       icon, macOS bundle script + Info.plist, Linux A
 - **Crash recovery:** if the sidecar dies it is restarted automatically
   (up to 3 times a minute), then the UI reconnects and reconciles. A Restart
   button covers the rest.
+
+## Async state ownership
+
+`domain/history.rs` owns the pure availability/request transition: Unloaded →
+Loading → Ready, or Ready → Refreshing → Ready. Failure/cancellation releases the
+request while preserving an existing baseline. The Store owns a private ticket
+allocator across all sessions: eviction/deletion cannot reuse a ticket that an
+old HTTP response still carries. Completion requires the active ticket, so stale,
+foreign-session and duplicate responses cannot install history or clear errors.
+The store's completion adapter executes the existing reconciliation algorithm and
+emits the same fine-grained `StoreEvent`s; it does not clone the whole store.
+
+At stream disconnect and sidecar restart, the controller cancels pending history
+state and clears its bounded event buffers. Reconnect still re-fetches selected
+history and invalidates other cached projections for selection-time reload.
+Cached rows remain available during refresh. Overflow cancels the snapshot and
+requires another read rather than silently dropping events.
+
+`domain/requests.rs` separates `ServerGeneration` from `ConnectionEpoch`.
+`RequestScope::Connection` rejects a response after either a stream boundary or
+server replacement. `RequestScope::Server` survives stream reconnects but rejects
+server replacement. These scopes do not replace per-resource versions or live
+revision checks. Rejected callbacks are logged at debug level with their issue
+identity and current generation/epoch; they never mutate the new state.
+
+Per-resource "latest wins" guards use `Revisions<K>` from the same module
+(working diff and task reads per directory, permission mode and usage totals per
+session). Every revision comes from one counter, so `forget` on folder removal or
+session deletion can never let a pre-removal response alias a fresh request.
+Removing a folder also forgets its worktree checkouts' revisions
+(`Store::forget_folder` returns the directories it dropped). Saved-grant
+refreshes keep a plain counter: it is never forgotten, so it cannot alias.
+
+Debounces and timers are owned GPUI tasks, not counters: the notice auto-clear,
+catalog-refresh debounce and settings-save debounce are `Option<Task<()>>` fields
+on the controller. Replacing one drops (cancels) the previous timer;
+`flush_settings` drops the pending save. `Controller::run` is unfenced and
+detached by design: it is for mutations whose outcome is persisted server state
+(delete, rename, archive, worktrees, inbox) or local work (opening an editor).
+Reads and completions that roll back or show transient state use `run_on`.
+
+`domain/fetch.rs` holds the request status of re-fetchable cached data (saved
+grants, folder diffs, usage): `FetchStatus` is `Idle | Loading | Failed`, so
+loading and failed are exclusive. The cached value stays beside it, so a refresh
+or a failed refresh still shows the last data. Sidecar restart abandons
+in-flight fetches and keeps shown errors.
+
+`gh` failures are a typed `GhFailed` with the CLI's stderr; "no pull request" is
+classified there (gh has no distinct exit code), never on a formatted error chain.
+Controller warnings use structured fields (`op`, `session_id`/`dir`, `generation`,
+`error`).
+
+`domain/choice.rs` orders optimistic model/agent choices. The display changes at
+once; only the newest outstanding choice of a session may roll it back, and only
+to the last value the server is known to hold: the value before the first
+outstanding choice, an older choice that succeeded meanwhile, or the latest
+`session.model.selected`/`session.agent.selected` the stream reported
+(`Controller::product_event` feeds those in; local optimistic applies bypass it).
+The stream overwrites the display directly, so it remains authoritative when a
+server applies overlapping requests out of order. An exhaustive test covers every
+completion order and outcome of three overlapping choices. Session removal and
+sidecar restart drop outstanding entries; those completions are discarded by
+`run_on(RequestScope::Server)`.
+
+Read demand belongs to its consumer. Mention search and the go-to-file dialog
+retain their GPUI task handles, cancelling obsolete debounces/replies on query
+replacement or owner drop. Read-only file/search/shell requests use
+`controller/reads.rs`: a dropped reply receiver cancels the Tokio future. Mutations
+retain their existing completion policy because cancelling a future cannot undo
+an already-admitted prompt, approval or write. Blocking demo searches remain
+bounded and run to completion. The SSE pump retains explicit abort-on-stop/drop;
+process startup/teardown and PTY server lifetimes remain separate owners.
+
+`api/error.rs` preserves HTTP status through anyhow context with the existing
+300-character diagnostic bound. Location-startup retry uses typed 404 status, not
+occurrences of “404” or “LocationNotFoundError” in unrelated text. File-read 404
+and 304 still map to `Missing` and `NotModified`; permissive event/model parsing
+is unchanged. Retry closures use concrete futures rather than boxed trait objects.
+
+Tests replay real store fixtures and exercise completion orders, duplicate and
+foreign tickets, delete/recreate, refresh failure, disconnect/restart and read
+cancellation. A small independent reference model exhaustively checks all
+four-command history sequences from cold and cached states (8,192 sequences).
+`rustc --edition=2024 --test src/domain/mod.rs -o /tmp/ocdesk-domain-tests` runs the
+pure models without GPUI; the same tests run in `cargo test --locked`.
+
+The design follows the mechanism/policy separation in ripgrep's
+[matcher](https://github.com/BurntSushi/ripgrep/tree/91f5d22ef48bde459d90a8c7dbeab416e97d0f2b/crates/matcher),
+[searcher](https://github.com/BurntSushi/ripgrep/tree/91f5d22ef48bde459d90a8c7dbeab416e97d0f2b/crates/searcher)
+and [core](https://github.com/BurntSushi/ripgrep/tree/91f5d22ef48bde459d90a8c7dbeab416e97d0f2b/crates/core):
+small concrete mechanisms with explicit contracts, composed by application policy.
+It adds no crates, dependencies, universal reducer or generic task framework.
+No UI frame-time, memory or throughput improvement is claimed. Rendering, SSE
+framing/buffering and transcript merge algorithms are intentionally unchanged;
+removing retry boxing only removes its per-attempt allocation, not measured UI cost.

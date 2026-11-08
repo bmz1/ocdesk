@@ -18,6 +18,15 @@ use crate::api::model::{
     SkillInfo, Timing, ToolCall, ToolStatus, UserMessage, VcsInfo,
 };
 use crate::api::{Envelope, Event};
+use crate::domain::fetch::{FetchStatus, FetchStatuses};
+use crate::domain::history::{HistoryLoad, HistoryRequests, LoadTicket};
+
+mod forms;
+mod permissions;
+
+use crate::domain::requests::Revisions;
+pub(crate) use forms::Forms;
+pub(crate) use permissions::Permissions;
 
 use serde_json::Value;
 
@@ -40,15 +49,10 @@ pub enum Connection {
 pub struct Conversation {
     /// Sorted by message id (ids are time-ordered).
     pub messages: Vec<Message>,
-    /// True once the REST history has been fetched. Events for conversations
-    /// that are not loaded are dropped; they are fetched on selection.
-    pub loaded: bool,
+    /// Availability and ownership of the latest REST history request.
+    load: HistoryLoad,
     /// Highest durable sequence number folded in.
     pub last_seq: Option<u64>,
-    /// A history fetch is in flight (see [`Store::begin_load`]).
-    pub fetching: bool,
-    /// Bumped per fetch; only the latest fetch's snapshot is applied.
-    pub load_seq: u64,
     /// Messages that events touched while the fetch was in flight: the only
     /// local messages missing from the snapshot that survive it (others were
     /// reverted, compacted away or deleted on the server).
@@ -68,6 +72,20 @@ const KEEP_CONVERSATIONS: usize = 10;
 const MAX_PENDING: usize = 128;
 
 impl Conversation {
+    pub(crate) fn loaded(&self) -> bool {
+        self.load.loaded()
+    }
+
+    pub(crate) fn fetching(&self) -> bool {
+        self.load.fetching()
+    }
+
+    fn cancel_load(&mut self) {
+        self.load.cancel();
+        self.live.clear();
+        self.pending.clear();
+    }
+
     /// `Ok(index)` of message `id`, else `Err(len)`: new messages append.
     ///
     /// The transcript is in *delivery* order, not id order (a queued prompt
@@ -156,6 +174,22 @@ pub enum StoreEvent {
     },
 }
 
+/// The user's reply to a pending permission request or question form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyState {
+    /// In flight; a second reply is refused.
+    Sending,
+    /// Failed; the request stays visible and can be answered again.
+    Failed(String),
+}
+
+/// Completion effects stay separate from the pure history transition.
+enum HistoryChange {
+    Ignored,
+    Failed,
+    Reconciled(Vec<StoreEvent>),
+}
+
 /// Result of [`Store::apply_m7`].
 enum M7 {
     Handled(Vec<StoreEvent>),
@@ -227,13 +261,14 @@ pub enum SubmissionTarget {
 
 #[derive(Default)]
 pub struct Store {
+    history_requests: HistoryRequests,
     /// Local HTTP admissions, visible before the server emits execution events.
     pub submitting: HashMap<u64, SubmissionTarget>,
     pub interrupting: HashSet<String>,
     pub snapshot_revision: u64,
     /// Per-session inbox events, so a read of one inbox isn't invalidated
     /// by activity in every other session.
-    pub inbox_revision: HashMap<String, u64>,
+    pub(crate) inbox_revision: Revisions<String>,
     pub tasks_revision: u64,
     pub(crate) shell_snapshots: HashMap<PathBuf, HashSet<String>>,
     /// The `gh` CLI is installed: the Pull request tab and chip show.
@@ -242,8 +277,7 @@ pub struct Store {
     pub pull_requests: HashMap<PathBuf, PrEntry>,
     pub check_logs: HashMap<String, CheckLog>,
     pub saved_grants: Vec<crate::api::features::SavedGrant>,
-    pub saved_grants_loading: bool,
-    pub saved_grants_error: Option<String>,
+    pub(crate) saved_grants_status: FetchStatus,
     pub grant_sending: HashSet<String>,
     pub preferences: crate::settings::Settings,
     pub unread: std::collections::BTreeSet<String>,
@@ -252,8 +286,7 @@ pub struct Store {
     pub session_modes: HashMap<String, Option<crate::settings::PermissionMode>>,
     pub mode_sending: HashSet<String>,
     pub usage: HashMap<String, crate::api::features::UsageReport>,
-    pub usage_loading: HashSet<String>,
-    pub usage_errors: HashMap<String, String>,
+    pub(crate) usage_status: FetchStatuses<String>,
     /// The user's folders, in sidebar order. Each is an opencode location.
     pub folders: Vec<PathBuf>,
     pub collapsed: HashSet<PathBuf>,
@@ -294,22 +327,13 @@ pub struct Store {
     pub opencode_version: Option<String>,
     /// A transient, app-level problem shown as a dismissible banner.
     pub notice: Option<String>,
-    pub permissions: HashMap<String, Vec<PermissionRequest>>,
-    /// Changed by both live events and snapshots, to reject stale in-flight reads.
-    pub permission_revision: HashMap<String, u64>,
-    pub permission_sending: HashSet<(String, String)>,
-    pub permission_errors: HashMap<(String, String), String>,
-    /// Pending question forms, session-owned like permissions.
-    pub forms: HashMap<String, Vec<FormRequest>>,
-    pub form_revision: HashMap<String, u64>,
-    pub form_sending: HashSet<(String, String)>,
-    pub form_errors: HashMap<(String, String), String>,
-    /// In-progress answers per pending form (`answer[key] = value`), seeded
-    /// from the fields' defaults and edited as the user picks or types.
-    pub form_drafts: HashMap<String, Value>,
+    /// Pending permission requests per session, their revisions (changed by
+    /// live events and snapshots alike) and the user's replies in flight.
+    pub(crate) permissions: Permissions,
+    /// Pending question forms and their draft answers.
+    pub(crate) forms: Forms,
     pub diffs: HashMap<PathBuf, Vec<FileDiff>>,
-    pub diff_loading: HashSet<PathBuf>,
-    pub diff_errors: HashMap<PathBuf, String>,
+    pub(crate) diff_status: FetchStatuses<PathBuf>,
     /// Folders whose diff may be outdated (a turn ended while not shown).
     pub diff_stale: HashSet<PathBuf>,
     /// Per folder (location directory).
@@ -335,115 +359,38 @@ impl Store {
         }
     }
 
-    pub fn permission_revision(&self, sid: &str) -> u64 {
-        self.permission_revision
-            .get(sid)
-            .copied()
-            .unwrap_or_default()
-    }
-
+    /// Replace a session's pending permission requests (snapshot read).
     pub fn set_permissions(
         &mut self,
         sid: &str,
         requests: Vec<PermissionRequest>,
         cx: &mut Context<Self>,
     ) {
-        self.permissions.insert(
-            sid.to_string(),
-            requests
-                .into_iter()
-                .filter(|r| r.session_id == sid)
-                .collect(),
-        );
-        let requests = &self.permissions[sid];
-        self.permission_sending.retain(|(session, request)| {
-            session != sid || requests.iter().any(|r| &r.id == request)
-        });
-        self.permission_errors.retain(|(session, request), _| {
-            session != sid || requests.iter().any(|r| &r.id == request)
-        });
-        if self.permissions[sid].is_empty() {
-            // No entry for "none": keys are the sessions with something pending.
-            self.permissions.remove(sid);
-        }
-        *self.permission_revision.entry(sid.to_string()).or_default() += 1;
+        self.permissions.replace(sid, requests);
         cx.emit(StoreEvent::StatusChanged {
             session_id: sid.to_string(),
         });
         cx.notify();
-    }
-
-    fn remove_permission(&mut self, sid: &str, rid: &str) {
-        if let Some(requests) = self.permissions.get_mut(sid) {
-            requests.retain(|r| r.id != rid);
-        }
-        let key = (sid.to_string(), rid.to_string());
-        self.permission_sending.remove(&key);
-        self.permission_errors.remove(&key);
-        *self.permission_revision.entry(sid.to_string()).or_default() += 1;
-    }
-
-    pub fn form_revision(&self, sid: &str) -> u64 {
-        self.form_revision.get(sid).copied().unwrap_or_default()
     }
 
     /// Replace the pending forms of a session (snapshot read). Drafts survive
     /// as long as the form stays pending.
     pub fn set_forms(&mut self, sid: &str, forms: Vec<FormRequest>, cx: &mut Context<Self>) {
-        let forms: Vec<FormRequest> = forms.into_iter().filter(|f| f.session_id == sid).collect();
-        for f in &forms {
-            self.seed_form_draft(f);
-        }
-        self.forms.insert(sid.to_string(), forms.clone());
-        let pending: HashSet<&str> = forms.iter().map(|f| f.id.as_str()).collect();
-        self.form_sending
-            .retain(|(session, form)| session != sid || pending.contains(form.as_str()));
-        self.form_errors
-            .retain(|(session, form), _| session != sid || pending.contains(form.as_str()));
-        // Drafts of other sessions' forms are still pending; keep them.
-        let all: HashSet<&str> = self
-            .forms
-            .values()
-            .flatten()
-            .map(|f| f.id.as_str())
-            .collect();
-        self.form_drafts
-            .retain(|form, _| all.contains(form.as_str()));
-        if forms.is_empty() {
-            // No entry for "none": keys are the sessions with something pending.
-            self.forms.remove(sid);
-        }
-        *self.form_revision.entry(sid.to_string()).or_default() += 1;
+        self.forms.replace(sid, forms);
         cx.emit(StoreEvent::StatusChanged {
             session_id: sid.to_string(),
         });
         cx.notify();
     }
 
-    fn remove_form(&mut self, sid: &str, fid: &str) {
-        if let Some(forms) = self.forms.get_mut(sid) {
-            forms.retain(|f| f.id != fid);
+    /// Stop showing replies whose outcome will never arrive (the stream or
+    /// the server they were sent on is gone). Failed replies stay visible.
+    pub(crate) fn abandon_replies(&mut self, cx: &mut Context<Self>) {
+        let permissions = self.permissions.abandon_replies();
+        let forms = self.forms.abandon_replies();
+        if permissions || forms {
+            cx.notify();
         }
-        let key = (sid.to_string(), fid.to_string());
-        self.form_sending.remove(&key);
-        self.form_errors.remove(&key);
-        self.form_drafts.remove(fid);
-        *self.form_revision.entry(sid.to_string()).or_default() += 1;
-    }
-
-    /// Fill a new form's draft with its fields' default answers.
-    fn seed_form_draft(&mut self, form: &FormRequest) {
-        if self.form_drafts.contains_key(&form.id) {
-            return;
-        }
-        let mut draft = serde_json::Map::new();
-        for field in &form.fields {
-            if let Some(d) = &field.default {
-                draft.insert(field.key.clone(), d.clone());
-            }
-        }
-        self.form_drafts
-            .insert(form.id.clone(), Value::Object(draft));
     }
 
     /// One answer inside a form's draft; keyed by form so drafts survive
@@ -455,27 +402,9 @@ impl Store {
         value: Value,
         cx: &mut Context<Self>,
     ) {
-        let entry = self
-            .form_drafts
-            .entry(form_id.to_string())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        if !entry.is_object() {
-            *entry = Value::Object(serde_json::Map::new());
+        if self.forms.set_answer(form_id, key, value) {
+            cx.notify();
         }
-        let map = entry.as_object_mut().expect("draft object");
-        if map.get(key) == Some(&value) {
-            return;
-        }
-        map.insert(key.to_string(), value);
-        cx.notify();
-    }
-
-    /// The current draft answers of a form (empty object if none yet).
-    pub fn form_draft(&self, form_id: &str) -> Value {
-        self.form_drafts
-            .get(form_id)
-            .cloned()
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
     }
 
     pub fn set_catalog(&mut self, folder: PathBuf, catalog: Catalog, cx: &mut Context<Self>) {
@@ -576,10 +505,7 @@ impl Store {
         // The approval/question cards already explain what the user must do.
         if std::iter::once(sid.as_str())
             .chain(self.children_of(sid).iter().map(|s| s.id.as_str()))
-            .any(|id| {
-                self.permissions.get(id).is_some_and(|r| !r.is_empty())
-                    || self.forms.get(id).is_some_and(|r| !r.is_empty())
-            })
+            .any(|id| self.permissions.has_pending(id) || self.forms.has_pending(id))
         {
             return None;
         }
@@ -857,34 +783,22 @@ impl Store {
         self.interrupting.remove(sid);
         self.submitting
             .retain(|_, target| *target != SubmissionTarget::Session(sid.to_string()));
-        let forms: Vec<String> = self
-            .forms
-            .remove(sid)
-            .into_iter()
-            .flatten()
-            .map(|f| f.id)
-            .collect();
-        self.form_drafts.retain(|id, _| !forms.contains(id));
-        self.permissions.remove(sid);
-        self.permission_revision.remove(sid);
-        self.permission_sending.retain(|(s, _)| s != sid);
-        self.permission_errors.retain(|(s, _), _| s != sid);
-        self.form_revision.remove(sid);
-        self.form_sending.retain(|(s, _)| s != sid);
-        self.form_errors.retain(|(s, _), _| s != sid);
+        self.forms.forget_session(sid);
+        self.permissions.forget_session(sid);
         self.inbox.remove(sid);
-        self.inbox_revision.remove(sid);
+        self.inbox_revision.forget(&sid.to_string());
         self.session_modes.remove(sid);
         self.mode_sending.remove(sid);
         self.usage.remove(sid);
-        self.usage_loading.remove(sid);
-        self.usage_errors.remove(sid);
+        self.usage_status.remove(sid);
         self.unread.remove(sid);
     }
 
     /// Drop everything kept about a folder that was removed from the
-    /// sidebar, including its worktree checkouts.
-    pub(crate) fn forget_folder(&mut self, folder: &Path) {
+    /// sidebar, including its worktree checkouts. Returns every directory
+    /// forgotten, so request owners can invalidate their reads for them too.
+    #[must_use]
+    pub(crate) fn forget_folder(&mut self, folder: &Path) -> Vec<PathBuf> {
         let mut dirs = self.worktrees.remove(folder).unwrap_or_default();
         dirs.push(folder.to_path_buf());
         self.projects.remove(folder);
@@ -894,11 +808,11 @@ impl Store {
             self.tooling.remove(dir);
             self.catalogs.remove(dir);
             self.diffs.remove(dir);
-            self.diff_loading.remove(dir);
-            self.diff_errors.remove(dir);
+            self.diff_status.remove(dir);
             self.diff_stale.remove(dir);
             self.shell_snapshots.remove(dir);
         }
+        dirs
     }
 
     /// The folder whose working-tree diff the selected session shows.
@@ -915,10 +829,9 @@ impl Store {
     /// A folder's diff starts loading. Diffs are per folder (opencode's
     /// working-tree diff), shared by every session in it.
     pub fn begin_diff(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        let start = self.diff_loading.insert(dir.clone());
-        let errors_removed = self.diff_errors.remove(&dir).is_some();
+        let changed = self.diff_status.begin(dir.clone());
         self.diff_stale.remove(&dir);
-        if start || errors_removed {
+        if changed {
             cx.emit(StoreEvent::DiffsChanged { dir });
             cx.notify();
         }
@@ -933,21 +846,10 @@ impl Store {
         error: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let mut changed = self.diff_loading.remove(&dir);
+        let mut changed = self.diff_status.finish(dir.clone(), error);
         if let Some(diffs) = diffs {
             changed |= self.diffs.get(&dir) != Some(&diffs);
             self.diffs.insert(dir.clone(), diffs);
-        }
-        if self.diff_errors.get(&dir) != error.as_ref() {
-            changed = true;
-            match error {
-                Some(e) => {
-                    self.diff_errors.insert(dir.clone(), e);
-                }
-                None => {
-                    self.diff_errors.remove(&dir);
-                }
-            }
         }
         if changed {
             cx.emit(StoreEvent::DiffsChanged { dir });
@@ -972,7 +874,7 @@ impl Store {
         &'a self,
         sid: &str,
     ) -> Option<impl DoubleEndedIterator<Item = &'a crate::api::model::AssistantMessage>> {
-        let conv = self.conversations.get(sid).filter(|c| c.loaded)?;
+        let conv = self.conversations.get(sid).filter(|c| c.load.loaded())?;
         Some(conv.messages.iter().filter_map(|m| match m {
             Message::Assistant(a) if a.meta.tokens.is_some() => Some(a),
             _ => None,
@@ -1034,7 +936,7 @@ impl Store {
 
     /// Whether usage details must come from the server's history.
     pub fn usage_needs_history(&self, sid: &str) -> bool {
-        !self.conversations.get(sid).is_some_and(|c| c.loaded)
+        !self.conversations.get(sid).is_some_and(|c| c.load.loaded())
     }
 
     pub fn set_vcs(&mut self, dir: PathBuf, info: VcsInfo, cx: &mut Context<Self>) {
@@ -1086,7 +988,7 @@ impl Store {
             && self
                 .conversations
                 .get(id)
-                .is_none_or(|c| !c.loaded && c.messages.is_empty())
+                .is_none_or(|c| !c.load.loaded() && c.messages.is_empty())
     }
 
     pub fn selected_conversation(&self) -> Option<&Conversation> {
@@ -1145,10 +1047,10 @@ impl Store {
             .filter(|(id, conv)| {
                 self.recent.contains(id)
                     || keep_children.contains(id.as_str())
-                    || conv.fetching
+                    || conv.load.fetching()
                     || self.busy.contains(*id)
-                    || self.permissions.get(*id).is_some_and(|r| !r.is_empty())
-                    || self.forms.get(*id).is_some_and(|r| !r.is_empty())
+                    || self.permissions.has_pending(id)
+                    || self.forms.has_pending(id)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1227,41 +1129,80 @@ impl Store {
     /// [`Store::finish_load`]. Events that arrive meanwhile are tracked (and,
     /// for an unloaded conversation, buffered) so the snapshot can be merged
     /// without losing or resurrecting anything.
-    pub fn begin_load(&mut self, session_id: &str) -> u64 {
+    pub fn begin_load(&mut self, session_id: &str) -> LoadTicket {
+        let ticket = self.history_requests.issue();
         let conv = self
             .conversations
             .entry(session_id.to_string())
             .or_default();
-        conv.load_seq += 1;
-        conv.fetching = true;
+        conv.load.begin(ticket);
+        tracing::debug!(
+            session_id,
+            ?ticket,
+            refresh = conv.load.loaded(),
+            "history request started"
+        );
         conv.live.clear();
         conv.pending.clear();
-        conv.load_seq
+        ticket
     }
 
     /// Apply the snapshot of fetch `ticket`, unless a newer fetch started.
     pub fn finish_load(
         &mut self,
         session_id: &str,
-        ticket: u64,
+        ticket: LoadTicket,
         history: anyhow::Result<Vec<Message>>,
         cx: &mut Context<Self>,
     ) {
+        match self.finish_load_inner(session_id, ticket, history) {
+            HistoryChange::Ignored => {}
+            HistoryChange::Failed => cx.notify(),
+            HistoryChange::Reconciled(events) => self.emit_all(events, cx),
+        }
+    }
+
+    /// Pure completion path: stale and duplicate responses cannot clear errors,
+    /// mutate messages, or emit notifications for a newer request.
+    fn finish_load_inner(
+        &mut self,
+        session_id: &str,
+        ticket: LoadTicket,
+        history: anyhow::Result<Vec<Message>>,
+    ) -> HistoryChange {
         let Some(conv) = self.conversations.get_mut(session_id) else {
-            return;
+            return HistoryChange::Ignored;
         };
-        if conv.load_seq != ticket {
-            return;
+        if !conv.load.accepts(ticket) {
+            tracing::debug!(session_id, ?ticket, state = ?conv.load, "ignored obsolete history completion");
+            return HistoryChange::Ignored;
         }
         match history {
-            Ok(history) => self.reconcile(session_id, history, cx),
+            Ok(history) => {
+                tracing::debug!(
+                    session_id,
+                    ?ticket,
+                    messages = history.len(),
+                    buffered_events = conv.pending.len(),
+                    "history snapshot accepted"
+                );
+                self.load_errors.remove(session_id);
+                HistoryChange::Reconciled(self.reconcile_inner(session_id, history))
+            }
             Err(e) => {
-                conv.fetching = false;
-                conv.pending.clear();
+                conv.cancel_load();
                 self.load_errors
                     .insert(session_id.to_string(), format!("{e:#}"));
-                cx.notify();
+                HistoryChange::Failed
             }
+        }
+    }
+
+    /// run_on drops obsolete callbacks. Release their loading/buffering state at
+    /// the same boundary, rather than leaving an unreachable fetch in progress.
+    pub(crate) fn cancel_history_loads(&mut self) {
+        for conv in self.conversations.values_mut() {
+            conv.cancel_load();
         }
     }
 
@@ -1270,7 +1211,8 @@ impl Store {
     pub fn invalidate_except(&mut self, keep: Option<&str>) {
         for (id, conv) in self.conversations.iter_mut() {
             if Some(id.as_str()) != keep {
-                conv.loaded = false;
+                conv.cancel_load();
+                conv.load.invalidate();
             }
         }
     }
@@ -1346,7 +1288,7 @@ impl Store {
         | Event::InboxCancelled { session_id, .. }
         | Event::InboxDeliveryChanged { session_id, .. } = &env.event
         {
-            *self.inbox_revision.entry(session_id.clone()).or_default() += 1;
+            self.inbox_revision.bump(session_id.clone());
         }
         // Inbox, background tasks and folder info are session-/folder-level.
         let mut out = match self.apply_m7(&mut env) {
@@ -1430,32 +1372,21 @@ impl Store {
             }
             Event::PermissionAsked(request) => {
                 let sid = request.session_id.clone();
-                let requests = self.permissions.entry(sid.clone()).or_default();
-                requests.retain(|r| r.id != request.id);
-                requests.push(request.clone());
-                *self.permission_revision.entry(sid.clone()).or_default() += 1;
+                self.permissions.asked(request.clone());
                 return vec![StoreEvent::StatusChanged { session_id: sid }];
             }
             Event::PermissionReplied {
                 session_id,
                 request_id,
             } => {
-                self.remove_permission(session_id, request_id);
+                self.permissions.replied(session_id, request_id);
                 return vec![StoreEvent::StatusChanged {
                     session_id: session_id.clone(),
                 }];
             }
             Event::FormAsked(form) => {
                 let sid = form.session_id.clone();
-                let fid = form.id.clone();
-                self.seed_form_draft(form);
-                if let Some(forms) = self.forms.get_mut(&sid) {
-                    forms.retain(|f| f.id != fid);
-                    forms.push(form.clone());
-                } else {
-                    self.forms.insert(sid.clone(), vec![form.clone()]);
-                }
-                *self.form_revision.entry(sid.clone()).or_default() += 1;
+                self.forms.asked(form.clone());
                 return vec![StoreEvent::StatusChanged { session_id: sid }];
             }
             Event::FormReplied {
@@ -1466,7 +1397,7 @@ impl Store {
                 session_id,
                 form_id,
             } => {
-                self.remove_form(session_id, form_id);
+                self.forms.closed(session_id, form_id);
                 return vec![StoreEvent::StatusChanged {
                     session_id: session_id.clone(),
                 }];
@@ -1503,13 +1434,11 @@ impl Store {
         let Some(conv) = self.conversations.get_mut(&session_id) else {
             return out;
         };
-        if !conv.loaded {
+        if !conv.load.loaded() {
             // Replayed onto the snapshot when it lands.
-            if conv.fetching {
+            if conv.load.fetching() {
                 if conv.pending.len() >= MAX_PENDING {
-                    conv.load_seq += 1;
-                    conv.fetching = false;
-                    conv.pending.clear();
+                    conv.cancel_load();
                     self.needs_reload.insert(session_id.clone());
                     self.load_errors.insert(
                         session_id,
@@ -1523,7 +1452,7 @@ impl Store {
         }
         // Retain terminal mutations received after the fetch boundary. Do not
         // replay earlier running/progress states over a newer terminal snapshot.
-        if conv.fetching
+        if conv.load.fetching()
             && matches!(
                 env.event,
                 Event::ToolSucceeded { .. }
@@ -1534,15 +1463,13 @@ impl Store {
             )
         {
             if conv.pending.len() >= MAX_PENDING {
-                conv.load_seq += 1;
-                conv.fetching = false;
-                conv.pending.clear();
+                conv.cancel_load();
                 self.needs_reload.insert(session_id.clone());
             } else {
                 conv.pending.push(env.clone());
             }
         }
-        if conv.fetching
+        if conv.load.fetching()
             && let Some(id) = event_message(&env.event)
         {
             conv.live.insert(id.to_string());
@@ -1807,8 +1734,7 @@ impl Store {
         // gone on the server (reverted, compacted, deleted).
         merged.extend(newer.into_iter().filter(|m| conv.live.contains(m.id())));
         conv.messages = merged;
-        conv.loaded = true;
-        conv.fetching = false;
+        conv.load.ready();
         conv.live.clear();
         let pending = std::mem::take(&mut conv.pending);
         // Prose blocks the snapshot has: buffered deltas for them partly
@@ -2018,6 +1944,21 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn forget_folder_reports_worktree_checkouts_it_dropped() {
+        let mut s = Store::default();
+        let folder = PathBuf::from("/repo");
+        let tree = PathBuf::from("/repo-wt");
+        s.worktrees.insert(folder.clone(), vec![tree.clone()]);
+        s.diff_status.begin(tree.clone());
+        s.diff_stale.insert(folder.clone());
+        let forgotten = s.forget_folder(&folder);
+        assert_eq!(forgotten, vec![tree.clone(), folder.clone()]);
+        assert!(!s.diff_status.is_loading(&tree));
+        assert!(!s.diff_stale.contains(&folder));
+        assert!(!s.worktrees.contains_key(&folder));
+    }
+
     fn sid() -> String {
         fixture()
             .into_iter()
@@ -2061,16 +2002,24 @@ mod tests {
             s.needs_reload.insert(id.into());
             s.usage.insert(id.into(), Default::default());
             s.session_modes.insert(id.into(), None);
-            s.inbox_revision.insert(id.into(), 1);
             s.unread.insert(id.into());
         }
+        let inbox_reads: Vec<_> = ["ses_a", "ses_kid"]
+            .map(|id| (id, s.inbox_revision.current(id.into())))
+            .into();
         s.apply_inner(Envelope::bare(Event::SessionRemoved {
             session_id: "ses_a".into(),
         }));
         assert!(s.conversations.is_empty() && s.children.is_empty());
         assert!(s.busy.is_empty() && s.retry.is_empty() && s.errors.is_empty());
         assert!(s.needs_reload.is_empty() && s.usage.is_empty() && s.session_modes.is_empty());
-        assert!(s.inbox_revision.is_empty() && s.unread.is_empty());
+        assert!(s.unread.is_empty());
+        for (id, revision) in inbox_reads {
+            assert!(
+                !s.inbox_revision.is_current(&id.to_string(), revision),
+                "an inbox read in flight for {id} is stale"
+            );
+        }
     }
 
     #[test]
@@ -2351,8 +2300,8 @@ mod tests {
             store.apply_inner(wire(r#"{"type":"session.text.delta","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","ordinal":0,"delta":"x"}}"#));
         }
         let conversation = &store.conversations["ses_a"];
-        assert_ne!(conversation.load_seq, ticket);
-        assert!(!conversation.fetching);
+        assert!(!conversation.load.accepts(ticket));
+        assert!(!conversation.load.fetching());
         assert!(conversation.pending.is_empty());
         assert!(store.needs_reload.contains("ses_a"));
     }
@@ -2398,7 +2347,143 @@ mod tests {
         let first = s.begin_load("ses_c");
         let second = s.begin_load("ses_c");
         assert_ne!(first, second);
-        assert_eq!(s.conversations["ses_c"].load_seq, second);
+        assert!(s.conversations["ses_c"].load.accepts(second));
+    }
+
+    fn history_message(id: &str) -> Message {
+        Message::User(UserMessage {
+            id: id.into(),
+            text: id.into(),
+            attachments: vec![],
+            meta: Default::default(),
+        })
+    }
+
+    #[test]
+    fn history_completion_orders_and_duplicate_responses_preserve_newest_snapshot() {
+        for newest_first in [false, true] {
+            let mut s = Store::default();
+            let a = s.begin_load("ses_a");
+            let b = s.begin_load("ses_a");
+            let replies = if newest_first {
+                [(b, "new"), (a, "old")]
+            } else {
+                [(a, "old"), (b, "new")]
+            };
+            for (ticket, id) in replies {
+                let result = s.finish_load_inner("ses_a", ticket, Ok(vec![history_message(id)]));
+                if ticket == a {
+                    assert!(matches!(result, HistoryChange::Ignored));
+                }
+            }
+            let before = s.conversations["ses_a"].revision;
+            assert!(matches!(
+                s.finish_load_inner("ses_a", b, Ok(vec![])),
+                HistoryChange::Ignored
+            ));
+            assert_eq!(s.conversations["ses_a"].revision, before);
+            assert_eq!(s.conversations["ses_a"].messages[0].id(), "new");
+        }
+    }
+
+    #[test]
+    fn histories_are_session_isolated_even_when_selection_changes_and_a_arrives_last() {
+        let mut s = Store {
+            selected: Some("ses_a".into()),
+            ..Default::default()
+        };
+        let a = s.begin_load("ses_a");
+        s.selected = Some("ses_b".into());
+        let b = s.begin_load("ses_b");
+        assert!(matches!(
+            s.finish_load_inner("ses_b", a, Ok(vec![])),
+            HistoryChange::Ignored
+        ));
+        s.finish_load_inner("ses_b", b, Ok(vec![history_message("b")]));
+        let result = s.finish_load_inner("ses_a", a, Ok(vec![history_message("a")]));
+        assert!(
+            matches!(result, HistoryChange::Reconciled(events) if events == vec![StoreEvent::MessagesReset { session_id: "ses_a".into() }])
+        );
+        assert_eq!(s.selected.as_deref(), Some("ses_b"));
+        assert_eq!(s.conversations["ses_b"].messages[0].id(), "b");
+        assert_eq!(s.conversations["ses_a"].messages[0].id(), "a");
+    }
+
+    #[test]
+    fn deleted_then_recreated_session_rejects_old_success_and_failure() {
+        let mut s = Store::default();
+        let old = s.begin_load("ses_a");
+        s.apply_inner(Envelope::bare(Event::SessionRemoved {
+            session_id: "ses_a".into(),
+        }));
+        assert!(matches!(
+            s.finish_load_inner("ses_a", old, Ok(vec![])),
+            HistoryChange::Ignored
+        ));
+        let new = s.begin_load("ses_a");
+        assert_ne!(old, new);
+        s.finish_load_inner("ses_a", new, Ok(vec![history_message("new")]));
+        assert!(matches!(
+            s.finish_load_inner("ses_a", old, Ok(vec![history_message("old")])),
+            HistoryChange::Ignored
+        ));
+        assert!(matches!(
+            s.finish_load_inner("ses_a", old, Err(anyhow::anyhow!("old failure"))),
+            HistoryChange::Ignored
+        ));
+        assert!(!s.load_errors.contains_key("ses_a"));
+        assert_eq!(s.conversations["ses_a"].messages[0].id(), "new");
+    }
+
+    #[test]
+    fn refresh_failure_keeps_data_and_stale_success_cannot_clear_new_error() {
+        let mut s = Store::default();
+        s.reconcile_inner("ses_a", vec![history_message("cached")]);
+        let old = s.begin_load("ses_a");
+        let current = s.begin_load("ses_a");
+        assert!(matches!(
+            s.finish_load_inner("ses_a", current, Err(anyhow::anyhow!("offline"))),
+            HistoryChange::Failed
+        ));
+        assert!(s.conversations["ses_a"].load.loaded());
+        assert!(!s.conversations["ses_a"].load.fetching());
+        assert!(matches!(
+            s.finish_load_inner("ses_a", old, Ok(vec![])),
+            HistoryChange::Ignored
+        ));
+        assert_eq!(s.load_errors["ses_a"], "offline");
+        assert_eq!(s.conversations["ses_a"].messages[0].id(), "cached");
+    }
+
+    #[test]
+    fn disconnect_releases_buffered_loads_and_reconnect_uses_fresh_snapshot() {
+        use crate::domain::requests::{RequestClock, RequestScope};
+        let mut clock = RequestClock::default();
+        let mut s = Store::default();
+        s.reconcile_inner("ses_a", vec![history_message("cached")]);
+        let a = s.begin_load("ses_a");
+        let b = s.begin_load("ses_b");
+        let issued = clock.issue(RequestScope::Connection);
+        s.apply_inner(wire(r#"{"type":"session.text.delta","data":{"sessionID":"ses_b","assistantMessageID":"msg_a","ordinal":0,"delta":"missed"}}"#));
+        clock.connection_changed();
+        s.cancel_history_loads();
+        assert!(!clock.accepts(issued));
+        for (id, ticket) in [("ses_a", a), ("ses_b", b)] {
+            assert!(!s.conversations[id].load.fetching());
+            assert!(s.conversations[id].pending.is_empty());
+            assert!(matches!(
+                s.finish_load_inner(id, ticket, Ok(vec![])),
+                HistoryChange::Ignored
+            ));
+        }
+        assert!(s.conversations["ses_a"].load.loaded());
+        clock.restart();
+        clock.connection_changed();
+        s.invalidate_except(Some("ses_a"));
+        let current = s.begin_load("ses_a");
+        s.finish_load_inner("ses_a", current, Ok(vec![history_message("fresh")]));
+        assert_eq!(s.conversations["ses_a"].messages[0].id(), "fresh");
+        assert!(!s.conversations["ses_b"].load.loaded());
     }
 
     #[test]
@@ -2555,23 +2640,23 @@ mod tests {
         s.apply_inner(Envelope::bare(Event::FormAsked(form())));
         s.apply_inner(Envelope::bare(Event::FormAsked(form())));
         assert_eq!(
-            s.forms["ses_a"].len(),
+            s.forms.of_session("ses_a").len(),
             1,
             "duplicate ask frames must not duplicate cards"
         );
-        assert_eq!(s.form_draft("frm_1"), serde_json::json!({}));
-        let before = s.form_revision("ses_a");
+        assert_eq!(s.forms.draft("frm_1"), serde_json::json!({}));
+        let before = s.forms.revision("ses_a");
         s.apply_inner(Envelope::bare(Event::FormReplied {
             session_id: "ses_a".into(),
             form_id: "frm_1".into(),
         }));
-        assert!(s.forms["ses_a"].is_empty());
+        assert!(s.forms.of_session("ses_a").is_empty());
         assert!(
-            s.form_revision("ses_a") > before,
+            s.forms.freshness("ses_a", before) != crate::domain::requests::Freshness::Current,
             "in-flight snapshots must be invalidated"
         );
         // The draft and scratch of the closed form go away with it.
-        assert_eq!(s.form_draft("frm_1"), serde_json::json!({}));
+        assert_eq!(s.forms.draft("frm_1"), serde_json::json!({}));
     }
 
     #[test]
@@ -2585,22 +2670,22 @@ mod tests {
             s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(sid, rid))));
         }
         assert_eq!(
-            s.permissions["ses_a"].len(),
+            s.permissions.of_session("ses_a").len(),
             1,
             "duplicate frames must not duplicate cards"
         );
-        assert_eq!(s.permissions["ses_b"].len(), 1);
-        let before = s.permission_revision("ses_a");
+        assert_eq!(s.permissions.of_session("ses_b").len(), 1);
+        let before = s.permissions.revision("ses_a");
         s.apply_inner(Envelope::bare(Event::PermissionReplied {
             session_id: "ses_a".into(),
             request_id: "perm_1".into(),
         }));
-        assert!(s.permissions["ses_a"].is_empty());
+        assert!(s.permissions.of_session("ses_a").is_empty());
         assert!(
-            s.permission_revision("ses_a") > before,
+            s.permissions.freshness("ses_a", before) != crate::domain::requests::Freshness::Current,
             "in-flight snapshots must be invalidated"
         );
-        assert_eq!(s.permissions["ses_b"].len(), 1);
+        assert_eq!(s.permissions.of_session("ses_b").len(), 1);
         assert!(s.conversations.is_empty());
     }
 
@@ -2610,13 +2695,80 @@ mod tests {
         s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(
             "ses_a", "perm_1",
         ))));
-        s.permission_sending
-            .insert(("ses_a".into(), "perm_1".into()));
+        assert!(s.permissions.begin_reply("ses_a", "perm_1"));
         s.apply_inner(Envelope::bare(Event::SessionRemoved {
             session_id: "ses_a".into(),
         }));
-        assert!(!s.permissions.contains_key("ses_a"));
-        assert!(s.permission_sending.is_empty());
+        assert!(!s.permissions.has_pending("ses_a"));
+        assert!(!s.permissions.is_sending("ses_a", "perm_1"));
+    }
+
+    #[test]
+    fn deleting_a_parent_cleans_its_subagents_approvals_and_strands_their_reads() {
+        let mut s = Store::default();
+        let kid = SessionInfo::from_json(
+            &serde_json::json!({"id":"ses_kid","parentID":"ses_a","location":{"directory":"/r"}}),
+        )
+        .unwrap();
+        s.children.insert("ses_a".into(), vec![kid]);
+        let form = FormRequest::from_json(&serde_json::json!({
+            "id": "frm_k", "sessionID": "ses_kid", "title": "Q",
+            "fields": [{"key": "q0", "type": "string", "default": "y"}]
+        }))
+        .unwrap();
+        s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(
+            "ses_kid", "perm_k",
+        ))));
+        s.apply_inner(Envelope::bare(Event::FormAsked(form)));
+        assert!(s.permissions.begin_reply("ses_kid", "perm_k"));
+        let (p_read, f_read) = (
+            s.permissions.revision("ses_kid"),
+            s.forms.revision("ses_kid"),
+        );
+        s.apply_inner(Envelope::bare(Event::SessionRemoved {
+            session_id: "ses_a".into(),
+        }));
+        assert!(!s.permissions.is_tracked("ses_kid") && !s.forms.is_tracked("ses_kid"));
+        assert!(!s.permissions.is_sending("ses_kid", "perm_k"));
+        assert_eq!(s.forms.draft("frm_k"), serde_json::json!({}));
+        use crate::domain::requests::Freshness::Forgotten;
+        assert_eq!(s.permissions.freshness("ses_kid", p_read), Forgotten);
+        assert_eq!(s.forms.freshness("ses_kid", f_read), Forgotten);
+    }
+
+    #[test]
+    fn approval_events_report_only_their_sessions_status() {
+        let mut s = Store::default();
+        let status = |sid: &str| {
+            vec![StoreEvent::StatusChanged {
+                session_id: sid.into(),
+            }]
+        };
+        assert_eq!(
+            s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(
+                "ses_a", "p1"
+            )))),
+            status("ses_a")
+        );
+        assert_eq!(
+            s.apply_inner(Envelope::bare(Event::PermissionReplied {
+                session_id: "ses_a".into(),
+                request_id: "p1".into(),
+            })),
+            status("ses_a")
+        );
+        assert!(
+            s.permissions.is_tracked("ses_a") && !s.permissions.has_pending("ses_a"),
+            "replied-out session stays eligible for the turn-end re-read"
+        );
+        assert_eq!(
+            s.apply_inner(Envelope::bare(Event::FormCancelled {
+                session_id: "ses_b".into(),
+                form_id: "missing".into(),
+            })),
+            status("ses_b")
+        );
+        assert!(s.conversations.is_empty(), "no transcript side effects");
     }
 
     #[test]

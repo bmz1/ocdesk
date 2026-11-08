@@ -11,6 +11,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::lifecycle::{DirectoryReads, RefreshTargets};
 use crate::api::model::FsEntry;
 use crate::controller::Controller;
 use crate::store::{Store, StoreEvent};
@@ -26,7 +27,7 @@ struct Tree {
     /// Listing per directory (`""` = the folder).
     children: HashMap<String, Vec<FsEntry>>,
     expanded: HashSet<String>,
-    loading: HashSet<String>,
+    loading: DirectoryReads,
     error: Option<String>,
 }
 
@@ -44,6 +45,7 @@ pub struct FileExplorer {
     trees: HashMap<PathBuf, Tree>,
     scroll: UniformListScrollHandle,
     refresh_seq: u64,
+    refresh_targets: RefreshTargets,
     _subs: Vec<Subscription>,
 }
 
@@ -70,6 +72,7 @@ impl FileExplorer {
             trees: HashMap::new(),
             scroll: UniformListScrollHandle::new(),
             refresh_seq: 0,
+            refresh_targets: RefreshTargets::default(),
             _subs: subs,
         }
     }
@@ -81,7 +84,7 @@ impl FileExplorer {
     /// List `path` in the current folder.
     fn load(&mut self, dir: PathBuf, path: String, cx: &mut Context<Self>) {
         let tree = self.trees.entry(dir.clone()).or_default();
-        if !tree.loading.insert(path.clone()) {
+        if !tree.loading.begin(&path) {
             return;
         }
         let rx = self.controller.read(cx).fs_list(dir.clone(), path.clone());
@@ -93,11 +96,11 @@ impl FileExplorer {
                 None => Err(anyhow::anyhow!("opencode is not running")),
             };
             let _ = this.update(cx, |this, cx| {
-                let tree = this.trees.entry(dir).or_default();
-                tree.loading.remove(&path);
+                let tree = this.trees.entry(dir.clone()).or_default();
+                let again = tree.loading.finish(&path);
                 match res {
                     Ok(entries) => {
-                        tree.children.insert(path, entries);
+                        tree.children.insert(path.clone(), entries);
                         tree.error = None;
                     }
                     Err(e) if path.is_empty() => tree.error = Some(format!("{e:#}")),
@@ -105,6 +108,9 @@ impl FileExplorer {
                         tracing::warn!("list {path}: {e:#}");
                         tree.expanded.remove(&path);
                     }
+                }
+                if again {
+                    this.load(dir, path, cx);
                 }
                 cx.notify();
             });
@@ -144,13 +150,22 @@ impl FileExplorer {
     }
 
     fn schedule_refresh(&mut self, dir: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.refresh_targets.include(dir);
         self.refresh_seq += 1;
         let seq = self.refresh_seq;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(REFRESH_DEBOUNCE).await;
             let _ = this.update(cx, |this, cx| {
                 if this.refresh_seq == seq {
-                    this.refresh(dir, cx);
+                    match std::mem::take(&mut this.refresh_targets) {
+                        RefreshTargets::None => {}
+                        RefreshTargets::All => this.refresh(None, cx),
+                        RefreshTargets::Folders(folders) => {
+                            for dir in folders {
+                                this.refresh(Some(dir), cx);
+                            }
+                        }
+                    }
                 }
             });
         })

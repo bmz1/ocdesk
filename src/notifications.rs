@@ -101,16 +101,14 @@ mod tests {
     };
     #[test]
     fn attention_respects_focus_and_routes_subagents_to_the_root_thread() {
-        let mut store = Store {
-            selected: Some("root".into()),
-            window_active: true,
-            ..Default::default()
-        };
+        let mut store = Store::default();
         let child = SessionInfo::from_json(
             &serde_json::json!({"id":"child","parentID":"root","location":{"directory":"/tmp"}}),
         )
         .unwrap();
         store.children.insert("root".into(), vec![child]);
+        store.selected = Some("root".into());
+        store.window_active = true;
         let event = Event::ExecutionEnded {
             session_id: "child".into(),
             outcome: Outcome::Failed {

@@ -131,6 +131,8 @@ pub struct Composer {
     store: Entity<Store>,
     mention: Option<MentionPopup>,
     mention_seq: u64,
+    /// Latest file search owns its debounce and read; obsolete queries cancel.
+    mention_search: Option<Task<()>>,
     history: History,
     /// Prompts sent from this window, for history in new sessions.
     sent: Vec<String>,
@@ -212,6 +214,7 @@ impl Composer {
             store,
             mention: None,
             mention_seq: 0,
+            mention_search: None,
             history: History::default(),
             sent: Vec::new(),
             recalled: None,
@@ -532,6 +535,7 @@ impl Composer {
     // ── @ mentions ───────────────────────────────────────────────────────
 
     fn close_mention(&mut self, cx: &mut Context<Self>) {
+        self.mention_search = None;
         if self.mention.take().is_some() {
             cx.notify();
         }
@@ -605,7 +609,7 @@ impl Composer {
         let query = query.to_string();
         let controller = self.controller.clone();
         let exec = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
+        self.mention_search = Some(cx.spawn(async move |this, cx| {
             exec.timer(FIND_DEBOUNCE).await;
             let stale = this
                 .update(cx, |this, _| {
@@ -639,12 +643,12 @@ impl Composer {
                 m.selected = m.selected.min(m.len().saturating_sub(1));
                 cx.notify();
             });
-        })
-        .detach();
+        }));
     }
 
     /// Replace `@query` with the picked item's token and a trailing space.
     fn accept_mention(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.mention_search = None;
         let Some(m) = self.mention.take() else { return };
         let Some(item) = m.items().nth(ix).cloned() else {
             return;
@@ -694,6 +698,7 @@ impl Composer {
     /// The `/` menu: client actions, the folder's server commands, skills
     /// and MCP servers (picking one toggles its connection).
     fn open_slash(&mut self, query: String, cx: &mut Context<Self>) {
+        self.mention_search = None;
         let store = self.store.read(cx);
         let tooling = store
             .catalog_folder()

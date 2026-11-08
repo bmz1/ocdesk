@@ -4,6 +4,7 @@ mod app_icon;
 mod browser;
 mod controller;
 mod demo;
+mod domain;
 mod files;
 mod github;
 mod notifications;

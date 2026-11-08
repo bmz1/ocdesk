@@ -5,12 +5,12 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use reqwest::{Method, StatusCode, header};
 use serde_json::json;
 
-use super::Api;
 use super::model::FsEntry;
+use super::{Api, HttpError};
 use crate::sidecar::USERNAME;
 
 const FS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -131,10 +131,7 @@ impl Api {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "HTTP {status}: {}",
-                body.chars().take(300).collect::<String>()
-            );
+            return Err(HttpError::new(status, &body).into());
         }
         let etag = resp
             .headers()
