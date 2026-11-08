@@ -202,7 +202,7 @@ impl Controller {
         let Some(api) = self.api.clone() else { return };
         self.rt.spawn(async move {
             if let Err(e) = api.watch_file(&dir, &rel, on).await {
-                tracing::warn!("fs watch {rel} ({on}): {e:#}");
+                tracing::warn!(op = "watch_file", path = %rel, on, error = %format!("{e:#}"), "fs watch failed");
             }
         });
     }

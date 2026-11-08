@@ -325,7 +325,7 @@ impl Controller {
         self.save_debounce = None;
         // The newest snapshot: it waits for any write in flight, then wins.
         if let Err(e) = self.settings.snapshot_for_save().write() {
-            tracing::warn!("could not save settings: {e:#}");
+            tracing::warn!(op = "save_settings", error = %format!("{e:#}"), "could not save settings");
         }
     }
 
@@ -335,7 +335,7 @@ impl Controller {
         let pending = self.settings.snapshot_for_save();
         self.rt.spawn_blocking(move || {
             if let Err(e) = pending.write() {
-                tracing::warn!("could not save settings: {e:#}");
+                tracing::warn!(op = "save_settings", error = %format!("{e:#}"), "could not save settings");
             }
         });
     }
@@ -402,7 +402,7 @@ impl Controller {
                 let (api, sc, exit_rx) = match started {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::error!("sidecar failed to start: {e:#}");
+                        tracing::error!(op = "start_sidecar", ?generation, error = %format!("{e:#}"), "sidecar failed to start");
                         this.store.update(cx, |s, cx| {
                             s.set_connection(
                                 Connection::SidecarDown {
@@ -457,7 +457,12 @@ impl Controller {
                     s.set_active(vec![], cx);
                 });
                 if this.recent_crashes.len() as u32 <= MAX_QUICK_RESTARTS {
-                    tracing::warn!("restarting sidecar automatically");
+                    tracing::warn!(
+                        op = "start_sidecar",
+                        ?generation,
+                        crashes = this.recent_crashes.len(),
+                        "restarting sidecar automatically"
+                    );
                     cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(Duration::from_secs(1)).await;
                         let _ = this.update(cx, |this, cx| {
@@ -637,7 +642,7 @@ impl Controller {
                 }
                 match res {
                     Ok(active) => this.store.update(cx, |s, cx| s.set_active(active, cx)),
-                    Err(e) => tracing::warn!("could not read active sessions: {e:#}"),
+                    Err(e) => tracing::warn!(op = "active", error = %format!("{e:#}"), "could not read active sessions"),
                 }
             },
         );
@@ -721,7 +726,7 @@ impl Controller {
                     models: models?,
                     // No default configured is not an error.
                     default_model: default_model.unwrap_or_else(|e| {
-                        tracing::warn!("no default model for {}: {e:#}", dir.display());
+                        tracing::warn!(op = "default_model", dir = %dir.display(), error = %format!("{e:#}"), "no default model");
                         None
                     }),
                     agents: agents?,
@@ -731,8 +736,10 @@ impl Controller {
             move |this, res: Result<Catalog>, cx| match res {
                 Ok(c) => this.store.update(cx, |s, cx| s.set_catalog(folder, c, cx)),
                 Err(e) => tracing::warn!(
-                    "could not read models/agents for {}: {e:#}",
-                    folder.display()
+                    op = "catalog",
+                    dir = %folder.display(),
+                    error = %format!("{e:#}"),
+                    "could not read models/agents"
                 ),
             },
         );
@@ -766,7 +773,7 @@ impl Controller {
                     }
                 }
                 let warn = |what: &str, e: &anyhow::Error| {
-                    tracing::debug!("{what} for {}: {e:#}", dir.display())
+                    tracing::debug!(op = "folder_info", dir = %dir.display(), error = %format!("{e:#}"), "{what}")
                 };
                 let tooling = Tooling {
                     commands: commands.unwrap_or_else(|e| {
@@ -920,7 +927,7 @@ impl Controller {
                         s.set_children(&target, kids, cx);
                         s.set_shells(&folder, shells, cx);
                     }),
-                    Err(e) => tracing::warn!("could not read tasks of {target}: {e:#}"),
+                    Err(e) => tracing::warn!(op = "tasks", session_id = %target, error = %format!("{e:#}"), "could not read tasks"),
                 }
             },
         );
@@ -1529,7 +1536,7 @@ impl Controller {
                         }
                     }
                     Err(e) if is_location_404(&e) => {
-                        tracing::warn!("could not load permission requests: {e:#}")
+                        tracing::warn!(op = "permissions", session_id = %sid, error = %format!("{e:#}"), "location not ready; permission requests not loaded")
                     }
                     Err(e) => this.notice(format!("Could not load permission requests: {e:#}"), cx),
                 }
@@ -1563,7 +1570,7 @@ impl Controller {
                         }
                     }
                     Err(e) if is_location_404(&e) => {
-                        tracing::warn!("could not load question forms: {e:#}")
+                        tracing::warn!(op = "forms", session_id = %sid, error = %format!("{e:#}"), "location not ready; question forms not loaded")
                     }
                     Err(e) => this.notice(format!("Could not load question forms: {e:#}"), cx),
                 }
@@ -2187,7 +2194,7 @@ impl Controller {
                     Ok(items) => this
                         .store
                         .update(cx, |s, cx| s.set_inbox(&target, items, cx)),
-                    Err(e) => tracing::warn!("could not read inbox of {target}: {e:#}"),
+                    Err(e) => tracing::warn!(op = "inbox", session_id = %target, error = %format!("{e:#}"), "could not read inbox"),
                 }
             },
         );
