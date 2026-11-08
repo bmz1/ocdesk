@@ -53,6 +53,30 @@ and `dev/teardown-test.sh` under Xvfb with the mock model: all five exit paths
 passed (sigterm, sigint, sigkill, panic, quit-after-idle). Desktop smoke checks
 by hand (item 2 below) and macOS remain unverified.
 
+## Continuation (branch `claude/zen-cori-feoxou`): approvals and supervision
+
+- `domain::approvals::PendingRequests<R>` owns the shared lifecycle of
+  permission requests and question forms: pending set per session, snapshot
+  revisions, and one `ReplyState` (Sending | Failed) per pending request. It
+  replaces eight store fields (`permission_*`/`form_*` lists, revisions,
+  sending sets and error maps) whose consistency relied on every caller.
+  Regression: those per-session `u64` revisions were removed with the session
+  and restarted at zero (the aliasing AGENTS.md forbids); they are `Revisions`
+  now. The store's `inbox_revision` had the same defect and is fixed too.
+- `Controller::send_reply` replaces three near-identical reply/cancel paths.
+  Regression: dismissing a form did not require a connection, so a dismissal
+  sent while reconnecting was discarded on reconnect and the form stayed
+  "sending" until the next disconnect. The Dismiss button is now disabled
+  while disconnected, like Next and the permission buttons.
+- `domain::supervisor::RestartBudget` is the sidecar crash-window policy, with
+  time as an input. The delayed auto-restart is an owned `restart_timer` task
+  (cleared by every start) instead of a detached timer re-checking the
+  generation; giving up is logged at error level with the crash count.
+- Tests: an exhaustive reference-model check of 100,000 five-command
+  approval sequences (pending set, orphan reply state, empty lists), targeted
+  ordering/regression tests, and restart-budget window tests. All run in the
+  standalone domain build.
+
 ## Verification completed
 
 Baseline: formatting, strict Clippy and all 125 existing Rust tests passed.
