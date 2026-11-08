@@ -210,15 +210,18 @@ impl Controller {
     /// Write pending settings now (on quit).
     pub fn flush_settings(&mut self) {
         self.save_seq += 1;
-        if let Err(e) = self.settings.save() {
+        // The newest snapshot: it waits for any write in flight, then wins.
+        if let Err(e) = self.settings.snapshot_for_save().write() {
             tracing::warn!("could not save settings: {e:#}");
         }
     }
 
     fn save_settings(&self) {
-        let settings = self.settings.clone();
+        // Numbered here, on the UI thread, so request order decides which
+        // write sticks however the background writes interleave.
+        let pending = self.settings.snapshot_for_save();
         self.rt.spawn_blocking(move || {
-            if let Err(e) = settings.save() {
+            if let Err(e) = pending.write() {
                 tracing::warn!("could not save settings: {e:#}");
             }
         });

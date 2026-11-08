@@ -193,35 +193,127 @@ fn path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("ocdesk").join("settings.json"))
 }
 
+/// Order of saves: taken on the UI thread when a save is requested, so a
+/// later request always carries a higher number.
+static NEXT_SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Highest save number written; also serializes writers.
+static WRITTEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+/// A snapshot of the settings waiting to be written, numbered in request
+/// order. Writes are serialized and a snapshot older than one already on
+/// disk is dropped, so overlapping background saves (and the final save on
+/// quit) can't interleave or put older settings back.
+pub struct PendingSave {
+    seq: u64,
+    settings: Settings,
+}
+
+impl PendingSave {
+    /// Blocking; call off the UI thread (except the final save on quit).
+    pub fn write(self) -> anyhow::Result<()> {
+        let p = path().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+        self.write_to(&p)
+    }
+
+    fn write_to(self, p: &std::path::Path) -> anyhow::Result<()> {
+        let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if self.seq <= *written {
+            return Ok(());
+        }
+        std::fs::create_dir_all(p.parent().expect("has parent"))?;
+        // Unique per write, so a crashed or concurrent writer's temp file
+        // is never renamed over the real one half-written.
+        let tmp = p.with_extension(format!("json.{}.{}.tmp", std::process::id(), self.seq));
+        let result = (|| {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&serde_json::to_vec_pretty(&self.settings)?)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, p)?;
+            anyhow::Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        } else {
+            *written = self.seq;
+        }
+        result
+    }
+}
+
 impl Settings {
     /// Never fails: a missing or broken file yields defaults (logged).
     pub fn load() -> Self {
         let Some(p) = path() else {
             return Self::default();
         };
-        match std::fs::read_to_string(&p) {
+        Self::load_from(&p)
+    }
+
+    fn load_from(p: &std::path::Path) -> Self {
+        match std::fs::read_to_string(p) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-                tracing::warn!("ignoring unreadable {}: {e}", p.display());
+                // Keep the unreadable file for the user instead of letting
+                // the next save replace it with defaults.
+                let aside = p.with_extension("json.unreadable");
+                tracing::warn!(
+                    "ignoring unreadable {} ({e}); kept as {}",
+                    p.display(),
+                    aside.display()
+                );
+                let _ = std::fs::rename(p, aside);
                 Self::default()
             }),
             Err(_) => Self::default(),
         }
     }
 
-    /// Blocking write (atomic via rename); call off the UI thread.
-    pub fn save(&self) -> anyhow::Result<()> {
-        let p = path().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-        std::fs::create_dir_all(p.parent().expect("has parent"))?;
-        let tmp = p.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(tmp, p)?;
-        Ok(())
+    /// Snapshot these settings for writing; take it on the UI thread, then
+    /// [`PendingSave::write`] it anywhere.
+    pub fn snapshot_for_save(&self) -> PendingSave {
+        PendingSave {
+            seq: NEXT_SAVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            settings: self.clone(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saves_are_ordered_and_stale_ones_dropped() {
+        let dir = std::env::temp_dir().join(format!("ocdesk-settings-{}", std::process::id()));
+        let p = dir.join("settings.json");
+        let with = |f: &str| Settings {
+            folders: vec![PathBuf::from(f)],
+            ..Default::default()
+        };
+        let older = with("/old").snapshot_for_save();
+        let newer = with("/new").snapshot_for_save();
+        // The newer save lands first; the older one must not overwrite it.
+        newer.write_to(&p).unwrap();
+        older.write_to(&p).unwrap();
+        assert_eq!(Settings::load_from(&p).folders, [PathBuf::from("/new")]);
+        // No temp files left behind.
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        // A broken file is kept aside, not silently replaced.
+        std::fs::write(&p, "{not json").unwrap();
+        assert!(Settings::load_from(&p).folders.is_empty());
+        assert!(dir.join("settings.json.unreadable").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn old_files_still_load() {
