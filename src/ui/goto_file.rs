@@ -25,6 +25,8 @@ pub struct GoToFile {
     results: Vec<String>,
     selected: usize,
     seq: u64,
+    /// Dropping this cancels debounce and any outstanding read reply.
+    search_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -55,11 +57,13 @@ impl GoToFile {
             results: Vec::new(),
             selected: 0,
             seq: 0,
+            search_task: None,
             _subs: subs,
         }
     }
 
     fn search(&mut self, cx: &mut Context<Self>) {
+        self.search_task = None;
         self.seq += 1;
         let seq = self.seq;
         let query = self.input.read(cx).value().trim().to_string();
@@ -69,7 +73,7 @@ impl GoToFile {
             return;
         }
         let (controller, dir) = (self.controller.clone(), self.dir.clone());
-        cx.spawn(async move |this, cx| {
+        self.search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
             if this.update(cx, |this, _| this.seq != seq).unwrap_or(true) {
                 return;
@@ -90,8 +94,7 @@ impl GoToFile {
                 this.selected = 0;
                 cx.notify();
             });
-        })
-        .detach();
+        }));
     }
 
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {

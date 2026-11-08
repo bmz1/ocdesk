@@ -38,16 +38,16 @@ identify the owner rather than a second parallel implementation.
 | Transcript cache / session | Implicit: selected/recent/live → retained; inactive and over budget → evicted | Store `recent`, `evict_conversations`, `invalidate_except`. Retention is independent of history-fetch status. |
 | Prompt admission / submission id | Implicit: draft/session target → creating/configuring session → HTTP admission → accepted or uncertain | `submit_to`, `submitting`, `SubmissionTarget`. HTTP acceptance is separate from execution completion. Preserve explicit recovery; do not automatically resend uncertain admissions. |
 | Admission recovery / last failed request | Implicit: absent → recovery tuple → explicit retry; can be replaced by another failure | Controller `failed_submission`. Original session/folder must travel with recovery. |
-| Plan implementation / original session | Implicit async chain: switch agent → submit implementation prompt, or error | **Changed:** `implement_plan` captures session/folder, guards its continuation by generation, and updates local agent choice only after switch success. Changing selection while awaiting must not redirect the prompt. |
+| Plan implementation / original session | Implicit async chain: switch agent → submit implementation prompt, or error | **Changed:** `implement_plan` captures session/folder, guards its continuation by server generation (`RequestScope::Server`), shows Build optimistically through `domain::choice` (rolled back if the switch fails) and changes the draft default only after success. Changing selection while awaiting must not redirect the prompt. |
 | Execution / session | Implicit: busy membership, retry text, interrupt-in-flight, error; execution events enter/leave busy | Store `set_busy_inner`, `set_active`; controller abort. Keep separate from submitting, approvals and reconnecting. |
 | Assistant step / message | Mixed: started → blocks/deltas/tools → finished/failed, completion/error metadata | Store event fold, [model](../src/api/model.rs). Preserve idempotent terminal handling and transcript fixtures. |
 | Tool call / call id | Explicit `ToolStatus`: pending/running → completed or failed; input/output can arrive separately | Model and store. Terminal tool status is server-owned; unknown tools may modify files. |
 | Inbox delivery / item id | Explicit `Delivery` plus implicit pending/edited/promoted/deleted/delivered membership | [composer](../src/ui/composer.rs), controller inbox operations, store. Pending text is not transcript history until delivered. |
 | Approval / (session, request) | Implicit: pending → sending → replied/removed, or visible retryable error; reconnect re-fetches | Store permissions/revisions/sending/errors; controller reply; [permission UI](../src/ui/permission.rs). Keep server authoritative; never auto-approve on recovery. |
 | Question / (session, form) | Implicit: defaulted/editing draft → reply or cancel in flight → removed or retryable error | Store forms/drafts/revisions; controller; [form UI](../src/ui/form_view.rs). Draft lifetime and request lifetime are distinct. |
-| Agent/model choice / session or draft | Implicit: inherited/selected → optimistic local choice → server event or failure | Controller `choose_model`, `choose_agent`; store catalog/draft selections. See follow-up risks below; do not collapse draft and active-session choices. |
+| Agent/model choice / session or draft | **Explicit now:** `OptimisticChoices` per session: choose → newest outstanding token; success/failure/stream report → settle or roll back to last server-known value | [domain::choice](../src/domain/choice.rs); controller `show_*`/`settle_*`. Only the newest choice may roll back; the stream stays authoritative. Do not collapse draft and active-session choices. |
 | Permission mode / session or draft | Implicit: inherited/known → mutation in flight → confirmed or error, versioned reads | [feature controller](../src/controller/features.rs), store mode maps. A read predating a mutation must not overwrite it. |
-| Saved grants / grant id | Implicit: list unread/loading/ready/error; individual revoke in flight → refreshed list | Feature controller, store saved-grant state, [settings](../src/ui/settings.rs). Keep server persistence authoritative. |
+| Saved grants / grant id | `FetchStatus` (Idle/Loading/Failed) beside the cached list; individual revoke in flight → refreshed list | Feature controller, store saved-grant state, [settings](../src/ui/settings.rs). Keep server persistence authoritative. |
 | Usage / session | Implicit: cached summary/details → loading; details requested during summary → deferred detailed read; live totals can supersede snapshot | Feature controller, store usage maps/revisions, [usage UI](../src/ui/usage.rs). Summary refresh must retain detail fields. |
 | Diff snapshot / folder | Implicit: absent/cached/stale → loading → ready/error; request sequence rejects old response | Controller diff functions, store diff maps, [review](../src/ui/review.rs). Cached data and freshness are independent. |
 | PR polling / checkout | Implicit: never fetched/no PR/PR/error × loading; window activity and pending checks select poll interval | [GitHub controller](../src/controller/github.rs), store `PrEntry`. Keep cached PR visible during fetch. |
@@ -76,8 +76,8 @@ identify the owner rather than a second parallel implementation.
 | Folder registration / path | Implicit: native picker or typed path → location registration → settings/store insertion → draft selection; removal hides sessions without deleting server data | Controller `add_folder`, `remove_folder`; [UI dialogs](../src/ui/mod.rs). Async location completion must retain its captured folder. |
 | Worktree/session-location mutation / checkout | Implicit: requested → create/remove/move in flight → refresh/select; dirty removal → explicit force confirmation or cancel | Controller worktree functions, [git dialogs](../src/ui/git.rs). Session location, current folder and selected session are related but distinct. |
 | Session metadata mutation / session | Implicit: rename/archive/restore request → server event or refresh/error; pin is local persisted membership | Controller session functions, feature controller, [sidebar](../src/ui/sidebar.rs). Archiving selected session leaves selection first; hidden is not deleted. |
-| Catalog refresh / folder | Implicit: burst event → debounce → parallel model/agent/tooling/VCS/project reads → partial result | Controller catalog functions; store `Catalog`, `Tooling`. Keep location initialization, debounce and generation ownership; independent reads may fail separately. |
-| Notice lifetime / notice sequence | Implicit: notice → timer → clear only if sequence still current; user dismissal clears current notice | Controller `notice`, `notice_seq`; conversation banner. An older timer cannot dismiss a newer failure. |
+| Catalog refresh / folder | Implicit: burst event → debounce → parallel model/agent/tooling/VCS/project reads → partial result | Controller catalog functions; store `Catalog`, `Tooling`. The debounce is an owned GPUI task (replace = cancel); reads complete via `run_on`. Independent reads may fail separately. |
+| Notice lifetime / notice timer | Owned task: notice → timer task stored on the controller; a newer notice replaces (cancels) it; user dismissal clears the current notice | Controller `notice`, `notice_clear`; conversation banner. An older timer cannot dismiss a newer failure. |
 | Go-to-file search / dialog query | Implicit: query → debounce → request → accepted only for latest sequence → selected result → close/open | [go-to-file](../src/ui/goto_file.rs). The dialog captures a directory for search; opening resolves through current tabs, so selection changes while the dialog is open deserve a targeting check. |
 | Preferences draft / settings view | Implicit: snapshot → edit locally → validate keybindings → save selected fields or close/discard | Settings view, controller `save_preferences`. Preserve live window, unread and reviewed-file fields when saving the screen's draft. |
 | File watches / open tab | Implicit: open → subscribe → renew every 12 h → unsubscribe on close; reconnect triggers full revalidation | Editor tabs, [file controller](../src/controller/files.rs). Watch delivery is advisory; activation and save still validate disk state. |
@@ -97,7 +97,7 @@ identify the owner rather than a second parallel implementation.
   inherited/read-only remain separate facts. Scope callbacks use `show_project`.
 - Implement plan in A, switch selection to B while the build-agent request runs:
   the prompt still targets A. A sidecar generation change discards the continuation.
-  A failed switch no longer falsely applies Build locally.
+  A failed switch rolls the optimistic Build selection back.
 
 `src/ui/lifecycle.rs` contains window-free event-sequence tests. Existing store
 fixture replay, file save/readback, settings ordering and parser tests remain the
@@ -118,17 +118,19 @@ not replace compilation, store fixture tests or live protocol/UI checks.
 
 These are concrete audit risks, not claims of reproduced production failures:
 
-1. `choose_model` can issue overlapping optimistic writes; an older failed write
-   can roll back a later choice. `choose_agent` leaves an optimistic selection
-   after failure. A future change should order mutations per session and reconcile
-   confirmed choice, covering server events interleaved with HTTP completion.
+1. **Resolved (#26):** overlapping model/agent choices are ordered per session by
+   `domain::choice`; stream reports and accepted older choices update the rollback
+   target. An older success arriving after the newest choice settled still relies
+   on the stream echo to correct the display.
 2. `run_on` intentionally drops stale callbacks. Any loading/sending flag whose
    only cleanup is in that callback needs owner-level reset or cancellation
-   cleanup. Sidecar restart clears many flags already; history load tickets and
-   PR/check-log loading lifetimes deserve separate cancellation tests.
-3. Several operations use `run` rather than `run_on`. Review mutation callbacks
-   (fork, move, worktree operations and optimistic choices) for generation and
-   original-selection ownership before generalizing the plan continuation fix.
+   cleanup. Sidecar restart clears many flags already; history load tickets are
+   owned by the store (#25). PR/check-log loading lifetimes deserve separate
+   cancellation tests.
+3. **Audited (#26):** reads and optimistic choices use `run_on`. Remaining `run`
+   callers are mutations whose result is persisted server state, or local work;
+   `Controller::run` documents that policy. Original-selection ownership of fork,
+   move and worktree completions still deserves interactive checks.
 4. Config reload checks that sessions are idle before issuing its request; it
    does not reserve an app-wide admission lock until completion. Preventing a
    concurrent new prompt needs a controller-owned reload/admission contract.

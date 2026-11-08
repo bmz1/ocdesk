@@ -112,6 +112,29 @@ fn unix(t: &str) -> Option<i64> {
 
 const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// `gh` exited unsuccessfully. Classified here, on its own stderr, so callers
+/// never search a formatted error chain (which context could change) for text.
+#[derive(Debug)]
+struct GhFailed {
+    stderr: String,
+}
+
+impl GhFailed {
+    /// `gh pr view` on a branch without a pull request. gh has no distinct
+    /// exit code for this; its message is the only signal.
+    fn no_pull_request(&self) -> bool {
+        self.stderr.contains("no pull requests found")
+    }
+}
+
+impl std::fmt::Display for GhFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.stderr)
+    }
+}
+
+impl std::error::Error for GhFailed {}
+
 async fn gh(dir: &Path, args: &[&str]) -> Result<String> {
     let out = tokio::process::Command::new("gh")
         .args(args)
@@ -128,7 +151,8 @@ async fn gh(dir: &Path, args: &[&str]) -> Result<String> {
         .await
         .map_err(|_| anyhow::anyhow!("gh {} timed out", args.first().unwrap_or(&"")))??;
     if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        return Err(GhFailed { stderr }.into());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -162,7 +186,12 @@ pub async fn pull_request(dir: &Path) -> Result<Option<PullRequest>> {
     .await
     {
         Ok(v) => v,
-        Err(e) if e.to_string().contains("no pull requests found") => return Ok(None),
+        Err(e)
+            if e.downcast_ref::<GhFailed>()
+                .is_some_and(GhFailed::no_pull_request) =>
+        {
+            return Ok(None);
+        }
         Err(e) => return Err(e),
     };
     let mut pr = parse_view(&serde_json::from_str(&view)?)
@@ -423,6 +452,29 @@ pub fn comments_prompt(pr: &PullRequest, threads: &[&Thread], comments: &[&Comme
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_pull_request_is_classified_on_gh_stderr_not_on_context() {
+        let none = super::GhFailed {
+            stderr: "no pull requests found for branch \"x\"".into(),
+        };
+        assert!(none.no_pull_request());
+        let e = anyhow::Error::from(none).context("reading the pull request");
+        assert!(
+            e.downcast_ref::<super::GhFailed>()
+                .is_some_and(super::GhFailed::no_pull_request)
+        );
+        // Context text alone must not be mistaken for gh's answer.
+        let other = anyhow::Error::from(super::GhFailed {
+            stderr: "HTTP 401: Bad credentials".into(),
+        })
+        .context("no pull requests found?");
+        assert!(
+            !other
+                .downcast_ref::<super::GhFailed>()
+                .is_some_and(super::GhFailed::no_pull_request)
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

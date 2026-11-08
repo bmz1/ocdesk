@@ -1,4 +1,5 @@
-//! Turns user intents into API calls and API results into store updates.//!
+//! Turns user intents into API calls and API results into store updates.
+//!
 //! Owns the sidecar lifecycle (start, crash detection, auto-restart), the
 //! SSE pump, and the folder list. One sidecar serves every folder:
 //! sessions are pinned to a location (directory) and `/api/event` covers all
@@ -8,6 +9,7 @@
 mod features;
 mod files;
 mod github;
+mod reads;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -19,21 +21,17 @@ use futures::channel::{mpsc, oneshot};
 use gpui_kit::{Context, Entity, Task};
 
 use crate::api::model::{FsEntry, ModelRef, PermissionDecision, PromptInput};
-use crate::api::{Api, Envelope, Event};
+use crate::api::{Api, Envelope, Event, HttpError};
+use crate::domain::choice::{ChoiceToken, OptimisticChoices};
+use crate::domain::requests::{
+    ConnectionEpoch, Issued, RequestClock, RequestScope, Revisions, ServerGeneration,
+};
 use crate::settings::Settings;
 use crate::sidecar::{self, SidecarConfig};
 use crate::store::{Catalog, Connection, Store, StoreEvent, SubmissionTarget, Tooling};
 
 /// Re-reads of a snapshot that raced live events, before applying it anyway.
 const SNAPSHOT_RETRIES: u32 = 4;
-
-/// The sidecar generation and (for per-connection reads) SSE connection
-/// epoch a request was issued on; see [`Controller::run_on`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Issued {
-    generation: u64,
-    epoch: Option<u64>,
-}
 
 /// Give up auto-restarting after this many crashes within [`CRASH_WINDOW`].
 const MAX_QUICK_RESTARTS: u32 = 3;
@@ -49,9 +47,6 @@ const CATALOG_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Quiet period before bursty settings changes (resizes, drags) are written.
 const SETTINGS_DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// A 404 on `permission`/`form` reads right after startup usually means the
-/// session's location has not been registered server-side yet — retry, don't
-/// bother the user.
 /// Built-in tools that never write to the working tree.
 fn is_read_only_tool(name: &str) -> bool {
     matches!(
@@ -71,24 +66,22 @@ fn is_read_only_tool(name: &str) -> bool {
 }
 
 fn is_location_404(e: &anyhow::Error) -> bool {
-    let s = format!("{e:#}");
-    s.contains("404") || s.contains("LocationNotFoundError")
+    HttpError::is_not_found(e)
 }
 
-async fn with_location_retry<F, T>(mut f: F) -> Result<T>
+// Startup may not have registered the session location yet. Retry typed 404s;
+// a diagnostic containing "404" must not turn unrelated failures into retries.
+async fn with_location_retry<F, Fut, T>(mut f: F) -> Result<T>
 where
-    F: FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send>>,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
 {
     let mut attempt = 0;
     loop {
         match f().await {
             Err(e) if attempt < LOCATION_RETRIES && is_location_404(&e) => {
-                tracing::warn!(
-                    "location read not ready yet ({}), retrying ({}/{})",
-                    e,
-                    attempt + 1,
-                    LOCATION_RETRIES
-                );
+                tracing::warn!(attempt = attempt + 1, max_retries = LOCATION_RETRIES,
+                    error = %e, "location read not ready; retrying");
                 attempt += 1;
                 tokio::time::sleep(LOCATION_BACKOFF * attempt as u32).await;
             }
@@ -102,36 +95,40 @@ pub struct Controller {
     store: Entity<Store>,
     settings: Settings,
     api: Option<Api>,
-    /// Bumped on every sidecar (re)start so stale callbacks can be ignored.
-    generation: u64,
-    connection_epoch: u64,
+    requests: RequestClock,
     grant_requests: u64,
     submission_seq: u64,
-    mode_requests: std::collections::HashMap<String, u64>,
-    usage_revision: std::collections::HashMap<String, u64>,
+    /// Bumped per permission-mode change, so an older mode read is dropped.
+    mode_requests: Revisions<String>,
+    /// Bumped per live usage total, so an older REST total is not shown.
+    usage_revision: Revisions<String>,
+    /// Outstanding optimistic model/agent choices per session.
+    model_choices: OptimisticChoices<ModelRef>,
+    agent_choices: OptimisticChoices<String>,
     /// Connection epoch in which each session's event-maintained state
     /// (history, approvals, inbox, tasks) was last fetched.
-    fetched_epoch: std::collections::HashMap<String, u64>,
+    fetched_epoch: std::collections::HashMap<String, ConnectionEpoch>,
     /// The usage dialog asked for details while a summary was in flight.
     usage_details_pending: std::collections::HashSet<String>,
     attention_seen: std::collections::HashSet<String>,
-    diff_requests: std::collections::HashMap<PathBuf, u64>,
-    task_requests: std::collections::HashMap<PathBuf, u64>,
+    diff_requests: Revisions<PathBuf>,
+    task_requests: Revisions<PathBuf>,
     pump: Option<(tokio::task::AbortHandle, Task<()>)>,
     exit_watch: Option<Task<()>>,
     recent_crashes: Vec<Instant>,
-    /// Bumped per notice so a stale auto-clear timer can't hide a newer one.
-    notice_seq: u64,
-    /// Bumped per catalog refresh request, to debounce bursts.
-    catalog_seq: u64,
+    /// Auto-clear timer of the current notice. Replacing it cancels the old
+    /// timer, so a stale one can't hide a newer notice.
+    notice_clear: Option<Task<()>>,
+    /// Pending debounced catalog refresh; replaced (cancelled) per burst event.
+    catalog_debounce: Option<Task<()>>,
     /// Offline UI demo (`OCDESK_DEMO`): no sidecar; prompts get synthetic replies.
     demo: bool,
     failed_submission: Option<(Submission, Option<String>, PathBuf)>,
     /// Session to reopen once the first session list arrives (last one open
     /// when ocdesk quit). Taken on first use.
     restore_session: Option<String>,
-    /// Bumped per debounced settings save.
-    save_seq: u64,
+    /// Pending debounced settings save; replaced per change, dropped on flush.
+    save_debounce: Option<Task<()>>,
 }
 
 impl Controller {
@@ -165,11 +162,12 @@ impl Controller {
             store,
             settings,
             api: None,
-            generation: 0,
-            connection_epoch: 0,
+            requests: RequestClock::default(),
             diff_requests: Default::default(),
             task_requests: Default::default(),
             mode_requests: Default::default(),
+            model_choices: Default::default(),
+            agent_choices: Default::default(),
             grant_requests: 0,
             submission_seq: 0,
             usage_revision: Default::default(),
@@ -179,12 +177,12 @@ impl Controller {
             pump: None,
             exit_watch: None,
             recent_crashes: Vec::new(),
-            notice_seq: 0,
-            catalog_seq: 0,
+            notice_clear: None,
+            catalog_debounce: None,
             demo: false,
             failed_submission: None,
             restore_session,
-            save_seq: 0,
+            save_debounce: None,
         };
         this.reset_draft_choices(cx);
         this.save_settings();
@@ -201,6 +199,16 @@ impl Controller {
     }
 
     /// Run `fut` on the Tokio runtime and hand the result back on the UI thread.
+    ///
+    /// Unfenced: `done` runs even after a sidecar restart. Use it for
+    /// mutations whose outcome is persisted server state (delete, rename,
+    /// archive, worktrees, inbox) or for local work (opening an editor), where
+    /// a completion stays true on the next server. Reads, and anything whose
+    /// completion rolls back or shows transient state, use [`Self::run_on`].
+    ///
+    /// Both halves are detached on purpose: an admitted mutation cannot be
+    /// cancelled, and the GPUI half holds only a weak controller handle, so it
+    /// does nothing once the controller is gone.
     fn run<T, F>(
         &self,
         cx: &mut Context<Self>,
@@ -223,16 +231,12 @@ impl Controller {
     }
 
     /// Where a request was issued, to drop its response if that's gone.
-    fn issued(&self, per_connection: bool) -> Issued {
-        Issued {
-            generation: self.generation,
-            epoch: per_connection.then_some(self.connection_epoch),
-        }
+    fn issued(&self, scope: RequestScope) -> Issued {
+        self.requests.issue(scope)
     }
 
     fn is_current(&self, issued: Issued) -> bool {
-        issued.generation == self.generation
-            && issued.epoch.is_none_or(|e| e == self.connection_epoch)
+        self.requests.accepts(issued)
     }
 
     /// [`Self::run`], but `done` only runs while the sidecar (and, for
@@ -250,6 +254,8 @@ impl Controller {
         self.run(cx, fut, move |this, res, cx| {
             if this.is_current(issued) {
                 done(this, res, cx);
+            } else {
+                tracing::debug!(?issued, generation = ?this.requests.generation(), epoch = ?this.requests.epoch(), "discarded obsolete request completion");
             }
         });
     }
@@ -267,7 +273,7 @@ impl Controller {
         if attempt >= SNAPSHOT_RETRIES {
             return false;
         }
-        let issued = self.issued(true);
+        let issued = self.issued(RequestScope::Connection);
         let delay = Duration::from_millis(100 << attempt);
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
@@ -306,26 +312,20 @@ impl Controller {
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        self.save_seq += 1;
-        let seq = self.save_seq;
         let exec = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
+        // Dropping the previous GPUI task cancels its timer.
+        self.save_debounce = Some(cx.spawn(async move |this, cx| {
             exec.timer(SETTINGS_DEBOUNCE).await;
-            let _ = this.update(cx, |this, _| {
-                if this.save_seq == seq {
-                    this.save_settings();
-                }
-            });
-        })
-        .detach();
+            let _ = this.update(cx, |this, _| this.save_settings());
+        }));
     }
 
     /// Write pending settings now (on quit).
     pub fn flush_settings(&mut self) {
-        self.save_seq += 1;
+        self.save_debounce = None;
         // The newest snapshot: it waits for any write in flight, then wins.
         if let Err(e) = self.settings.snapshot_for_save().write() {
-            tracing::warn!("could not save settings: {e:#}");
+            tracing::warn!(op = "save_settings", error = %format!("{e:#}"), "could not save settings");
         }
     }
 
@@ -335,7 +335,7 @@ impl Controller {
         let pending = self.settings.snapshot_for_save();
         self.rt.spawn_blocking(move || {
             if let Err(e) = pending.write() {
-                tracing::warn!("could not save settings: {e:#}");
+                tracing::warn!(op = "save_settings", error = %format!("{e:#}"), "could not save settings");
             }
         });
     }
@@ -350,22 +350,26 @@ impl Controller {
     }
 
     fn start_sidecar(&mut self, cx: &mut Context<Self>) {
-        self.generation += 1;
+        self.requests.restart();
         self.fetched_epoch.clear();
-        let generation = self.generation;
+        // Their completions are discarded with the old generation.
+        self.model_choices.clear();
+        self.agent_choices.clear();
+        let generation = self.requests.generation();
         self.api = None;
         self.store.update(cx, |s, cx| {
+            s.cancel_history_loads();
             s.submitting.clear();
             s.interrupting.clear();
             s.permission_sending.clear();
             s.form_sending.clear();
-            for dir in std::mem::take(&mut s.diff_loading) {
+            for dir in s.diff_status.abandon_all() {
                 cx.emit(StoreEvent::DiffsChanged { dir });
             }
             s.mode_sending.clear();
-            s.usage_loading.clear();
+            s.usage_status.abandon_all();
             s.grant_sending.clear();
-            s.saved_grants_loading = false;
+            s.saved_grants_status.abandon();
             cx.notify();
         });
         self.stop_pump();
@@ -378,7 +382,7 @@ impl Controller {
         let working_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move {
                 let binary = sidecar::find_binary().ok_or_else(|| {
                     anyhow!(
@@ -398,7 +402,7 @@ impl Controller {
                 let (api, sc, exit_rx) = match started {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::error!("sidecar failed to start: {e:#}");
+                        tracing::error!(op = "start_sidecar", ?generation, error = %format!("{e:#}"), "sidecar failed to start");
                         this.store.update(cx, |s, cx| {
                             s.set_connection(
                                 Connection::SidecarDown {
@@ -424,14 +428,14 @@ impl Controller {
 
     fn watch_exit(
         &mut self,
-        generation: u64,
+        generation: ServerGeneration,
         exit_rx: tokio::sync::oneshot::Receiver<sidecar::SidecarExit>,
         cx: &mut Context<Self>,
     ) {
         self.exit_watch = Some(cx.spawn(async move |this, cx| {
             let Ok(exit) = exit_rx.await else { return };
             let _ = this.update(cx, |this, cx| {
-                if this.generation != generation {
+                if this.requests.generation() != generation {
                     return;
                 }
                 this.api = None;
@@ -453,11 +457,16 @@ impl Controller {
                     s.set_active(vec![], cx);
                 });
                 if this.recent_crashes.len() as u32 <= MAX_QUICK_RESTARTS {
-                    tracing::warn!("restarting sidecar automatically");
+                    tracing::warn!(
+                        op = "start_sidecar",
+                        ?generation,
+                        crashes = this.recent_crashes.len(),
+                        "restarting sidecar automatically"
+                    );
                     cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(Duration::from_secs(1)).await;
                         let _ = this.update(cx, |this, cx| {
-                            if this.generation == generation {
+                            if this.requests.generation() == generation {
                                 this.start_sidecar(cx);
                             }
                         });
@@ -509,7 +518,7 @@ impl Controller {
         self.product_event(&env, cx);
         match env.event {
             Event::Connected => {
-                self.connection_epoch += 1;
+                self.requests.connection_changed();
                 #[cfg(debug_assertions)]
                 if std::env::var_os("OCDESK_DEBUG_PANIC").is_some() {
                     panic!("OCDESK_DEBUG_PANIC: deliberate panic to test sidecar teardown");
@@ -524,8 +533,9 @@ impl Controller {
                 self.files_changed(env.directory, Some(file), removed, cx)
             }
             Event::Disconnected => {
-                self.connection_epoch += 1;
+                self.requests.connection_changed();
                 self.store.update(cx, |s, cx| {
+                    s.cancel_history_loads();
                     s.permission_sending.clear();
                     s.form_sending.clear();
                     cx.notify();
@@ -585,7 +595,7 @@ impl Controller {
                 .read(cx)
                 .conversations
                 .get(&_session_id)
-                .is_some_and(|c| c.loaded)
+                .is_some_and(|c| c.loaded())
         {
             self.load_messages(_session_id.clone(), cx);
         }
@@ -620,7 +630,7 @@ impl Controller {
         let revision = self.store.read(cx).snapshot_revision;
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.active().await },
             move |this, res, cx| {
                 if this.store.read(cx).snapshot_revision != revision
@@ -632,7 +642,7 @@ impl Controller {
                 }
                 match res {
                     Ok(active) => this.store.update(cx, |s, cx| s.set_active(active, cx)),
-                    Err(e) => tracing::warn!("could not read active sessions: {e:#}"),
+                    Err(e) => tracing::warn!(op = "active", error = %format!("{e:#}"), "could not read active sessions"),
                 }
             },
         );
@@ -644,7 +654,7 @@ impl Controller {
             .update(cx, |s, _| s.invalidate_except(selected.as_deref()));
         self.fetched_epoch.clear();
         if let Some(id) = &selected {
-            self.fetched_epoch.insert(id.clone(), self.connection_epoch);
+            self.fetched_epoch.insert(id.clone(), self.requests.epoch());
         }
         self.refresh_sessions(cx);
         self.refresh_active(cx);
@@ -684,18 +694,11 @@ impl Controller {
     // ── models and agents ────────────────────────────────────────────────
 
     fn schedule_catalog_refresh(&mut self, cx: &mut Context<Self>) {
-        self.catalog_seq += 1;
-        let seq = self.catalog_seq;
         let exec = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
+        self.catalog_debounce = Some(cx.spawn(async move |this, cx| {
             exec.timer(CATALOG_DEBOUNCE).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.catalog_seq == seq {
-                    this.refresh_catalogs(cx);
-                }
-            });
-        })
-        .detach();
+            let _ = this.update(cx, |this, cx| this.refresh_catalogs(cx));
+        }));
     }
 
     /// Re-read models, default model and agents for every folder.
@@ -708,10 +711,10 @@ impl Controller {
     pub(crate) fn refresh_catalog(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
         self.refresh_folder_info(folder.clone(), cx);
-        let generation = self.generation;
         let dir = folder.clone();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move {
                 let (models, default_model, agents, configured_agent) = futures::join!(
                     api.models(&dir),
@@ -723,24 +726,21 @@ impl Controller {
                     models: models?,
                     // No default configured is not an error.
                     default_model: default_model.unwrap_or_else(|e| {
-                        tracing::warn!("no default model for {}: {e:#}", dir.display());
+                        tracing::warn!(op = "default_model", dir = %dir.display(), error = %format!("{e:#}"), "no default model");
                         None
                     }),
                     agents: agents?,
                     configured_agent: configured_agent.unwrap_or_default(),
                 })
             },
-            move |this, res: Result<Catalog>, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                match res {
-                    Ok(c) => this.store.update(cx, |s, cx| s.set_catalog(folder, c, cx)),
-                    Err(e) => tracing::warn!(
-                        "could not read models/agents for {}: {e:#}",
-                        folder.display()
-                    ),
-                }
+            move |this, res: Result<Catalog>, cx| match res {
+                Ok(c) => this.store.update(cx, |s, cx| s.set_catalog(folder, c, cx)),
+                Err(e) => tracing::warn!(
+                    op = "catalog",
+                    dir = %folder.display(),
+                    error = %format!("{e:#}"),
+                    "could not read models/agents"
+                ),
             },
         );
     }
@@ -749,10 +749,10 @@ impl Controller {
     /// part fails on its own (e.g. a folder that isn't a git repository).
     fn refresh_folder_info(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
-        let generation = self.generation;
         let dir = folder.clone();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move {
                 let (commands, skills, mcp, vcs, project) = futures::join!(
                     api.commands(&dir),
@@ -773,7 +773,7 @@ impl Controller {
                     }
                 }
                 let warn = |what: &str, e: &anyhow::Error| {
-                    tracing::debug!("{what} for {}: {e:#}", dir.display())
+                    tracing::debug!(op = "folder_info", dir = %dir.display(), error = %format!("{e:#}"), "{what}")
                 };
                 let tooling = Tooling {
                     commands: commands.unwrap_or_else(|e| {
@@ -792,9 +792,6 @@ impl Controller {
                 Ok((tooling, vcs.ok(), project.ok(), worktrees, wt_vcs))
             },
             move |this, res: Result<_>, cx| {
-                if this.generation != generation {
-                    return;
-                }
                 let Ok((tooling, vcs, project, worktrees, wt_vcs)) = res else {
                     return;
                 };
@@ -906,29 +903,22 @@ impl Controller {
         else {
             return;
         };
-        let request = self.task_requests.entry(dir.clone()).or_default();
-        *request += 1;
-        let request = *request;
-        let guard = (
-            self.generation,
-            self.connection_epoch,
-            self.store.read(cx).tasks_revision,
-        );
+        let request = self.task_requests.bump(dir.clone());
+        let revision = self.store.read(cx).tasks_revision;
         let target = sid.clone();
         let folder = dir.clone();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Connection),
             async move {
                 let (kids, shells) = futures::join!(api.children(&sid), api.shells(&dir));
                 Ok((kids?, shells?))
             },
             move |this, res, cx| {
-                if (this.generation, this.connection_epoch) != (guard.0, guard.1)
-                    || this.task_requests.get(&folder) != Some(&request)
-                {
+                if !this.task_requests.is_current(&folder, request) {
                     return;
                 }
-                if this.store.read(cx).tasks_revision != guard.2 {
+                if this.store.read(cx).tasks_revision != revision {
                     this.refresh_tasks(target, cx);
                     return;
                 }
@@ -937,7 +927,7 @@ impl Controller {
                         s.set_children(&target, kids, cx);
                         s.set_shells(&folder, shells, cx);
                     }),
-                    Err(e) => tracing::warn!("could not read tasks of {target}: {e:#}"),
+                    Err(e) => tracing::warn!(op = "tasks", session_id = %target, error = %format!("{e:#}"), "could not read tasks"),
                 }
             },
         );
@@ -951,7 +941,7 @@ impl Controller {
             .read(cx)
             .conversations
             .get(&child)
-            .is_some_and(|c| c.loaded);
+            .is_some_and(|c| c.loaded());
         if !loaded {
             self.load_messages(child, cx);
         }
@@ -964,11 +954,9 @@ impl Controller {
         shell_id: String,
     ) -> Option<oneshot::Receiver<Result<String>>> {
         let api = self.api.clone()?;
-        let (tx, rx) = oneshot::channel();
-        self.rt.spawn(async move {
-            let _ = tx.send(api.shell_output(&dir, &shell_id).await);
-        });
-        Some(rx)
+        Some(reads::spawn_read(&self.rt, "shell_output", async move {
+            api.shell_output(&dir, &shell_id).await
+        }))
     }
 
     pub fn kill_shell(&mut self, dir: PathBuf, shell_id: String, cx: &mut Context<Self>) {
@@ -1068,28 +1056,29 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
+        // Shown at once and rolled back on failure (see domain::choice); the
+        // draft default for new sessions only changes once the server agreed.
+        let token = self.show_agent(&sid, "build", cx);
         let session = sid.clone();
-        // Switching threads while the request runs must not retarget the prompt.
-        // A sidecar restart also invalidates this continuation.
+        // Switching threads while the request runs must not retarget the
+        // prompt. A sidecar restart also invalidates this continuation.
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.switch_agent(&session, "build").await },
-            move |this, res, cx| match res {
-                Ok(()) => {
-                    this.store.update(cx, |s, cx| {
-                        s.set_draft_choice(None, Some("build".into()), cx);
-                        s.apply(
-                            Envelope::bare(Event::AgentSelected {
-                                session_id: sid.clone(),
-                                agent: "build".into(),
-                            }),
-                            cx,
-                        );
-                    });
-                    this.submit_to(Submission::Prompt(prompt), Some((Some(sid), folder)), cx);
+            move |this, res, cx| {
+                this.settle_agent(sid.clone(), token, "build".into(), res.is_err(), cx);
+                match res {
+                    Ok(()) => {
+                        this.store.update(cx, |s, cx| {
+                            s.set_draft_choice(None, Some("build".into()), cx)
+                        });
+                        this.submit_to(Submission::Prompt(prompt), Some((Some(sid), folder)), cx);
+                    }
+                    Err(e) => {
+                        this.notice(format!("Could not switch to the build agent: {e:#}"), cx)
+                    }
                 }
-                Err(e) => this.notice(format!("Could not switch to the build agent: {e:#}"), cx),
             },
         );
     }
@@ -1123,39 +1112,17 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        let previous = self
-            .store
-            .read(cx)
-            .session(&sid)
-            .and_then(|s| s.model.clone());
-        // Optimistic; the stream confirms with session.model.selected.
-        self.store.update(cx, |s, cx| {
-            s.apply(
-                Envelope::bare(Event::ModelSelected {
-                    session_id: sid.clone(),
-                    model: model.clone(),
-                }),
-                cx,
-            )
-        });
+        let token = self.show_model(&sid, &model, cx);
         let target = sid.clone();
-        self.run(
+        let chosen = model.clone();
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move { api.switch_model(&sid, &model).await },
             move |this, res, cx| {
-                let Err(e) = res else { return };
-                this.notice(format!("Could not switch model: {e:#}"), cx);
-                // Roll back the optimistic choice.
-                if let Some(prev) = previous {
-                    this.store.update(cx, |s, cx| {
-                        s.apply(
-                            Envelope::bare(Event::ModelSelected {
-                                session_id: target,
-                                model: prev,
-                            }),
-                            cx,
-                        )
-                    });
+                this.settle_model(target, token, chosen, res.is_err(), cx);
+                if let Err(e) = res {
+                    this.notice(format!("Could not switch model: {e:#}"), cx);
                 }
             },
         );
@@ -1172,24 +1139,109 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        self.store.update(cx, |s, cx| {
-            s.apply(
-                Envelope::bare(Event::AgentSelected {
-                    session_id: sid.clone(),
-                    agent: agent.clone(),
-                }),
-                cx,
-            )
-        });
-        self.run(
+        let token = self.show_agent(&sid, &agent, cx);
+        let target = sid.clone();
+        let chosen = agent.clone();
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move { api.switch_agent(&sid, &agent).await },
-            |this, res, cx| {
+            move |this, res, cx| {
+                this.settle_agent(target, token, chosen, res.is_err(), cx);
                 if let Err(e) = res {
                     this.notice(format!("Could not switch agent: {e:#}"), cx);
                 }
             },
         );
+    }
+
+    // Optimistic choices: shown at once, confirmed by the stream
+    // (session.model.selected / session.agent.selected). See domain::choice
+    // for what a late or failed completion may still change.
+
+    fn show_model(&mut self, sid: &str, model: &ModelRef, cx: &mut Context<Self>) -> ChoiceToken {
+        let shown = self
+            .store
+            .read(cx)
+            .session(sid)
+            .and_then(|s| s.model.clone());
+        let token = self.model_choices.choose(sid, shown);
+        self.show_selection(
+            Event::ModelSelected {
+                session_id: sid.to_owned(),
+                model: model.clone(),
+            },
+            cx,
+        );
+        token
+    }
+
+    fn settle_model(
+        &mut self,
+        sid: String,
+        token: ChoiceToken,
+        model: ModelRef,
+        failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !failed {
+            self.model_choices.succeeded(&sid, token, model);
+        } else if let Some(model) = self.model_choices.failed(&sid, token) {
+            tracing::debug!(session_id = %sid, "rolling back failed model choice");
+            self.show_selection(
+                Event::ModelSelected {
+                    session_id: sid,
+                    model,
+                },
+                cx,
+            );
+        }
+    }
+
+    fn show_agent(&mut self, sid: &str, agent: &str, cx: &mut Context<Self>) -> ChoiceToken {
+        let shown = self
+            .store
+            .read(cx)
+            .session(sid)
+            .and_then(|s| s.agent.clone());
+        let token = self.agent_choices.choose(sid, shown);
+        self.show_selection(
+            Event::AgentSelected {
+                session_id: sid.to_owned(),
+                agent: agent.to_owned(),
+            },
+            cx,
+        );
+        token
+    }
+
+    fn settle_agent(
+        &mut self,
+        sid: String,
+        token: ChoiceToken,
+        agent: String,
+        failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !failed {
+            self.agent_choices.succeeded(&sid, token, agent);
+        } else if let Some(agent) = self.agent_choices.failed(&sid, token) {
+            tracing::debug!(session_id = %sid, "rolling back failed agent choice");
+            self.show_selection(
+                Event::AgentSelected {
+                    session_id: sid,
+                    agent,
+                },
+                cx,
+            );
+        }
+    }
+
+    /// Apply a locally decided selection; it bypasses [`Self::on_event`], so
+    /// the optimistic trackers don't mistake it for a server report.
+    fn show_selection(&mut self, event: Event, cx: &mut Context<Self>) {
+        self.store
+            .update(cx, |s, cx| s.apply(Envelope::bare(event), cx));
     }
 
     /// Fuzzy file search for `@` mentions. `None` when opencode isn't running.
@@ -1198,22 +1250,20 @@ impl Controller {
         folder: PathBuf,
         query: String,
     ) -> Option<oneshot::Receiver<Result<Vec<FsEntry>>>> {
-        let (tx, rx) = oneshot::channel();
         match (self.api.clone(), self.demo) {
-            (Some(api), _) => {
-                self.rt.spawn(async move {
-                    let _ = tx.send(api.find_files(&folder, &query, 20).await);
-                });
-            }
-            // Offline demo: walk the local folder instead.
+            (Some(api), _) => Some(reads::spawn_read(&self.rt, "find_files", async move {
+                api.find_files(&folder, &query, 20).await
+            })),
+            // Blocking local searches are bounded and finish independently.
             (None, true) => {
+                let (tx, rx) = oneshot::channel();
                 self.rt.spawn_blocking(move || {
                     let _ = tx.send(Ok(files::find_local(&folder, &query, 20)));
                 });
+                Some(rx)
             }
-            (None, false) => return None,
+            (None, false) => None,
         }
-        Some(rx)
     }
 
     /// Debug check (OCDESK_VERIFY_ON_IDLE): the streamed state of a loaded
@@ -1230,7 +1280,7 @@ impl Controller {
         self.run(cx, fut, move |this, res, cx| {
             let Ok(history) = res else { return };
             let store = this.store.read(cx);
-            let Some(conv) = store.conversations.get(&session_id).filter(|c| c.loaded) else { return };
+            let Some(conv) = store.conversations.get(&session_id).filter(|c| c.loaded()) else { return };
             if conv.messages == history {
                 tracing::info!(%session_id, messages = history.len(), "verify: store matches REST");
             } else {
@@ -1253,28 +1303,20 @@ impl Controller {
     fn notice(&mut self, msg: impl Into<String>, cx: &mut Context<Self>) {
         let msg = msg.into();
         tracing::warn!("{msg}");
-        self.notice_seq += 1;
-        let seq = self.notice_seq;
         self.store.update(cx, |s, cx| {
             s.notice = Some(msg);
             cx.notify();
         });
         let exec = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
+        let store = self.store.clone();
+        self.notice_clear = Some(cx.spawn(async move |_, cx| {
             exec.timer(NOTICE_LINGER).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.notice_seq != seq {
-                    return;
+            store.update(cx, |s, cx| {
+                if s.notice.take().is_some() {
+                    cx.notify();
                 }
-                this.store.update(cx, |s, cx| {
-                    if s.notice.is_some() {
-                        s.notice = None;
-                        cx.notify();
-                    }
-                });
             });
-        })
-        .detach();
+        }));
     }
 
     pub fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
@@ -1286,7 +1328,7 @@ impl Controller {
         let revision = self.store.read(cx).snapshot_revision;
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.list_sessions().await },
             move |this, res, cx| {
                 if this.store.read(cx).snapshot_revision != revision
@@ -1356,7 +1398,7 @@ impl Controller {
         let sid = session_id.clone();
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.messages(&sid).await },
             move |this, res, cx| {
                 if let Err(e) = &res {
@@ -1392,19 +1434,19 @@ impl Controller {
         let d = dir.clone();
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move {
                 let read = |forms: bool| {
                     let (api, d) = (api.clone(), d.clone());
                     with_location_retry(move || {
                         let (api, d) = (api.clone(), d.clone());
-                        Box::pin(async move {
+                        async move {
                             Ok(if forms {
                                 (Vec::new(), api.folder_forms(&d).await?)
                             } else {
                                 (api.folder_permissions(&d).await?, Vec::new())
                             })
-                        })
+                        }
                     })
                 };
                 let (p, f) = futures::join!(read(false), read(true));
@@ -1481,12 +1523,12 @@ impl Controller {
         let id = sid.clone();
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move {
                 with_location_retry(move || {
                     let api = api.clone();
                     let id = id.clone();
-                    Box::pin(async move { api.permissions(&id).await })
+                    async move { api.permissions(&id).await }
                 })
                 .await
             },
@@ -1502,7 +1544,7 @@ impl Controller {
                         }
                     }
                     Err(e) if is_location_404(&e) => {
-                        tracing::warn!("could not load permission requests: {e:#}")
+                        tracing::warn!(op = "permissions", session_id = %sid, error = %format!("{e:#}"), "location not ready; permission requests not loaded")
                     }
                     Err(e) => this.notice(format!("Could not load permission requests: {e:#}"), cx),
                 }
@@ -1516,12 +1558,12 @@ impl Controller {
         let id = sid.clone();
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move {
                 with_location_retry(move || {
                     let api = api.clone();
                     let id = id.clone();
-                    Box::pin(async move { api.forms(&id).await })
+                    async move { api.forms(&id).await }
                 })
                 .await
             },
@@ -1536,7 +1578,7 @@ impl Controller {
                         }
                     }
                     Err(e) if is_location_404(&e) => {
-                        tracing::warn!("could not load question forms: {e:#}")
+                        tracing::warn!(op = "forms", session_id = %sid, error = %format!("{e:#}"), "location not ready; question forms not loaded")
                     }
                     Err(e) => this.notice(format!("Could not load question forms: {e:#}"), cx),
                 }
@@ -1572,7 +1614,7 @@ impl Controller {
         let (session, form) = (sid.clone(), fid.clone());
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.reply_form(&session, &form, &answer).await },
             move |this, res, cx| {
                 this.store.update(cx, |s, cx| {
@@ -1639,7 +1681,7 @@ impl Controller {
         let (session, form) = (sid.clone(), fid.clone());
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.cancel_form(&session, &form).await },
             move |this, res, cx| {
                 this.store.update(cx, |s, cx| {
@@ -1699,7 +1741,7 @@ impl Controller {
         let (session, request) = (sid.clone(), rid.clone());
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move {
                 api.reply_permission(&session, &request, decision, message.as_deref())
                     .await
@@ -1758,17 +1800,15 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        let generation = self.generation;
-        let request = self.diff_requests.entry(dir.clone()).or_default();
-        *request += 1;
-        let request = *request;
+        let request = self.diff_requests.bump(dir.clone());
         self.store.update(cx, |s, cx| s.begin_diff(dir.clone(), cx));
         let d = dir.clone();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move { api.working_diff(&d).await },
             move |this, res, cx| {
-                if this.generation != generation || this.diff_requests.get(&dir) != Some(&request) {
+                if !this.diff_requests.is_current(&dir, request) {
                     return;
                 }
                 if let Ok(files) = &res {
@@ -1849,14 +1889,14 @@ impl Controller {
                 let s = self.store.read(cx);
                 s.conversations
                     .get(&id)
-                    .is_some_and(|c| c.loaded || c.fetching)
+                    .is_some_and(|c| c.loaded() || c.fetching())
                     && !s.needs_reload.contains(&id)
-                    && self.fetched_epoch.get(&id) == Some(&self.connection_epoch)
+                    && self.fetched_epoch.get(&id) == Some(&self.requests.epoch())
             };
             if current {
                 return;
             }
-            self.fetched_epoch.insert(id.clone(), self.connection_epoch);
+            self.fetched_epoch.insert(id.clone(), self.requests.epoch());
             self.refresh_permissions(id.clone(), cx);
             self.refresh_forms(id.clone(), cx);
             self.refresh_inbox(id.clone(), cx);
@@ -1932,12 +1972,17 @@ impl Controller {
         if selected_in_folder {
             self.select_session(None, cx);
         }
-        self.store.update(cx, |s, cx| {
-            s.forget_folder(&folder);
+        let forgotten = self.store.update(cx, |s, cx| {
+            let forgotten = s.forget_folder(&folder);
             s.set_folders(folders, cx);
+            forgotten
         });
-        self.diff_requests.remove(&folder);
-        self.task_requests.remove(&folder);
+        // Worktree checkouts go with their folder: an in-flight diff or task
+        // read for one must not re-create state for a directory now gone.
+        for dir in &forgotten {
+            self.diff_requests.forget(dir);
+            self.task_requests.forget(dir);
+        }
     }
 
     pub fn toggle_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
@@ -2071,7 +2116,7 @@ impl Controller {
         });
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move {
                 let (sid, created) = match selected {
                     Some(sid) => (sid, None),
@@ -2142,7 +2187,7 @@ impl Controller {
         let revision = inbox_revision(self.store.read(cx), &sid);
         self.run_on(
             cx,
-            self.issued(true),
+            self.issued(RequestScope::Connection),
             async move { api.inbox(&sid).await },
             move |this, res, cx| {
                 if inbox_revision(this.store.read(cx), &target) != revision {
@@ -2157,7 +2202,7 @@ impl Controller {
                     Ok(items) => this
                         .store
                         .update(cx, |s, cx| s.set_inbox(&target, items, cx)),
-                    Err(e) => tracing::warn!("could not read inbox of {target}: {e:#}"),
+                    Err(e) => tracing::warn!(op = "inbox", session_id = %target, error = %format!("{e:#}"), "could not read inbox"),
                 }
             },
         );
@@ -2213,7 +2258,7 @@ impl Controller {
         });
         self.run_on(
             cx,
-            self.issued(false),
+            self.issued(RequestScope::Server),
             async move { api.interrupt(&sid).await },
             move |this, res, cx| {
                 if let Err(e) = res {

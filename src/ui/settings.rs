@@ -244,7 +244,7 @@ impl SettingsView {
                 )
                 .child(
                     Button::new("refresh-saved-grants")
-                        .label(if store.saved_grants_loading {
+                        .label(if store.saved_grants_status.is_loading() {
                             "Loading…"
                         } else {
                             "Refresh"
@@ -257,16 +257,16 @@ impl SettingsView {
                         })),
                 ),
         );
-        if let Some(error) = &store.saved_grants_error {
+        if let Some(error) = store.saved_grants_status.error() {
             col = col.child(
                 div()
                     .text_sm()
                     .text_color(theme.danger)
-                    .child(error.clone()),
+                    .child(error.to_owned()),
             );
         }
         if store.saved_grants.is_empty() {
-            if !store.saved_grants_loading {
+            if !store.saved_grants_status.is_loading() {
                 col = col.child(
                     v_flex()
                         .items_center()

@@ -3,6 +3,7 @@ mod api;
 mod app_icon;
 mod controller;
 mod demo;
+mod domain;
 mod files;
 mod github;
 mod notifications;
