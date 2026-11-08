@@ -169,13 +169,13 @@ impl AppView {
                 async {}
             }),
         ];
-        // Closing the window with unsaved editor tabs asks first.
+        // Closing the window with unsaved file or agent drafts asks first.
         let conversation_for_close = conversation.downgrade();
         let me = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             let dirty = conversation_for_close
                 .upgrade()
-                .map(|c| c.read(cx).files().read(cx).dirty_files())
+                .map(|c| c.read(cx).dirty_files(cx))
                 .unwrap_or_default();
             if dirty.is_empty() {
                 return true;
@@ -203,14 +203,14 @@ impl AppView {
         }
     }
 
-    /// Run `then` now, or after the user agreed to drop unsaved editor tabs.
+    /// Run `then` now, or after the user agreed to drop unsaved drafts.
     fn confirm_discard(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Window, &mut App) + 'static,
     ) {
-        let dirty = self.conversation.read(cx).files().read(cx).dirty_files();
+        let dirty = self.conversation.read(cx).dirty_files(cx);
         if dirty.is_empty() {
             then(window, cx);
             return;

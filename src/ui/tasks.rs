@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -231,7 +230,7 @@ impl TasksDrawer {
                         ),
                 )
                 .when(running, |el| {
-                    el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+                    el.child(super::kit::spinner().xsmall().color(theme.muted_foreground))
                 })
                 .child(
                     Icon::new(IconName::ChevronRight)
@@ -374,7 +373,7 @@ impl TasksDrawer {
                 )
             })
             .when(running, |el| {
-                el.child(Spinner::new().small().color(theme.primary))
+                el.child(super::kit::spinner().small().color(theme.primary))
             })
             .when_some(result, |el, state| {
                 el.child(
@@ -443,7 +442,7 @@ impl TasksDrawer {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .when(sh.running(), |el| {
-                        el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+                        el.child(super::kit::spinner().xsmall().color(theme.muted_foreground))
                     })
                     .child(div().flex_1().child(shell_status(&sh)))
                     .when(sh.running() && dir.is_some(), |el| {

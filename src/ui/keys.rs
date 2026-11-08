@@ -64,7 +64,7 @@ pub struct OpenFile {
 fn table() -> Vec<(&'static str, Box<dyn Action>, &'static str)> {
     vec![
         ("secondary-n", Box::new(NewSession), "New session"),
-        ("secondary-o", Box::new(AddFolder), "Add folder…"),
+        ("secondary-o", Box::new(AddFolder), "Add project…"),
         ("secondary-b", Box::new(ToggleSidebar), "Show/hide sidebar"),
         ("alt-up", Box::new(PreviousSession), "Previous session"),
         ("alt-down", Box::new(NextSession), "Next session"),
@@ -361,7 +361,7 @@ pub fn set_menus(cx: &mut App) {
         ]),
         Menu::new("File").items([
             MenuItem::action("New Session", NewSession),
-            MenuItem::action("Add Folder…", AddFolder),
+            MenuItem::action("Add Project…", AddFolder),
             MenuItem::separator(),
             MenuItem::action("Go to File…", GoToFile),
             MenuItem::action("Save File", SaveFile),

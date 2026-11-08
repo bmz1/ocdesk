@@ -7,13 +7,14 @@
 //! those directories and reloads, and the panel also asks the controller to
 //! re-read the folder's agents so the composer's pickers update at once.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Sizable as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -39,6 +40,20 @@ struct Editing {
     model: Option<String>,
 }
 
+impl Editing {
+    fn value(&self, cx: &App) -> AgentEdit {
+        AgentEdit {
+            description: self.description.read(cx).value().to_string(),
+            prompt: self.prompt.read(cx).value().to_string(),
+            mode: self.mode.clone(),
+            model: self.model.clone(),
+        }
+    }
+    fn dirty(&self, cx: &App) -> bool {
+        self.value(cx) != AgentEdit::of(&self.file)
+    }
+}
+
 pub struct AgentsPanel {
     store: Entity<Store>,
     controller: Entity<Controller>,
@@ -46,6 +61,10 @@ pub struct AgentsPanel {
     files: Vec<AgentFile>,
     editing: Option<Editing>,
     error: Option<String>,
+    drafts: HashMap<PathBuf, Editing>,
+    reload_seq: u64,
+    edit_seq: u64,
+    pending: std::collections::HashSet<PathBuf>,
     _subs: Vec<Subscription>,
 }
 
@@ -60,14 +79,18 @@ impl AgentsPanel {
                 StoreEvent::SelectionChanged | StoreEvent::FoldersChanged => {
                     let folder = this.store.read(cx).target_folder();
                     if folder != this.folder {
-                        this.editing = None;
+                        this.stash(cx);
                         this.reload(cx);
                     }
                 }
                 _ => {}
             }),
             // The catalog (built-in agents, models) changes.
-            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.subscribe(&store, |_, _, event: &StoreEvent, cx| {
+                if matches!(event, StoreEvent::ChoicesChanged) {
+                    cx.notify();
+                }
+            }),
         ];
         let mut this = Self {
             store,
@@ -76,30 +99,117 @@ impl AgentsPanel {
             files: Vec::new(),
             editing: None,
             error: None,
+            drafts: HashMap::new(),
+            reload_seq: 0,
+            edit_seq: 0,
+            pending: Default::default(),
             _subs: subs,
         };
         this.reload(cx);
         this
     }
 
-    /// Re-read the agent files (called whenever the tab opens).
+    /// Keep unsaved forms when navigating away. Reopening the agent resumes it.
+    fn stash(&mut self, cx: &App) {
+        self.edit_seq += 1;
+        if let Some(editing) = self.editing.take()
+            && (editing.dirty(cx) || self.pending.contains(&editing.file.path))
+        {
+            self.drafts.insert(editing.file.path.clone(), editing);
+        }
+    }
+
+    pub fn dirty_files(&self, cx: &App) -> Vec<String> {
+        self.editing
+            .iter()
+            .chain(self.drafts.values())
+            .filter(|e| e.dirty(cx) || self.pending.contains(&e.file.path))
+            .map(|e| e.file.path.display().to_string())
+            .collect()
+    }
+
+    /// Filesystem work runs off the UI thread; only entity updates run here.
+    fn io<T: Send + 'static>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let task = cx.background_executor().spawn(async move { work() });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(value) => done(this, value, window, cx),
+                Err(e) => {
+                    this.error = Some(format!("{e:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.folder = self.store.read(cx).target_folder();
-        self.files = self
-            .folder
-            .as_deref()
-            .map(agents::discover)
-            .unwrap_or_default();
-        self.error = None;
+        let folder = self.store.read(cx).target_folder();
+        if folder != self.folder {
+            self.stash(cx);
+            self.files.clear();
+        }
+        self.folder = folder.clone();
+        self.reload_seq += 1;
+        let seq = self.reload_seq;
+        let task = cx
+            .background_executor()
+            .spawn(async move { folder.as_deref().map(agents::discover).unwrap_or_default() });
+        cx.spawn(async move |this, cx| {
+            let files = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.reload_seq == seq {
+                    this.files = files;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         cx.notify();
     }
 
     fn edit(&mut self, file: AgentFile, window: &mut Window, cx: &mut Context<Self>) {
-        let loaded = std::fs::read_to_string(&file.path).unwrap_or_else(|_| file.doc.render());
-        let file = AgentFile {
-            doc: agents::AgentDoc::parse(&loaded),
-            ..file
-        };
+        self.stash(cx);
+        if let Some(draft) = self.drafts.remove(&file.path) {
+            self.editing = Some(draft);
+            self.error = None;
+            cx.notify();
+            return;
+        }
+        let seq = self.edit_seq;
+        self.io(
+            window,
+            cx,
+            move || {
+                let loaded = std::fs::read_to_string(&file.path)?;
+                let file = AgentFile {
+                    doc: agents::AgentDoc::parse(&loaded),
+                    ..file
+                };
+                Ok((file, loaded))
+            },
+            move |this, (file, loaded), window, cx| {
+                if this.edit_seq == seq {
+                    this.open_editor(file, loaded, window, cx);
+                }
+            },
+        );
+    }
+
+    fn open_editor(
+        &mut self,
+        file: AgentFile,
+        loaded: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let e = AgentEdit::of(&file);
         let description = cx.new(|cx| {
             InputState::new(window, cx)
@@ -126,37 +236,82 @@ impl AgentsPanel {
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ed) = &self.editing else { return };
-        let on_disk = std::fs::read_to_string(&ed.file.path).ok();
-        if on_disk.as_deref().is_some_and(|d| d != ed.loaded) {
-            self.error = Some(
-                "The file changed on disk since you opened it. Go back and open it again to edit the latest version."
-                    .into(),
-            );
-            cx.notify();
+        let path = ed.file.path.clone();
+        if !self.pending.insert(path.clone()) {
             return;
         }
-        let edit = AgentEdit {
-            description: ed.description.read(cx).value().to_string(),
-            mode: ed.mode.clone(),
-            model: ed.model.clone(),
-            prompt: ed.prompt.read(cx).value().to_string(),
-        };
+        let edit = ed.value(cx);
         let mut doc = ed.file.doc.clone();
         edit.apply(&mut doc);
-        let path = ed.file.path.clone();
-        let name = ed.file.name.clone();
-        match agents::write(&path, &doc) {
-            Ok(()) => {
-                self.editing = None;
-                self.reload(cx);
-                self.controller.update(cx, |c, cx| c.agents_changed(cx));
-                super::kit::toast(window, cx, format!("Saved agent {name}"), None);
-            }
-            Err(e) => {
-                self.error = Some(format!("{e:#}"));
+        let loaded = ed.loaded.clone();
+        let work_path = path.clone();
+        let saved_doc = doc.clone();
+        cx.notify();
+        // Return the error as a value so pending state is always cleared.
+        self.io(
+            window,
+            cx,
+            move || Ok(agents::write_checked(&work_path, &loaded, &doc)),
+            move |this, result, window, cx| {
+                this.pending.remove(&path);
+                match result {
+                    Ok(()) => {
+                        let current = this
+                            .editing
+                            .as_mut()
+                            .filter(|e| e.file.path == path)
+                            .or_else(|| this.drafts.get_mut(&path));
+                        if let Some(e) = current {
+                            // Edits made during the save remain unsaved against the new baseline.
+                            e.loaded = saved_doc.render();
+                            e.file.doc = saved_doc;
+                        }
+                        this.error = None;
+                        this.reload(cx);
+                        this.controller.update(cx, |c, cx| c.agents_changed(cx));
+                        super::kit::toast(window, cx, "Saved agent", None);
+                    }
+                    Err(e) => this.error = Some(format!("{e:#}")),
+                }
                 cx.notify();
-            }
+            },
+        );
+    }
+
+    fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(e) = &self.editing else { return };
+        if self.pending.contains(&e.file.path) {
+            return;
         }
+        let file = e.file.clone();
+        let path = file.path.clone();
+        let weak = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let file = file.clone();
+            let path = path.clone();
+            let weak = weak.clone();
+            alert
+                .title("Discard this agent draft?")
+                .description(
+                    "Your unsaved edits will be discarded and the file will be read again.",
+                )
+                .confirm()
+                .ok_text("Discard")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        if this.pending.contains(&path) {
+                            return;
+                        }
+                        if this.editing.as_ref().is_some_and(|e| e.file.path == path) {
+                            this.editing = None;
+                        }
+                        this.drafts.remove(&path);
+                        this.edit(file.clone(), window, cx);
+                    });
+                    true
+                })
+        });
     }
 
     fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -173,18 +328,44 @@ impl AgentsPanel {
                 .ok_text("Delete")
                 .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, window, cx| {
-                    let res = std::fs::remove_file(&path);
-                    let _ = weak.update(cx, |this, cx| match res {
-                        Ok(()) => {
-                            this.editing = None;
-                            this.reload(cx);
-                            this.controller.update(cx, |c, cx| c.agents_changed(cx));
-                            super::kit::toast(window, cx, format!("Deleted agent {name}"), None);
+                    let path = path.clone();
+                    let name = name.clone();
+                    let _ = weak.update(cx, |this, cx| {
+                        if !this.pending.insert(path.clone()) {
+                            return;
                         }
-                        Err(e) => {
-                            this.error = Some(format!("Could not delete: {e}"));
-                            cx.notify();
-                        }
+                        cx.notify();
+                        let deleted_path = path.clone();
+                        this.io(
+                            window,
+                            cx,
+                            move || Ok(std::fs::remove_file(&path)),
+                            move |this, result, window, cx| {
+                                this.pending.remove(&deleted_path);
+                                match result {
+                                    Ok(()) => {
+                                        if this
+                                            .editing
+                                            .as_ref()
+                                            .is_some_and(|e| e.file.path == deleted_path)
+                                        {
+                                            this.editing = None;
+                                        }
+                                        this.drafts.remove(&deleted_path);
+                                        this.reload(cx);
+                                        this.controller.update(cx, |c, cx| c.agents_changed(cx));
+                                        super::kit::toast(
+                                            window,
+                                            cx,
+                                            format!("Deleted agent {name}"),
+                                            None,
+                                        );
+                                    }
+                                    Err(e) => this.error = Some(format!("Could not delete: {e}")),
+                                }
+                                cx.notify();
+                            },
+                        );
                     });
                     true
                 })
@@ -223,35 +404,47 @@ impl AgentsPanel {
                 .ok_text("Create")
                 .on_ok(move |_, window, cx| {
                     let name = input.read(cx).value().trim().to_string();
-                    let made = agents::new_agent_path(&folder, scope, &name).and_then(|path| {
-                        agents::create(
-                            &path,
-                            &AgentEdit {
-                                description: String::new(),
-                                mode: Some("subagent".into()),
-                                model: None,
-                                prompt: format!("You are the {name} agent."),
-                            },
-                        )
-                        .map(|()| path)
-                    });
-                    match made {
-                        Ok(path) => {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.reload(cx);
-                                this.controller.update(cx, |c, cx| c.agents_changed(cx));
-                                if let Some(f) = this.files.iter().find(|f| f.path == path).cloned()
-                                {
-                                    this.edit(f, window, cx);
-                                }
-                            });
-                            true
-                        }
+                    let path = match agents::new_agent_path(&folder, scope, &name) {
+                        Ok(path) => path,
                         Err(e) => {
                             super::kit::toast(window, cx, format!("{e:#}"), None);
-                            false
+                            return false;
                         }
-                    }
+                    };
+                    let folder = folder.clone();
+                    let _ = weak.update(cx, |this, cx| {
+                        let target = folder.clone();
+                        let edit_seq = this.edit_seq;
+                        this.io(
+                            window,
+                            cx,
+                            move || {
+                                agents::create(
+                                    &path,
+                                    &AgentEdit {
+                                        description: String::new(),
+                                        mode: Some("subagent".into()),
+                                        model: None,
+                                        prompt: format!("You are the {name} agent."),
+                                    },
+                                )?;
+                                Ok(agents::discover(&folder)
+                                    .into_iter()
+                                    .find(|f| f.path == path))
+                            },
+                            move |this, file, window, cx| {
+                                this.reload(cx);
+                                this.controller.update(cx, |c, cx| c.agents_changed(cx));
+                                if this.folder.as_ref() == Some(&target)
+                                    && this.edit_seq == edit_seq
+                                    && let Some(file) = file
+                                {
+                                    this.edit(file, window, cx);
+                                }
+                            },
+                        );
+                    });
+                    true
                 })
         });
     }
@@ -261,32 +454,41 @@ impl AgentsPanel {
         let Some(folder) = self.folder.clone() else {
             return;
         };
-        let (mut added, mut skipped, mut failed) = (Vec::new(), Vec::new(), None);
-        for (name, edit) in agents::pipeline_template() {
-            match agents::new_agent_path(&folder, Scope::Project, name) {
-                Ok(path) if path.exists() => skipped.push(name),
-                Ok(path) => match agents::create(&path, &edit) {
-                    Ok(()) => added.push(name),
-                    Err(e) => failed = Some(format!("{e:#}")),
-                },
-                Err(e) => failed = Some(format!("{e:#}")),
-            }
-        }
-        self.reload(cx);
-        self.error = failed;
-        self.controller.update(cx, |c, cx| c.agents_changed(cx));
-        let mut msg = if added.is_empty() {
-            "No agents added".to_string()
-        } else {
-            format!(
-                "Added {}. Pick the lead agent in the composer to run the team.",
-                added.join(", ")
-            )
-        };
-        if !skipped.is_empty() {
-            msg.push_str(&format!(" Kept existing: {}.", skipped.join(", ")));
-        }
-        super::kit::toast(window, cx, msg, None);
+        self.io(
+            window,
+            cx,
+            move || {
+                let (mut added, mut skipped, mut failed) = (Vec::new(), Vec::new(), None);
+                for (name, edit) in agents::pipeline_template() {
+                    match agents::new_agent_path(&folder, Scope::Project, name) {
+                        Ok(path) if path.exists() => skipped.push(name),
+                        Ok(path) => match agents::create(&path, &edit) {
+                            Ok(()) => added.push(name),
+                            Err(e) => failed = Some(format!("{e:#}")),
+                        },
+                        Err(e) => failed = Some(format!("{e:#}")),
+                    }
+                }
+                Ok((added, skipped, failed))
+            },
+            |this, (added, skipped, failed), window, cx| {
+                this.reload(cx);
+                this.error = failed;
+                this.controller.update(cx, |c, cx| c.agents_changed(cx));
+                let mut msg = if added.is_empty() {
+                    "No agents added".to_string()
+                } else {
+                    format!(
+                        "Added {}. Pick the lead agent in the composer to run the team.",
+                        added.join(", ")
+                    )
+                };
+                if !skipped.is_empty() {
+                    msg.push_str(&format!(" Kept existing: {}.", skipped.join(", ")));
+                }
+                super::kit::toast(window, cx, msg, None);
+            },
+        );
     }
 
     fn models(&self, cx: &App) -> Vec<ModelInfo> {
@@ -329,7 +531,7 @@ impl AgentsPanel {
                         .small()
                         .tooltip("All agents")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.editing = None;
+                            this.stash(cx);
                             this.reload(cx);
                         })),
                 )
@@ -390,7 +592,7 @@ impl AgentsPanel {
                 .p_4()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child("Add a folder to manage its agents.")
+                .child("Add a project to manage its agents.")
                 .into_any_element();
         }
         let store = self.store.read(cx);
@@ -452,7 +654,15 @@ impl AgentsPanel {
                         .rounded_lg()
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.secondary))
-                        .child(div().text_sm().truncate().child(f.name.clone()))
+                        .child(div().text_sm().truncate().child(format!(
+                            "{}{}",
+                            f.name,
+                            if self.drafts.contains_key(&f.path) {
+                                " ●"
+                            } else {
+                                ""
+                            }
+                        )))
                         .when_some(f.description(), |el, d| {
                             el.child(
                                 div()
@@ -507,6 +717,7 @@ impl AgentsPanel {
             return div().into_any_element();
         };
         let weak = cx.entity().downgrade();
+        let pending = self.pending.contains(&ed.file.path);
         let label = |text: &'static str| {
             div()
                 .text_xs()
@@ -672,22 +883,29 @@ impl AgentsPanel {
                     .child(label("Prompt"))
                     .child(Textarea::new(&ed.prompt)),
             )
-            .when_some(self.error.clone(), |el, e| {
-                el.child(div().text_xs().text_color(theme.danger).child(e))
-            })
             .child(
                 h_flex()
                     .gap_2()
                     .child(
                         Button::new("agent-save")
-                            .label("Save")
+                            .label(if pending { "Working…" } else { "Save" })
+                            .disabled(pending)
                             .primary()
                             .small()
                             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                     )
+                    .child(
+                        Button::new("agent-discard")
+                            .label("Discard…")
+                            .ghost()
+                            .small()
+                            .disabled(pending)
+                            .on_click(cx.listener(|this, _, window, cx| this.discard(window, cx))),
+                    )
                     .child(div().flex_1())
                     .child(
                         Button::new("agent-delete")
+                            .disabled(pending)
                             .label("Delete")
                             .danger()
                             .ghost()
@@ -732,13 +950,21 @@ impl Render for AgentsPanel {
         } else {
             self.render_list(cx)
         };
-        v_flex().size_full().child(self.header(cx)).child(
-            div()
-                .id("agents-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(body),
-        )
+        let error = self.error.clone();
+        let danger = cx.theme().danger;
+        v_flex()
+            .size_full()
+            .child(self.header(cx))
+            .when_some(error, |el, e| {
+                el.child(div().px_3().py_2().text_xs().text_color(danger).child(e))
+            })
+            .child(
+                div()
+                    .id("agents-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
     }
 }

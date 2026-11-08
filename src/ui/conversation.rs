@@ -458,6 +458,12 @@ impl ConversationView {
         cx.notify();
     }
 
+    pub fn dirty_files(&self, cx: &App) -> Vec<String> {
+        let mut files = self.files.read(cx).dirty_files();
+        files.extend(self.agents.read(cx).dirty_files(cx));
+        files
+    }
+
     /// The editor tabs (for app-level shortcuts).
     pub fn files(&self) -> &Entity<super::editor_tabs::FileTabs> {
         &self.files
@@ -689,7 +695,7 @@ impl ConversationView {
 
         let chooser = if folders.is_empty() {
             Button::new("start-add-folder")
-                .label("Add a folder to start")
+                .label("Add a project to start")
                 .icon(IconName::Folder)
                 .primary()
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -718,7 +724,7 @@ impl ConversationView {
                     let c = controller.clone();
                     menu.separator()
                         .item(
-                            PopupMenuItem::new("Add folder…").on_click(move |_, window, cx| {
+                            PopupMenuItem::new("Add project…").on_click(move |_, window, cx| {
                                 crate::ui::add_folder(c.clone(), window, cx);
                             }),
                         )
@@ -1262,7 +1268,7 @@ impl Render for ConversationView {
                     .child(tab_button(
                         "toggle-agents",
                         PanelTab::Agents,
-                        "Agents: opencode agent files for this folder".into(),
+                        "Agents: opencode agent files for this project".into(),
                         super::icons::bot(),
                         &super::keys::ToggleAgents,
                         false,

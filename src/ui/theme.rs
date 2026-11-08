@@ -49,6 +49,50 @@ pub fn install(cx: &mut App) {
     theme.light_theme = light;
 }
 
+/// Follow the OS "reduce motion" setting. GPUI's animations, springs and
+/// dialogs all honour `App::reduce_motion`, but nothing sets it from the
+/// platform, so ask the desktop once at startup (off the UI thread).
+/// `OCDESK_REDUCE_MOTION=1`/`0` overrides the probe.
+pub fn follow_reduced_motion(cx: &mut App) {
+    let probe = cx
+        .background_executor()
+        .spawn(async { os_reduces_motion() });
+    cx.spawn(async move |cx| {
+        if probe.await {
+            cx.update(|cx| cx.set_reduce_motion(true));
+        }
+    })
+    .detach();
+}
+
+fn os_reduces_motion() -> bool {
+    if let Ok(v) = std::env::var("OCDESK_REDUCE_MOTION") {
+        return v == "1";
+    }
+    let read = |cmd: &str, args: &[&str]| {
+        std::process::Command::new(cmd)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    if cfg!(target_os = "macos") {
+        read(
+            "defaults",
+            &["read", "com.apple.universalaccess", "reduceMotion"],
+        )
+        .is_some_and(|v| v == "1")
+    } else {
+        // GNOME (and most GTK desktops): "Animations" off in Accessibility.
+        read(
+            "gsettings",
+            &["get", "org.gnome.desktop.interface", "enable-animations"],
+        )
+        .is_some_and(|v| v == "false")
+    }
+}
+
 /// Apply a theme preference: "light", "system" or anything else for dark.
 pub fn apply(pref: Option<&str>, window: &mut Window, cx: &mut App) {
     match pref {

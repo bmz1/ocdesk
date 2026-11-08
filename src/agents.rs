@@ -10,6 +10,7 @@
 //! frontmatter entry (permissions, request, comments, …) is kept verbatim,
 //! so saving never drops settings it doesn't understand.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
@@ -411,23 +412,58 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 /// Write a new agent file; fails if one already exists there.
 pub fn create(path: &Path, edit: &AgentEdit) -> Result<()> {
-    if path.exists() {
-        bail!("{} already exists", path.display());
-    }
     let mut doc = AgentDoc::parse("---\n---\n");
     edit.apply(&mut doc);
-    write(path, &doc)
+    let tmp = write_temp(path, &doc)?;
+    // Publish the complete file without replacing an existing agent, even
+    // when two background creates race. Both paths are on the same volume.
+    let result = std::fs::hard_link(&tmp, path)
+        .with_context(|| format!("create {} (it may already exist)", path.display()));
+    let _ = std::fs::remove_file(tmp);
+    result
+}
+
+/// Refuse unreadable, deleted or externally modified files. This is a
+/// best-effort check: filesystem rename does not provide compare-and-swap.
+pub fn write_checked(path: &Path, loaded: &str, doc: &AgentDoc) -> Result<()> {
+    let current = std::fs::read_to_string(path)
+        .with_context(|| format!("read {} before saving", path.display()))?;
+    if current != loaded {
+        bail!(
+            "The agent file changed on disk. Your draft is kept. Copy any edits you want to retain, then use Discard to load the current file."
+        );
+    }
+    write(path, doc)
 }
 
 pub fn write(path: &Path, doc: &AgentDoc) -> Result<()> {
+    let tmp = write_temp(path, doc)?;
+    let result = std::fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()));
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
+fn write_temp(path: &Path, doc: &AgentDoc) -> Result<PathBuf> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    // Write next to the file, then rename: opencode's watcher never reads a
-    // half-written agent.
-    let tmp = path.with_extension("md.ocdesk-tmp");
-    std::fs::write(&tmp, doc.render()).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()))
+    // Independent operations must never share a temporary file. Publish only
+    // after closing it, so watchers cannot read partially written frontmatter.
+    let tmp = path.with_extension(format!("md.ocdesk-{:016x}.tmp", rand::random::<u64>()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    if let Err(e) = file.write_all(doc.render().as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("write {}", tmp.display()));
+    }
+    drop(file);
+    Ok(tmp)
 }
 
 /// Starter agents. `lead` runs the others: plan → implement → three
@@ -500,6 +536,69 @@ Always use your subagents for these steps instead of doing the work yourself.";
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concurrent_agent_creation_never_replaces_the_winner() {
+        let dir = std::env::temp_dir().join(format!("ocdesk-create-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.md");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let jobs: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|prompt| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = super::create(
+                        &path,
+                        &super::AgentEdit {
+                            prompt: prompt.into(),
+                            ..Default::default()
+                        },
+                    );
+                    (prompt, result.is_ok())
+                })
+            })
+            .collect();
+        let results: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(_, ok)| *ok).count(), 1);
+        let winner = results.iter().find(|(_, ok)| *ok).unwrap().0;
+        let doc = super::AgentDoc::parse(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(
+            super::AgentEdit::of(&super::AgentFile {
+                name: "agent".into(),
+                path: path.clone(),
+                scope: super::Scope::Project,
+                root: dir.clone(),
+                doc,
+            })
+            .prompt
+            .trim(),
+            winner
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn checked_write_preserves_external_changes_and_refuses_missing_files() {
+        let dir =
+            std::env::temp_dir().join(format!("ocdesk-agent-write-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.md");
+        let original = "---\ndescription: original\n---\nold prompt\n";
+        let doc = super::AgentDoc::parse("---\ndescription: saved\n---\nnew prompt\n");
+        std::fs::write(&path, original).unwrap();
+        super::write_checked(&path, original, &doc).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), doc.render());
+        assert!(super::write_checked(&path, original, &doc).is_err());
+        std::fs::write(&path, "external edit").unwrap();
+        assert!(super::write_checked(&path, original, &doc).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external edit");
+        std::fs::remove_file(&path).unwrap();
+        assert!(super::write_checked(&path, original, &doc).is_err());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use super::*;
 
     const SAMPLE: &str = "---

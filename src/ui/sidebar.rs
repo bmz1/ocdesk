@@ -362,7 +362,7 @@ impl Sidebar {
                             .icon(IconName::Plus)
                             .ghost()
                             .xsmall()
-                            .tooltip("New session in this folder")
+                            .tooltip("New session in this project")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 let f = f_new.clone();
@@ -902,7 +902,7 @@ impl Render for Sidebar {
                     .justify_between()
                     .items_center()
                     .child(super::kit::section_label(
-                        if activity { "Needs you" } else { "Folders" },
+                        if activity { "Needs you" } else { "Projects" },
                         cx,
                     ))
                     .child(
@@ -910,7 +910,7 @@ impl Render for Sidebar {
                             .icon(IconName::Plus)
                             .ghost()
                             .xsmall()
-                            .tooltip("Add folder…")
+                            .tooltip("Add project…")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 crate::ui::add_folder(this.controller.clone(), window, cx);
                             })),
@@ -928,7 +928,7 @@ impl Render for Sidebar {
                     .when(empty, |el| {
                         el.child(
                             v_flex().px_2().py_4().gap_2().text_sm().text_color(theme.muted_foreground).child(
-                                "Add a project folder to start. Sessions are grouped by folder.",
+                                "Add a project folder to start. Sessions are grouped by project.",
                             ),
                         )
                     }),

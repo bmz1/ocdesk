@@ -90,7 +90,7 @@ fn groups(mode: Mode, store: &Store, controller: &Entity<Controller>) -> Vec<Gro
             })
             .collect();
         out.push(Group {
-            label: "Folders",
+            label: "Projects",
             items,
         });
         let items = super::keys::palette_actions()
@@ -238,6 +238,10 @@ pub fn open(controller: Entity<Controller>, mode: Mode, window: &mut Window, cx:
                 }
             })
             .on_cancel(|window, cx| window.close_dialog(cx));
-        dialog.w(px(640.)).p_0().child(command)
+        dialog
+            .entrance(gpui_kit::component::dialog::DialogEntrance::None)
+            .w(px(640.))
+            .p_0()
+            .child(command)
     });
 }

@@ -181,7 +181,7 @@ impl Render for GoToFile {
                                 .text_sm()
                                 .text_color(theme.muted_foreground)
                                 .child(if query_empty {
-                                    "Type to search this folder"
+                                    "Type to search this project"
                                 } else {
                                     "No matching files"
                                 }),
@@ -211,6 +211,10 @@ pub fn open(
             let input = view.read(cx).input.clone();
             input.update(cx, |i, cx| i.focus(window, cx));
         }
-        dialog.title("Go to file").w(px(560.)).child(view.clone())
+        dialog
+            .entrance(gpui_kit::component::dialog::DialogEntrance::None)
+            .title("Go to file")
+            .w(px(560.))
+            .child(view.clone())
     });
 }

@@ -84,6 +84,7 @@ fn main() -> Result<()> {
     app.run(move |cx| {
         gpui_kit::init(cx);
         ui::theme::install(cx);
+        ui::theme::follow_reduced_motion(cx);
         cx.set_app_identity(ui::app_view::APP_ID, "ocdesk");
         cx.on_app_quit(|_| {
             sidecar::kill_sidecar();
