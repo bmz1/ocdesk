@@ -1,3 +1,8 @@
 /target
 *.log
 /dev/xdg/ocdesk/
+__pycache__/
+*.pyc
+.DS_Store
+# Agent files the Agents panel writes when ocdesk is pointed at this repo.
+/.opencode/
