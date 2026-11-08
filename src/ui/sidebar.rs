@@ -40,12 +40,12 @@ pub struct Sidebar {
 
 /// A session's status for its row.
 pub fn row_status(store: &Store, id: &str) -> RowStatus {
-    let waiting = store.permissions.get(id).is_some_and(|p| !p.is_empty())
-        || store.forms.get(id).is_some_and(|f| !f.is_empty())
+    let waiting = store.permissions.has_pending(id)
+        || store.forms.has_pending(id)
         || store
             .children_of(id)
             .iter()
-            .any(|c| store.permissions.get(&c.id).is_some_and(|p| !p.is_empty()));
+            .any(|c| store.permissions.has_pending(&c.id));
     if waiting {
         RowStatus::NeedsYou
     } else if store.is_busy(id) {

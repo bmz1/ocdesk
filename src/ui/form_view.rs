@@ -38,9 +38,7 @@ pub fn render_forms(
     let Some(sid) = store.selected.clone() else {
         return div().into_any_element();
     };
-    let Some(forms) = store.forms.get(&sid).cloned() else {
-        return div().into_any_element();
-    };
+    let forms = store.forms.of_session(&sid).to_vec();
     if forms.is_empty() {
         return div().into_any_element();
     }
@@ -84,8 +82,7 @@ fn render_card(
 ) -> AnyElement {
     let theme = cx.theme();
     let draft = store.form_draft(&form.id);
-    let key = (sid.to_string(), form.id.clone());
-    let sending = store.form_sending.contains(&key);
+    let sending = store.forms.is_sending(sid, &form.id);
     let connected = store.connection() == Connection::Connected;
     let disabled = sending || !connected;
     let ready = form
@@ -124,7 +121,7 @@ fn render_card(
         ));
     }
 
-    let error = store.form_errors.get(&key).cloned();
+    let error = store.forms.reply_error(sid, &form.id).map(str::to_owned);
     let (controller2, sid2, fid2) = (controller.clone(), sid.to_string(), form.id.clone());
     let cancel: Entity<Controller> = controller;
     let (sid3, fid3) = (sid.to_string(), form.id.clone());
@@ -137,7 +134,9 @@ fn render_card(
                     .label("Dismiss")
                     .ghost()
                     .small()
-                    .disabled(sending)
+                    // Like replies: a dismissal sent while reconnecting could
+                    // never report back, leaving the form stuck "sending".
+                    .disabled(disabled)
                     .on_click(move |_, _, cx| {
                         cancel.update(cx, |c, cx| c.cancel_form(sid3.clone(), fid3.clone(), cx))
                     }),
