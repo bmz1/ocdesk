@@ -27,8 +27,8 @@ pub struct ToolCtx<'a> {
     pub open_task: &'a super::tasks::OpenTask,
     pub scrolls: &'a ScrollHandles,
     pub density: crate::settings::Density,
-    /// The find bar's query, lowercased: calls that match open up.
-    pub find: Option<&'a str>,
+    /// Calls (ids) that match the find bar's query: they open up.
+    pub found: Option<&'a HashSet<String>>,
 }
 
 impl ToolCtx<'_> {
@@ -40,17 +40,37 @@ impl ToolCtx<'_> {
     }
 
     fn found(&self, t: &ToolCall) -> bool {
-        self.find.is_some_and(|q| tool_matches(t, q))
+        self.found.is_some_and(|f| f.contains(&t.call_id))
     }
 }
 
-/// Whether a call's input, output or error contains `q` (lowercase).
+/// Whether `hay` contains `needle_lower` (already lowercase), ignoring
+/// ASCII case, without allocating.
+pub fn contains_ci(hay: &str, needle_lower: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle_lower.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// Whether a call's input strings, output or error contain `q` (lowercase).
 pub fn tool_matches(t: &ToolCall, q: &str) -> bool {
-    let has = |s: &str| s.to_lowercase().contains(q);
-    has(&t.name)
-        || has(&t.input.to_string())
-        || has(&t.output)
-        || t.error.as_deref().is_some_and(has)
+    fn in_json(v: &serde_json::Value, q: &str) -> bool {
+        match v {
+            serde_json::Value::String(s) => contains_ci(s, q),
+            serde_json::Value::Array(a) => a.iter().any(|x| in_json(x, q)),
+            serde_json::Value::Object(o) => o.values().any(|x| in_json(x, q)),
+            _ => false,
+        }
+    }
+    contains_ci(&t.name, q)
+        || in_json(&t.input, q)
+        || contains_ci(&t.output, q)
+        || t.error.as_deref().is_some_and(|e| contains_ci(e, q))
 }
 
 /// Successful, finished calls are left out in the quiet density.
@@ -137,6 +157,55 @@ fn task_row(
     )
 }
 
+/// A `todowrite` call: "Updated todos · 2/5 done", opening into the list
+/// it set.
+fn todo_row(t: &ToolCall, message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let todos = super::todos::of_call(t);
+    let (done, total) = super::todos::progress(&todos);
+    let key = key(message_id, &t.call_id);
+    let open = ctx.is_open(&key);
+    let toggle = ctx.toggle.clone();
+    let click_key = key.clone();
+    let label = match (t.status, total) {
+        (ToolStatus::Error, _) => "Couldn't update the todo list".to_string(),
+        (_, 0) => "Cleared the todo list".to_string(),
+        _ => format!("Updated todos · {done}/{total} done"),
+    };
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(
+            h_flex()
+                .id(SharedString::from(format!("todo-{key}")))
+                .gap_1p5()
+                .items_center()
+                .text_sm()
+                .text_color(if t.status == ToolStatus::Error {
+                    theme.danger
+                } else {
+                    theme.muted_foreground
+                })
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.foreground))
+                .on_click(move |_, _, cx| toggle(click_key.clone(), cx))
+                .child(super::icons::list_checks().xsmall())
+                .child(label)
+                .when(total > 0, |el| el.child(super::todos::bar(done, total, cx)))
+                .when(total > 0, |el| el.child(chevron(open))),
+        )
+        .when(open && total > 0, |el| {
+            el.child(
+                div()
+                    .pl_3()
+                    .border_l_1()
+                    .border_color(theme.border)
+                    .child(super::todos::checklist(&todos, cx)),
+            )
+        })
+        .into_any_element()
+}
+
 pub fn key(message_id: &str, call_id: &str) -> String {
     format!("{message_id}/{call_id}")
 }
@@ -162,6 +231,11 @@ pub fn render_tools(
     };
     for t in tools {
         if hidden_in(t, ctx.density) && t.name != "subagent" {
+            continue;
+        }
+        if t.name == "todowrite" {
+            flush(&mut run, &mut out);
+            out.push(todo_row(t, message_id, ctx, cx));
             continue;
         }
         if let Some(row) = task_row(t, message_id, ctx.open_task, cx) {

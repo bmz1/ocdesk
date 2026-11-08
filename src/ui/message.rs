@@ -73,11 +73,14 @@ pub fn render_message(
                 .next()
                 .and_then(|(k, _)| prose.state(&k).map(|s| markdown(&k, s)));
             let group = SharedString::from(format!("user-{}", user.id));
-            let undo = row.idle.then(|| {
+            let undo = Some({
                 let on_action = row.on_action.clone();
                 let message_id = user.id.clone();
+                // Always laid out (invisible while busy) so the row's height
+                // doesn't change when a turn starts or ends.
                 h_flex()
                     .gap_1()
+                    .when(!row.idle, |el| el.invisible())
                     .opacity(0.)
                     .group_hover(group.clone(), |s| s.opacity(1.))
                     .child(
@@ -118,30 +121,39 @@ pub fn render_message(
                         .bg(theme.secondary)
                         .text_color(theme.secondary_foreground)
                         .children(body)
-                        .children(user.attachments.iter().map(|a| {
-                            let image = a
-                                .path()
-                                .and_then(|p| {
-                                    p.extension().map(|s| s.to_string_lossy().to_lowercase())
-                                })
-                                .is_some_and(|e| {
-                                    ["png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "tiff"]
-                                        .contains(&e.as_str())
-                                });
-                            h_flex()
-                                .gap_1()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(
-                                    Icon::new(if image {
-                                        IconName::GalleryVerticalEnd
-                                    } else {
-                                        IconName::File
-                                    })
-                                    .xsmall(),
+                        .children({
+                            let images: Vec<std::path::PathBuf> = user
+                                .attachments
+                                .iter()
+                                .filter_map(|a| a.path())
+                                .filter(|p| super::images::is_image(p))
+                                .collect();
+                            (!images.is_empty()).then(|| {
+                                h_flex().gap_1p5().flex_wrap().pt_1().children(
+                                    images.iter().enumerate().map(|(i, p)| {
+                                        super::images::thumbnail(
+                                            SharedString::from(format!("thumb-{}-{i}", user.id)),
+                                            p,
+                                            96.,
+                                            cx,
+                                        )
+                                    }),
                                 )
-                                .child(a.name.clone())
-                        })),
+                            })
+                        })
+                        .children(
+                            user.attachments
+                                .iter()
+                                .filter(|a| !a.path().is_some_and(|p| super::images::is_image(&p)))
+                                .map(|a| {
+                                    h_flex()
+                                        .gap_1()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(Icon::new(IconName::File).xsmall())
+                                        .child(a.name.clone())
+                                }),
+                        ),
                 )
                 .children(undo)
                 .into_any_element();

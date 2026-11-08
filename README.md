@@ -120,6 +120,12 @@ Failed steps get **Retry**; a finished plan-agent turn offers **Implement
 plan**. The header shows context use (ring), tokens and cost; at 80 % a
 **Compact** button appears.
 
+**Todos and images.** When the agent keeps a todo list (`todowrite`), a
+pill above the prompt shows progress and the current step; click it for the
+checklist. Each update appears in the work log as "Updated todos · 3/5
+done". Image attachments show as thumbnails in the prompt box and in the
+transcript; click one to see it full size.
+
 **Right panel.** **Changes** reviews the latest turn, working tree, branch or
 commits file by file; hover a line and press `+` to comment, then **Send to
 agent** turns the comments into one prompt. **Tasks** lists subagents and
@@ -280,6 +286,9 @@ src/
   ui/changes.rs      patch parsing and the diff view
   ui/review.rs       Changes tab: scopes, files, inline review comments
   ui/terminal.rs     Terminal tab (alacritty_terminal emulator)
+  ui/syntax.rs       syntax colours for diffs, file reads and written files
+  ui/todos.rs        todo list from todowrite: progress pill and checklists
+  ui/images.rs       image thumbnails and the full-size viewer
   ui/composer.rs     prompt box, Send ↔ Stop, agent/model/variant pickers, @ popup, history
   ui/mention.rs      @ query detection, tokens → prompt attachments, history (pure)
   ui/form_view.rs    question forms (form.*) above the composer

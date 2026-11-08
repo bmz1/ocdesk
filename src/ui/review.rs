@@ -39,7 +39,40 @@ pub struct ChangesPanel {
     comments: Vec<ReviewComment>,
     editing: Option<Editing>,
     collapsed: HashSet<String>,
+    /// [`fingerprint`] of the store state last drawn.
+    seen: u64,
     _subs: Vec<Subscription>,
+}
+
+/// What the Changes tab depends on in the store, hashed.
+fn fingerprint(store: &Store) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let sid = store.selected.as_deref().unwrap_or_default();
+    sid.hash(&mut h);
+    if let Some(files) = store.diffs.get(sid) {
+        for f in files {
+            (
+                &f.file,
+                &f.status,
+                f.patch.len(),
+                f.additions,
+                f.deletions,
+                f.more,
+            )
+                .hash(&mut h);
+        }
+    } else {
+        u64::MAX.hash(&mut h);
+    }
+    store.diff_loading.contains(sid).hash(&mut h);
+    store.diff_errors.get(sid).hash(&mut h);
+    store.review.get(sid).map(|m| m.key()).hash(&mut h);
+    store.review_base.get(sid).hash(&mut h);
+    store.commits.get(sid).map(Vec::len).hash(&mut h);
+    store.preferences.viewed.len().hash(&mut h);
+    store.preferences.viewed.values().sum::<u64>().hash(&mut h);
+    h.finish()
 }
 
 /// The prompt a batch of review comments becomes.
@@ -61,20 +94,32 @@ impl ChangesPanel {
         controller: Entity<Controller>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subs = vec![cx.subscribe(&store, |this, _, ev: &StoreEvent, cx| {
-            if matches!(ev, StoreEvent::SelectionChanged) {
-                this.comments.clear();
-                this.editing = None;
-                this.collapsed.clear();
-            }
-            cx.notify();
-        })];
+        let subs = vec![
+            cx.subscribe(&store, |this, _, ev: &StoreEvent, cx| {
+                if matches!(ev, StoreEvent::SelectionChanged) {
+                    this.comments.clear();
+                    this.editing = None;
+                    this.collapsed.clear();
+                    cx.notify();
+                }
+            }),
+            // The store notifies on every streamed delta; redraw only when
+            // what this panel shows changed.
+            cx.observe(&store, |this, store, cx| {
+                let f = fingerprint(store.read(cx));
+                if f != this.seen {
+                    this.seen = f;
+                    cx.notify();
+                }
+            }),
+        ];
         Self {
             store,
             controller,
             comments: Vec::new(),
             editing: None,
             collapsed: HashSet::new(),
+            seen: 0,
             _subs: subs,
         }
     }

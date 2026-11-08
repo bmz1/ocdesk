@@ -120,11 +120,19 @@ fn showcase(now: u64) -> Vec<Message> {
         })
     };
     use serde_json::json;
+    // OCDESK_DEMO_IMAGE=/path/to.png attaches an image to the first prompt.
+    let mut first = user(
+        "msg_z1",
+        "Find why the sidebar goes stale after sleep and fix it",
+    );
+    if let (Message::User(u), Ok(path)) = (&mut first, std::env::var("OCDESK_DEMO_IMAGE")) {
+        u.attachments.push(crate::api::model::Attachment {
+            name: "screenshot.png".into(),
+            uri: Some(crate::api::model::file_uri(std::path::Path::new(&path))),
+        });
+    }
     vec![
-        user(
-            "msg_z1",
-            "Find why the sidebar goes stale after sleep and fix it",
-        ),
+        first,
         Message::Assistant(AssistantMessage {
             id: "msg_z2".into(),
             blocks: vec![
@@ -133,6 +141,19 @@ fn showcase(now: u64) -> Vec<Message> {
                     0,
                     "Start with how the client opens the stream.",
                     4,
+                ),
+                tool(
+                    "c0",
+                    "todowrite",
+                    json!({"todos": [
+                        {"content": "Find where the stream reconnects", "status": "completed"},
+                        {"content": "Add a heartbeat watchdog", "status": "completed"},
+                        {"content": "Fix backoff resetting on every message", "status": "in_progress"},
+                        {"content": "Test a flapping server", "status": "pending"},
+                        {"content": "Rewrite the stream in WebSockets", "status": "cancelled"}
+                    ]}),
+                    "",
+                    ToolStatus::Completed,
                 ),
                 tool(
                     "c1",

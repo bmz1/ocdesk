@@ -210,15 +210,18 @@ impl Controller {
     /// Write pending settings now (on quit).
     pub fn flush_settings(&mut self) {
         self.save_seq += 1;
-        if let Err(e) = self.settings.save() {
+        // The newest snapshot: it waits for any write in flight, then wins.
+        if let Err(e) = self.settings.snapshot_for_save().write() {
             tracing::warn!("could not save settings: {e:#}");
         }
     }
 
     fn save_settings(&self) {
-        let settings = self.settings.clone();
+        // Numbered here, on the UI thread, so request order decides which
+        // write sticks however the background writes interleave.
+        let pending = self.settings.snapshot_for_save();
         self.rt.spawn_blocking(move || {
-            if let Err(e) = settings.save() {
+            if let Err(e) = pending.write() {
                 tracing::warn!("could not save settings: {e:#}");
             }
         });
@@ -1087,21 +1090,22 @@ impl Controller {
                 cx.notify();
             }
         });
+        // Only the latest fetch for a session (and for this sidecar) lands.
+        let ticket = self.store.update(cx, |s, _| s.begin_load(&session_id));
+        let generation = self.generation;
         let sid = session_id.clone();
         self.run(
             cx,
             async move { api.messages(&sid).await },
-            move |this, res, cx| match res {
-                Ok(history) => this
-                    .store
-                    .update(cx, |s, cx| s.reconcile(&session_id, history, cx)),
-                Err(e) => {
-                    tracing::warn!(%session_id, "could not load messages: {e:#}");
-                    this.store.update(cx, |s, cx| {
-                        s.load_errors.insert(session_id, format!("{e:#}"));
-                        cx.notify();
-                    });
+            move |this, res, cx| {
+                if this.generation != generation {
+                    return;
                 }
+                if let Err(e) = &res {
+                    tracing::warn!(%session_id, "could not load messages: {e:#}");
+                }
+                this.store
+                    .update(cx, |s, cx| s.finish_load(&session_id, ticket, res, cx));
             },
         );
     }

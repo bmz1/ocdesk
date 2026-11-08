@@ -49,12 +49,16 @@ pub struct FindState {
     query: String,
     /// Row indices that match, ascending.
     hits: Vec<usize>,
+    /// Tool calls that match, by call id (their cards open).
+    calls: std::rc::Rc<std::collections::HashSet<String>>,
     /// Index into `hits` of the row being shown.
     current: usize,
 }
 
 pub struct ConversationView {
     find: Option<FindState>,
+    /// The todo pill shows its checklist.
+    todos_open: bool,
     expanded_tools: std::collections::HashSet<String>,
     tool_scrolls: super::tool_card::ScrollHandles,
     /// Open right-panel tab.
@@ -115,6 +119,7 @@ impl ConversationView {
         }));
         Self {
             find: None,
+            todos_open: false,
             tasks,
             panel: prefs.panel,
             panel_width: px(prefs
@@ -240,6 +245,7 @@ impl ConversationView {
             input,
             query: String::new(),
             hits: Vec::new(),
+            calls: Default::default(),
             current: 0,
         });
         cx.notify();
@@ -256,7 +262,7 @@ impl ConversationView {
     }
 
     fn set_find_query(&mut self, query: String, cx: &mut Context<Self>) {
-        let hits = {
+        let (hits, calls) = {
             let store = self.store.read(cx);
             store
                 .selected_conversation()
@@ -266,6 +272,7 @@ impl ConversationView {
         let Some(f) = self.find.as_mut() else { return };
         f.query = query;
         f.hits = hits;
+        f.calls = std::rc::Rc::new(calls);
         f.current = f.hits.len().saturating_sub(1);
         let n = self.row_count(cx);
         self.scroller
@@ -501,6 +508,7 @@ impl ConversationView {
         match ev {
             StoreEvent::SelectionChanged | StoreEvent::FoldersChanged => {
                 self.find = None;
+                self.todos_open = false;
                 if self.panel == Some(crate::settings::PanelTab::Changes)
                     && let Some(sid) = self.store.read(cx).selected.clone()
                 {
@@ -514,6 +522,59 @@ impl ConversationView {
                 let n = self.row_count(cx);
                 self.scroller.update(cx, |s, cx| s.reset(n, cx));
                 Composer::focus(&self.composer, window, cx);
+            }
+            StoreEvent::MessagesReset { session_id }
+            | StoreEvent::MessageInserted { session_id, .. }
+                if is_selected(session_id) && self.find.is_some() =>
+            {
+                // Row indices moved: match again (cheap; no allocation per text).
+                let q = self
+                    .find
+                    .as_ref()
+                    .map(|f| f.query.clone())
+                    .unwrap_or_default();
+                if matches!(ev, StoreEvent::MessagesReset { .. }) {
+                    self.prose.update(cx, |p, _| p.invalidate());
+                }
+                let n = self.row_count(cx);
+                match ev {
+                    StoreEvent::MessageInserted { index, .. } => {
+                        let i = *index;
+                        self.scroller.update(cx, |s, cx| {
+                            s.splice(i..i, 1, cx);
+                        });
+                    }
+                    _ => self.scroller.update(cx, |s, cx| s.reset(n, cx)),
+                }
+                self.set_find_query(q, cx);
+            }
+            StoreEvent::MessageChanged { session_id, index }
+                if is_selected(session_id) && self.find.is_some() =>
+            {
+                // Only this row's membership can change.
+                let i = *index;
+                self.scroller.update(cx, |s, cx| {
+                    s.remeasure_items(i..i + 1, cx);
+                });
+                let store = self.store.read(cx);
+                if let (Some(f), Some(m)) = (
+                    self.find.as_mut(),
+                    store
+                        .selected_conversation()
+                        .and_then(|c| c.messages.get(i)),
+                ) {
+                    let q = f.query.trim().to_lowercase();
+                    let hit =
+                        !q.is_empty() && row_matches(m, &q, std::rc::Rc::make_mut(&mut f.calls));
+                    match (f.hits.binary_search(&i), hit) {
+                        (Err(at), true) => f.hits.insert(at, i),
+                        (Ok(at), false) => {
+                            f.hits.remove(at);
+                            f.current = f.current.min(f.hits.len().saturating_sub(1));
+                        }
+                        _ => {}
+                    }
+                }
             }
             StoreEvent::MessagesReset { session_id } if is_selected(session_id) => {
                 self.prose.update(cx, |p, _| p.invalidate());
@@ -857,11 +918,7 @@ impl Render for ConversationView {
                 .as_ref()
                 .map(|f| f.hits.clone())
                 .unwrap_or_default();
-            let find_query: Option<String> = self
-                .find
-                .as_ref()
-                .map(|f| f.query.trim().to_lowercase())
-                .filter(|q| !q.is_empty());
+            let find_calls = self.find.as_ref().map(|f| f.calls.clone());
             let find_current = self
                 .find
                 .as_ref()
@@ -882,7 +939,7 @@ impl Render for ConversationView {
                             open_task: &open_task,
                             scrolls: &scrolls,
                             density,
-                            find: find_query.as_deref(),
+                            found: find_calls.as_deref(),
                         };
                         let next = c.messages.get(ix + 1);
                         let start = c.messages[..ix]
@@ -961,6 +1018,7 @@ impl Render for ConversationView {
                                     self.controller.clone(),
                                     cx,
                                 ))
+                                .children(self.render_todos(cx))
                                 .child(super::permission::render_permissions(
                                     self.store.read(cx),
                                     self.controller.clone(),
@@ -1085,9 +1143,23 @@ impl Render for ConversationView {
 
         let panel = panel_tab.map(|tab| {
             let body: AnyElement = match tab {
-                PanelTab::Changes => self.changes.clone().into_any_element(),
-                PanelTab::Tasks => self.tasks.clone().into_any_element(),
-                PanelTab::Terminal => self.terminal.clone().into_any_element(),
+                // Cached: the conversation redraws per streamed delta; the
+                // panels redraw when they notify.
+                PanelTab::Changes => self
+                    .changes
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                PanelTab::Tasks => self
+                    .tasks
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                PanelTab::Terminal => self
+                    .terminal
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
             };
             div()
                 .relative()
@@ -1157,6 +1229,26 @@ impl Render for ConversationView {
 }
 
 impl ConversationView {
+    /// The agent's todo progress above the prompt.
+    fn render_todos(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        let busy = store.selected.as_ref().is_some_and(|id| store.is_busy(id));
+        let todos = super::todos::session_todos(&store.selected_conversation()?.messages);
+        let view = cx.entity().downgrade();
+        super::todos::pill(
+            &todos,
+            self.todos_open,
+            busy,
+            move |_, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.todos_open = !this.todos_open;
+                    cx.notify();
+                });
+            },
+            cx,
+        )
+    }
+
     /// Header meter: context ring, tokens and cost; opens usage details.
     fn render_usage(&self, cx: &mut Context<Self>) -> AnyElement {
         let store = self.store.read(cx);
@@ -1325,25 +1417,50 @@ impl ConversationView {
 }
 
 /// Rows whose prompt, reply, reasoning or tool call contains `query`
-/// (case-insensitive).
-pub fn find_rows(messages: &[crate::api::model::Message], query: &str) -> Vec<usize> {
-    use crate::api::model::{Block, Message};
+/// (ASCII case-insensitive), and the matching tool calls.
+pub fn find_rows(
+    messages: &[crate::api::model::Message],
+    query: &str,
+) -> (Vec<usize>, std::collections::HashSet<String>) {
     let q = query.trim().to_lowercase();
+    let mut calls = std::collections::HashSet::new();
     if q.is_empty() {
-        return Vec::new();
+        return (Vec::new(), calls);
     }
-    let has = |t: &str| t.to_lowercase().contains(&q);
-    messages
+    let rows = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| match m {
-            Message::User(u) => has(&u.text),
-            Message::Marker(m) => has(&m.text),
-            Message::Assistant(a) => a.blocks.iter().any(|b| match b {
-                Block::Prose { text, .. } => has(text),
-                Block::Tool(t) => super::tool_card::tool_matches(t, &q),
-            }),
-        })
+        .filter(|(_, m)| row_matches(m, &q, &mut calls))
         .map(|(i, _)| i)
-        .collect()
+        .collect();
+    (rows, calls)
+}
+
+/// Whether one message matches `q` (lowercase); records matching calls.
+fn row_matches(
+    m: &crate::api::model::Message,
+    q: &str,
+    calls: &mut std::collections::HashSet<String>,
+) -> bool {
+    use super::tool_card::contains_ci;
+    use crate::api::model::{Block, Message};
+    match m {
+        Message::User(u) => contains_ci(&u.text, q),
+        Message::Marker(m) => contains_ci(&m.text, q),
+        Message::Assistant(a) => {
+            let mut hit = false;
+            for b in &a.blocks {
+                match b {
+                    Block::Prose { text, .. } => hit |= contains_ci(text, q),
+                    Block::Tool(t) => {
+                        if super::tool_card::tool_matches(t, q) {
+                            calls.insert(t.call_id.clone());
+                            hit = true;
+                        }
+                    }
+                }
+            }
+            hit
+        }
+    }
 }
