@@ -1,5 +1,4 @@
-//! The only place that talks HTTP. Every future here must run on the Tokio
-//! runtime (see [`Runtime`]), never on the GPUI foreground executor.
+//! The only place that talks HTTP. Every future here must run on the Tokio//! runtime (see [`Runtime`]), never on the GPUI foreground executor.
 //!
 //! ocdesk speaks opencode 2.x's API (`/api/*`, see `docs/protocol-notes.md`)
 //! through a thin reqwest client.
@@ -14,8 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use futures::StreamExt as _;
-use futures::channel::mpsc::UnboundedSender;
+use futures::channel::mpsc::Sender;
 use reqwest::Method;
 use serde_json::{Value, json};
 
@@ -696,10 +694,10 @@ impl Api {
     /// drop yields [`Event::Disconnected`], then reconnects with exponential
     /// backoff. Returns when the receiver is dropped; the caller aborts the
     /// task to stop it early.
-    pub async fn run_events(&self, tx: UnboundedSender<Envelope>) {
+    pub async fn run_events(&self, mut tx: Sender<Envelope>) {
         let mut backoff = SSE_BACKOFF_MIN;
         loop {
-            match self.stream_once(&tx).await {
+            match self.stream_once(&mut tx).await {
                 Ok(StreamEnd::ReceiverGone) => return,
                 Ok(StreamEnd::Dropped) => {
                     backoff = SSE_BACKOFF_MIN;
@@ -707,10 +705,7 @@ impl Api {
                 }
                 Err(e) => tracing::warn!(target: "sse", "event stream connect failed: {e:#}"),
             }
-            if tx
-                .unbounded_send(Envelope::bare(Event::Disconnected))
-                .is_err()
-            {
+            if tx.send(Envelope::bare(Event::Disconnected)).await.is_err() {
                 return;
             }
             tokio::time::sleep(backoff).await;
@@ -718,7 +713,7 @@ impl Api {
         }
     }
 
-    async fn stream_once(&self, tx: &UnboundedSender<Envelope>) -> Result<StreamEnd> {
+    async fn stream_once(&self, tx: &mut Sender<Envelope>) -> Result<StreamEnd> {
         let resp = self
             .req(Method::GET, "/api/event")
             .header("accept", "text/event-stream")
@@ -728,7 +723,7 @@ impl Api {
             bail!("GET /api/event returned {}", resp.status());
         }
         tracing::info!(target: "sse", "connected");
-        if tx.unbounded_send(Envelope::bare(Event::Connected)).is_err() {
+        if tx.send(Envelope::bare(Event::Connected)).await.is_err() {
             return Ok(StreamEnd::ReceiverGone);
         }
         let mut body = resp.bytes_stream();
@@ -746,16 +741,19 @@ impl Api {
                 }
                 Ok(Some(Ok(chunk))) => chunk,
             };
+            if parser.buf.len() + parser.data.len() + chunk.len() > 4 * 1024 * 1024 {
+                bail!("event frame exceeded 4 MiB; reconnecting");
+            }
             for data in parser.push(&chunk) {
                 let Some(env) = Envelope::from_json(&data) else {
-                    tracing::warn!(target: "sse", "undecodable frame: {data}");
+                    tracing::warn!(target: "sse", bytes = data.len(), "undecodable frame");
                     continue;
                 };
                 if !matches!(&env.event, Event::Other(t) if t == "plugin.added" || t == "server.heartbeat")
                 {
-                    tracing::debug!(target: "sse", "{data}");
+                    tracing::debug!(target: "sse", bytes = data.len(), seq = ?env.seq, "event received");
                 }
-                if tx.unbounded_send(env).is_err() {
+                if tx.send(env).await.is_err() {
                     return Ok(StreamEnd::ReceiverGone);
                 }
             }
