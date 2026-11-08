@@ -126,7 +126,7 @@ fn render_card(
 
     let error = store.form_errors.get(&key).cloned();
     let (controller2, sid2, fid2) = (controller.clone(), sid.to_string(), form.id.clone());
-    let cancel: Entity<Controller> = controller.clone();
+    let cancel: Entity<Controller> = controller;
     let (sid3, fid3) = (sid.to_string(), form.id.clone());
     card = card.child(
         h_flex()
@@ -303,7 +303,7 @@ fn render_field(
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(placeholder.clone()),
+                    .child(placeholder),
             );
         }
     }
@@ -334,7 +334,7 @@ fn option_row(
 ) -> AnyElement {
     let theme = cx.theme();
     let (fid, key) = (form.id.clone(), field.key.clone());
-    let (controller, _sid) = (controller.clone(), sid.to_string());
+    let (controller, _sid) = (controller, sid.to_string());
     let multi = field.kind == FormFieldKind::MultiSelect;
     let border = if selected {
         theme.primary

@@ -6,8 +6,6 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::model::ModelRef;
-
 /// Last window placement, in logical pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WindowPlacement {
@@ -49,11 +47,6 @@ pub struct Settings {
     pub sidebar_hidden: bool,
     /// Session open when ocdesk last quit; reopened on start if it still exists.
     pub last_session: Option<String>,
-    /// Model/agent picked for new sessions.
-    pub draft_model: Option<ModelRef>,
-    pub draft_agent: Option<String>,
-    pub permission_mode: PermissionMode,
-    pub project_defaults: BTreeMap<PathBuf, ProjectDefaults>,
     pub keybindings: BTreeMap<String, String>,
     /// Executable name/path, without shell arguments.
     pub editor: Option<String>,
@@ -126,10 +119,6 @@ impl Default for Settings {
             sidebar_width: None,
             sidebar_hidden: false,
             last_session: None,
-            draft_model: None,
-            draft_agent: None,
-            permission_mode: PermissionMode::Supervised,
-            project_defaults: BTreeMap::new(),
             keybindings: BTreeMap::new(),
             editor: None,
             notifications: true,
@@ -179,22 +168,6 @@ impl PermissionMode {
         Self::ALL.into_iter().find(|m| m.rules() == *v)
     }
 }
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProjectDefaults {
-    pub model: Option<ModelRef>,
-    pub agent: Option<String>,
-    pub permission: Option<PermissionMode>,
-}
-impl Settings {
-    pub fn permission_for(&self, folder: &std::path::Path) -> PermissionMode {
-        self.project_defaults
-            .get(folder)
-            .and_then(|p| p.permission)
-            .unwrap_or(self.permission_mode)
-    }
-}
-
 fn path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("ocdesk").join("settings.json"))
 }
@@ -327,7 +300,7 @@ mod tests {
         let s: Settings =
             serde_json::from_str(r#"{"folders":["/a"],"collapsed":[],"theme":null}"#).unwrap();
         assert_eq!(s.folders, vec![PathBuf::from("/a")]);
-        assert!(s.window.is_none() && !s.sidebar_hidden && s.draft_model.is_none());
+        assert!(s.window.is_none() && !s.sidebar_hidden);
     }
 
     #[test]
@@ -343,12 +316,6 @@ mod tests {
             sidebar_width: Some(300.),
             sidebar_hidden: true,
             last_session: Some("ses_1".into()),
-            draft_model: Some(ModelRef {
-                provider_id: "p".into(),
-                id: "m".into(),
-                variant: Some("high".into()),
-            }),
-            draft_agent: Some("plan".into()),
             ..Default::default()
         };
         let back: Settings = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
@@ -374,22 +341,23 @@ mod tests {
 mod desktop_feature_tests {
     use super::*;
     #[test]
-    fn project_defaults_override_only_explicit_fields() {
-        let mut settings = Settings::default();
-        let folder = PathBuf::from("/project");
-        settings.permission_mode = PermissionMode::FullAccess;
-        assert_eq!(settings.permission_for(&folder), PermissionMode::FullAccess);
-        settings.project_defaults.insert(
-            folder.clone(),
-            ProjectDefaults {
-                permission: Some(PermissionMode::Supervised),
-                ..Default::default()
-            },
-        );
-        assert_eq!(settings.permission_for(&folder), PermissionMode::Supervised);
-        let back: Settings =
-            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
-        assert_eq!(settings, back);
+    fn legacy_defaults_load_but_are_no_longer_saved_or_applied() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "theme":"light", "draft_model":{"providerID":"p","id":"m"},
+            "draft_agent":"plan", "permission_mode":"full-access",
+            "project_defaults":{"/project":{"agent":"build"}}
+        }))
+        .unwrap();
+        assert_eq!(settings.theme.as_deref(), Some("light"));
+        let saved = serde_json::to_value(settings).unwrap();
+        for key in [
+            "draft_model",
+            "draft_agent",
+            "permission_mode",
+            "project_defaults",
+        ] {
+            assert!(saved.get(key).is_none());
+        }
         assert_eq!(PermissionMode::from_rules(&serde_json::json!([])), None);
         for mode in PermissionMode::ALL {
             assert_eq!(PermissionMode::from_rules(&mode.rules()), Some(mode));

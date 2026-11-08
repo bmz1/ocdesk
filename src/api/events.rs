@@ -250,9 +250,10 @@ impl Envelope {
 
     /// Decode one SSE `data:` payload.
     pub fn from_json(data: &str) -> Option<Self> {
-        let v: Value = serde_json::from_str(data).ok()?;
+        let mut v: Value = serde_json::from_str(data).ok()?;
         let ty = v.get("type")?.as_str()?.to_string();
-        let d = v.get("data").cloned().unwrap_or(Value::Null);
+        // Moved out, not cloned: payloads carry whole tool outputs.
+        let d = v.get_mut("data").map(Value::take).unwrap_or(Value::Null);
         let seq = u64_at(&v, "/durable/seq");
         let directory = v
             .pointer("/location/directory")

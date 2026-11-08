@@ -11,6 +11,6 @@ if command -v update-desktop-database >/dev/null; then
   update-desktop-database "$PREFIX/share/applications" || true
 fi
 if command -v gtk-update-icon-cache >/dev/null; then
-  gtk-update-icon-cache -q "$PREFIX/share/icons/hicolor" 2>/dev/null || true
+  gtk-update-icon-cache -q -f -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
 fi
 echo "installed to $PREFIX (make sure $PREFIX/bin is on PATH)"

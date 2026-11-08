@@ -112,19 +112,32 @@ impl FileExplorer {
         .detach();
     }
 
-    /// Re-list every loaded directory of `dir` (all folders for `None`).
+    /// Re-list the visible directories of `dir` (all folders for `None`).
+    /// Listings under collapsed folders are dropped instead: opening one
+    /// lists it again, so a file change doesn't re-read hidden folders.
     fn refresh(&mut self, dir: Option<PathBuf>, cx: &mut Context<Self>) {
-        let todo: Vec<(PathBuf, String)> = self
+        let mut todo: Vec<(PathBuf, String)> = Vec::new();
+        for (d, t) in self
             .trees
-            .iter()
+            .iter_mut()
             .filter(|(d, _)| dir.as_ref().is_none_or(|x| x == *d))
-            .flat_map(|(d, t)| {
-                // The root too, so a failed first listing is retried.
-                std::iter::once(String::new())
-                    .chain(t.children.keys().filter(|p| !p.is_empty()).cloned())
-                    .map(|p| (d.clone(), p))
-            })
-            .collect();
+        {
+            let visible = |p: &str| {
+                p.is_empty()
+                    || (t.expanded.contains(p)
+                        && p.match_indices('/')
+                            .all(|(i, _)| t.expanded.contains(&p[..i])))
+            };
+            t.children.retain(|p, _| visible(p));
+            // The root too, so a failed first listing is retried.
+            todo.push((d.clone(), String::new()));
+            todo.extend(
+                t.children
+                    .keys()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| (d.clone(), p.clone())),
+            );
+        }
         for (d, p) in todo {
             self.load(d, p, cx);
         }

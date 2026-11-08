@@ -29,7 +29,7 @@ const CACHE_ENTRIES: usize = 256;
 pub type Spans = Rc<Vec<(Range<usize>, &'static str)>>;
 
 thread_local! {
-    static CACHE: RefCell<HashMap<u64, Spans>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<super::lru::Lru<Spans>> = RefCell::new(super::lru::Lru::new(CACHE_ENTRIES));
 }
 
 /// The syntax for a path (`src/a.rs`), extension (`rs`) or language name
@@ -63,7 +63,7 @@ pub fn highlight(lang: &str, code: &str) -> Spans {
     syntax.name.hash(&mut h);
     code.hash(&mut h);
     let key = h.finish();
-    if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+    if let Some(hit) = CACHE.with(|c| c.borrow_mut().get(key)) {
         return hit;
     }
     let end = if code.len() > MAX_BYTES {
@@ -76,13 +76,7 @@ pub fn highlight(lang: &str, code: &str) -> Spans {
         code.len()
     };
     let spans: Spans = Rc::new(parse(syntax, &code[..end]));
-    CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.len() >= CACHE_ENTRIES {
-            c.clear();
-        }
-        c.insert(key, spans.clone());
-    });
+    CACHE.with(|c| c.borrow_mut().insert(key, spans.clone()));
     spans
 }
 

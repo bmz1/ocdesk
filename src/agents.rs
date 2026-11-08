@@ -721,10 +721,7 @@ You are a reviewer.
             "never overwrites"
         );
 
-        let found = discover_in(&[
-            (global.clone(), Scope::Global),
-            (project.clone(), Scope::Project),
-        ]);
+        let found = discover_in(&[(global, Scope::Global), (project, Scope::Project)]);
         let names: Vec<_> = found.iter().map(|f| (f.name.as_str(), f.scope)).collect();
         assert_eq!(
             names,

@@ -73,6 +73,7 @@ pub fn window_options(settings: &Settings, cx: &App) -> WindowOptions {
         window_min_size: Some(size(px(WindowPlacement::MIN_W), px(WindowPlacement::MIN_H))),
         // Matches the desktop entry (StartupWMClass) and the macOS bundle id.
         app_id: Some(APP_ID.into()),
+        icon: Some(crate::app_icon::window_icon()),
         // macOS: content under a transparent title bar, traffic lights
         // inset into the sidebar's top row (see `TITLEBAR_INSET`).
         titlebar: Some(TitlebarOptions {
@@ -247,7 +248,7 @@ impl AppView {
         };
         if placement.is_sane() {
             self.controller.update(cx, |c, cx| {
-                c.update_settings(cx, |s| s.window = Some(placement))
+                c.update_layout(cx, |s| s.window = Some(placement))
             });
         }
     }
@@ -324,7 +325,7 @@ impl AppView {
         self.sidebar_width = w;
         let saved: f32 = w.into();
         self.controller.update(cx, |c, cx| {
-            c.update_settings(cx, |s| s.sidebar_width = Some(saved))
+            c.update_layout(cx, |s| s.sidebar_width = Some(saved))
         });
         cx.notify();
     }
@@ -554,7 +555,14 @@ impl Render for AppView {
                         .w(self.sidebar_width)
                         .h_full()
                         .flex_none()
-                        .child(self.sidebar.clone()),
+                        // Cached: the transcript redraws per streamed delta,
+                        // which would otherwise re-render every sidebar row.
+                        // The sidebar notifies itself when its data changes.
+                        .child(
+                            self.sidebar
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        ),
                 )
             })
             .child(

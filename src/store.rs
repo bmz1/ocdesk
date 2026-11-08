@@ -55,7 +55,14 @@ pub struct Conversation {
     pub live: HashSet<String>,
     /// Events for a not-yet-loaded conversation, replayed after its snapshot.
     pub pending: Vec<Envelope>,
+    /// Bumped whenever `messages` change other than by streamed text, so
+    /// views can memoize what they derive from tool calls and message
+    /// structure (todos) instead of rescanning every frame.
+    pub revision: u64,
 }
+
+/// Transcripts kept in memory besides live ones (recently selected sessions).
+const KEEP_CONVERSATIONS: usize = 10;
 
 /// Events buffered per loading conversation, at most.
 const MAX_PENDING: usize = 128;
@@ -89,6 +96,7 @@ impl Conversation {
         };
         match &mut self.messages[index] {
             Message::Assistant(a) => (index, inserted, a),
+            // `apply_inner` drops assistant events for non-assistant ids.
             _ => unreachable!("message id {id} is not an assistant message"),
         }
     }
@@ -134,6 +142,18 @@ pub enum StoreEvent {
         file: Option<String>,
         removed: bool,
     },
+    /// A session's diff snapshot or loader/error state changed.
+    DiffsChanged {
+        dir: PathBuf,
+    },
+    /// The set of files the user marked reviewed changed.
+    ViewedChanged,
+    /// A checkout's pull request, its fetch state or a check log changed.
+    PullRequestChanged,
+    /// A session's usage report, or its loading/error state, changed.
+    UsageChanged {
+        session_id: String,
+    },
 }
 
 /// Result of [`Store::apply_m7`].
@@ -155,6 +175,7 @@ pub struct Tooling {
 pub struct Catalog {
     pub models: Vec<ModelInfo>,
     pub default_model: Option<ModelRef>,
+    pub configured_agent: Option<String>,
     pub agents: Vec<AgentInfo>,
 }
 
@@ -169,6 +190,11 @@ impl Catalog {
     /// exists, else the first primary agent.
     pub fn default_agent(&self) -> Option<&AgentInfo> {
         let primary = || self.agents.iter().filter(|a| a.is_primary());
+        if let Some(agent) = self.configured_agent.as_deref()
+            && let Some(agent) = primary().find(|a| a.id == agent)
+        {
+            return Some(agent);
+        }
         primary()
             .find(|a| a.id == "build")
             .or_else(|| primary().next())
@@ -193,9 +219,21 @@ pub enum CheckLog {
     Failed(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubmissionTarget {
+    Session(String),
+    Draft(PathBuf),
+}
+
 #[derive(Default)]
 pub struct Store {
+    /// Local HTTP admissions, visible before the server emits execution events.
+    pub submitting: HashMap<u64, SubmissionTarget>,
+    pub interrupting: HashSet<String>,
     pub snapshot_revision: u64,
+    /// Per-session inbox events, so a read of one inbox isn't invalidated
+    /// by activity in every other session.
+    pub inbox_revision: HashMap<String, u64>,
     pub tasks_revision: u64,
     pub(crate) shell_snapshots: HashMap<PathBuf, HashSet<String>>,
     /// The `gh` CLI is installed: the Pull request tab and chip show.
@@ -229,6 +267,9 @@ pub struct Store {
     /// Last error per session, cleared when a new prompt is sent.
     pub errors: HashMap<String, String>,
     pub conversations: HashMap<String, Conversation>,
+    /// Recently selected sessions, newest last; their transcripts stay in
+    /// memory (see [`Store::evict_conversations`]).
+    pub(crate) recent: std::collections::VecDeque<String>,
     /// Why a session's history couldn't be fetched (cleared on success).
     pub load_errors: HashMap<String, String>,
     /// Pending prompts/compactions per session, oldest first. Kept whether
@@ -266,9 +307,11 @@ pub struct Store {
     /// In-progress answers per pending form (`answer[key] = value`), seeded
     /// from the fields' defaults and edited as the user picks or types.
     pub form_drafts: HashMap<String, Value>,
-    pub diffs: HashMap<String, Vec<FileDiff>>,
-    pub diff_loading: HashSet<String>,
-    pub diff_errors: HashMap<String, String>,
+    pub diffs: HashMap<PathBuf, Vec<FileDiff>>,
+    pub diff_loading: HashSet<PathBuf>,
+    pub diff_errors: HashMap<PathBuf, String>,
+    /// Folders whose diff may be outdated (a turn ended while not shown).
+    pub diff_stale: HashSet<PathBuf>,
     /// Per folder (location directory).
     pub catalogs: HashMap<PathBuf, Catalog>,
     /// The model/agent for the next new session. Updated by every pick, so
@@ -319,6 +362,10 @@ impl Store {
         self.permission_errors.retain(|(session, request), _| {
             session != sid || requests.iter().any(|r| &r.id == request)
         });
+        if self.permissions[sid].is_empty() {
+            // No entry for "none": keys are the sessions with something pending.
+            self.permissions.remove(sid);
+        }
         *self.permission_revision.entry(sid.to_string()).or_default() += 1;
         cx.emit(StoreEvent::StatusChanged {
             session_id: sid.to_string(),
@@ -353,8 +400,19 @@ impl Store {
             .retain(|(session, form)| session != sid || pending.contains(form.as_str()));
         self.form_errors
             .retain(|(session, form), _| session != sid || pending.contains(form.as_str()));
+        // Drafts of other sessions' forms are still pending; keep them.
+        let all: HashSet<&str> = self
+            .forms
+            .values()
+            .flatten()
+            .map(|f| f.id.as_str())
+            .collect();
         self.form_drafts
-            .retain(|form, _| pending.contains(form.as_str()));
+            .retain(|form, _| all.contains(form.as_str()));
+        if forms.is_empty() {
+            // No entry for "none": keys are the sessions with something pending.
+            self.forms.remove(sid);
+        }
         *self.form_revision.entry(sid.to_string()).or_default() += 1;
         cx.emit(StoreEvent::StatusChanged {
             session_id: sid.to_string(),
@@ -490,6 +548,53 @@ impl Store {
 
     pub fn is_busy(&self, session_id: &str) -> bool {
         self.busy.contains(session_id)
+    }
+
+    pub fn is_submitting(&self) -> bool {
+        let target = match &self.selected {
+            Some(sid) => SubmissionTarget::Session(sid.clone()),
+            None => match self.target_folder() {
+                Some(folder) => SubmissionTarget::Draft(folder),
+                None => return false,
+            },
+        };
+        self.submitting.values().any(|t| *t == target)
+    }
+
+    /// Activity stays beside the latest message throughout server/model latency.
+    pub fn response_activity(&self) -> Option<&'static str> {
+        if self.is_submitting() {
+            return Some("Sending…");
+        }
+        let sid = self.selected.as_ref()?;
+        if self.interrupting.contains(sid) {
+            return Some("Stopping…");
+        }
+        if !self.is_busy(sid) || self.retry.contains_key(sid) {
+            return None;
+        }
+        // The approval/question cards already explain what the user must do.
+        if std::iter::once(sid.as_str())
+            .chain(self.children_of(sid).iter().map(|s| s.id.as_str()))
+            .any(|id| {
+                self.permissions.get(id).is_some_and(|r| !r.is_empty())
+                    || self.forms.get(id).is_some_and(|r| !r.is_empty())
+            })
+        {
+            return None;
+        }
+        let latest = self.selected_conversation().and_then(|c| c.messages.last());
+        Some(match latest {
+            Some(Message::Assistant(a))
+                if a.blocks.iter().any(|b| match b {
+                    Block::Prose { text, .. } => !text.trim().is_empty(),
+                    Block::Tool(_) => true,
+                }) =>
+            {
+                "Working…"
+            }
+            _ => "Thinking…",
+        })
     }
 
     /// The session `delta` rows above (-1) or below (+1) the selected one,
@@ -725,6 +830,213 @@ impl Store {
                 .count()
     }
 
+    /// Drop everything kept about a deleted session (and its subagents).
+    /// Every per-session map must be cleared here, or it leaks.
+    pub(crate) fn forget_session(&mut self, sid: &str) {
+        let kids: Vec<String> = self
+            .children
+            .remove(sid)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        for kid in &kids {
+            self.forget_session(kid);
+        }
+        self.sessions.retain(|x| x.id != sid);
+        for siblings in self.children.values_mut() {
+            siblings.retain(|c| c.id != sid);
+        }
+        self.conversations.remove(sid);
+        self.recent.retain(|r| r != sid);
+        self.busy.remove(sid);
+        self.retry.remove(sid);
+        self.errors.remove(sid);
+        self.load_errors.remove(sid);
+        self.needs_reload.remove(sid);
+        self.interrupting.remove(sid);
+        self.submitting
+            .retain(|_, target| *target != SubmissionTarget::Session(sid.to_string()));
+        let forms: Vec<String> = self
+            .forms
+            .remove(sid)
+            .into_iter()
+            .flatten()
+            .map(|f| f.id)
+            .collect();
+        self.form_drafts.retain(|id, _| !forms.contains(id));
+        self.permissions.remove(sid);
+        self.permission_revision.remove(sid);
+        self.permission_sending.retain(|(s, _)| s != sid);
+        self.permission_errors.retain(|(s, _), _| s != sid);
+        self.form_revision.remove(sid);
+        self.form_sending.retain(|(s, _)| s != sid);
+        self.form_errors.retain(|(s, _), _| s != sid);
+        self.inbox.remove(sid);
+        self.inbox_revision.remove(sid);
+        self.session_modes.remove(sid);
+        self.mode_sending.remove(sid);
+        self.usage.remove(sid);
+        self.usage_loading.remove(sid);
+        self.usage_errors.remove(sid);
+        self.unread.remove(sid);
+    }
+
+    /// Drop everything kept about a folder that was removed from the
+    /// sidebar, including its worktree checkouts.
+    pub(crate) fn forget_folder(&mut self, folder: &Path) {
+        let mut dirs = self.worktrees.remove(folder).unwrap_or_default();
+        dirs.push(folder.to_path_buf());
+        self.projects.remove(folder);
+        for dir in &dirs {
+            self.pull_requests.remove(dir);
+            self.vcs.remove(dir);
+            self.tooling.remove(dir);
+            self.catalogs.remove(dir);
+            self.diffs.remove(dir);
+            self.diff_loading.remove(dir);
+            self.diff_errors.remove(dir);
+            self.diff_stale.remove(dir);
+            self.shell_snapshots.remove(dir);
+        }
+    }
+
+    /// The folder whose working-tree diff the selected session shows.
+    pub fn selected_diff_dir(&self) -> Option<PathBuf> {
+        self.session(self.selected.as_deref()?)
+            .map(|s| s.directory.clone())
+    }
+
+    /// The selected session's folder diff, if loaded.
+    pub fn selected_diff(&self) -> Option<&Vec<FileDiff>> {
+        self.diffs.get(&self.selected_diff_dir()?)
+    }
+
+    /// A folder's diff starts loading. Diffs are per folder (opencode's
+    /// working-tree diff), shared by every session in it.
+    pub fn begin_diff(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let start = self.diff_loading.insert(dir.clone());
+        let errors_removed = self.diff_errors.remove(&dir).is_some();
+        self.diff_stale.remove(&dir);
+        if start || errors_removed {
+            cx.emit(StoreEvent::DiffsChanged { dir });
+            cx.notify();
+        }
+    }
+
+    /// A folder's diff finished loading. Emits only when what the Changes
+    /// panel shows changed: it is the one heavy reader.
+    pub fn set_diff_state(
+        &mut self,
+        dir: PathBuf,
+        diffs: Option<Vec<FileDiff>>,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = self.diff_loading.remove(&dir);
+        if let Some(diffs) = diffs {
+            changed |= self.diffs.get(&dir) != Some(&diffs);
+            self.diffs.insert(dir.clone(), diffs);
+        }
+        if self.diff_errors.get(&dir) != error.as_ref() {
+            changed = true;
+            match error {
+                Some(e) => {
+                    self.diff_errors.insert(dir.clone(), e);
+                }
+                None => {
+                    self.diff_errors.remove(&dir);
+                }
+            }
+        }
+        if changed {
+            cx.emit(StoreEvent::DiffsChanged { dir });
+            cx.notify();
+        }
+    }
+
+    /// The name of a tool call, if its message is in memory.
+    pub fn tool_name(&self, session_id: &str, message_id: &str, call_id: &str) -> Option<&str> {
+        let conv = self.conversations.get(session_id)?;
+        let Message::Assistant(a) = conv.messages.get(conv.index_of(message_id).ok()?)? else {
+            return None;
+        };
+        a.blocks.iter().find_map(|b| match b {
+            Block::Tool(t) if t.call_id == call_id && !t.name.is_empty() => Some(t.name.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The loaded conversation's assistant messages that reported usage.
+    fn usage_messages<'a>(
+        &'a self,
+        sid: &str,
+    ) -> Option<impl DoubleEndedIterator<Item = &'a crate::api::model::AssistantMessage>> {
+        let conv = self.conversations.get(sid).filter(|c| c.loaded)?;
+        Some(conv.messages.iter().filter_map(|m| match m {
+            Message::Assistant(a) if a.meta.tokens.is_some() => Some(a),
+            _ => None,
+        }))
+    }
+
+    /// Context used by the last request and the model's window. Derived
+    /// from the loaded conversation and catalog, else the last REST report.
+    pub fn usage_context(&self, sid: &str) -> (Option<u64>, Option<u64>) {
+        let report = self.usage.get(sid);
+        let last = self.usage_messages(sid).and_then(|mut it| it.next_back());
+        let Some(last) = last else {
+            return (
+                report.and_then(|r| r.context),
+                report.and_then(|r| r.context_limit),
+            );
+        };
+        let context = last.meta.tokens.as_ref().map(|t| t.context());
+        let session = self.session(sid);
+        let model = last
+            .meta
+            .model
+            .as_ref()
+            .or_else(|| session.and_then(|s| s.model.as_ref()));
+        let limit = session
+            .and_then(|s| self.catalogs.get(&s.directory))
+            .zip(model)
+            .and_then(|(c, m)| {
+                c.models
+                    .iter()
+                    .find(|x| x.provider_id == m.provider_id && x.id == m.id)
+            })
+            .and_then(|m| m.context_limit)
+            .or_else(|| report.and_then(|r| r.context_limit));
+        (context, limit)
+    }
+
+    /// The usage report, with the per-model breakdown and context computed
+    /// from the loaded conversation (so the server needn't resend history).
+    pub fn usage_view(&self, sid: &str) -> Option<crate::api::features::UsageReport> {
+        let mut report = self.usage.get(sid)?.clone();
+        if let Some(messages) = self.usage_messages(sid) {
+            report.models.clear();
+            for a in messages {
+                let key = a
+                    .meta
+                    .model
+                    .as_ref()
+                    .map(|m| format!("{}/{}", m.provider_id, m.id))
+                    .unwrap_or_else(|| "unknown/unknown".into());
+                if let Some(t) = &a.meta.tokens {
+                    report.add_model_usage(&key, t, a.meta.cost.unwrap_or(0.));
+                }
+            }
+        }
+        (report.context, report.context_limit) = self.usage_context(sid);
+        Some(report)
+    }
+
+    /// Whether usage details must come from the server's history.
+    pub fn usage_needs_history(&self, sid: &str) -> bool {
+        !self.conversations.get(sid).is_some_and(|c| c.loaded)
+    }
+
     pub fn set_vcs(&mut self, dir: PathBuf, info: VcsInfo, cx: &mut Context<Self>) {
         self.vcs.insert(dir, info);
         cx.emit(StoreEvent::FolderInfoChanged);
@@ -802,9 +1114,45 @@ impl Store {
                 self.current_folder = Some(dir);
             }
             self.selected = id;
+            if let Some(id) = &self.selected {
+                self.recent.retain(|r| r != id);
+                self.recent.push_back(id.clone());
+                if self.recent.len() > KEEP_CONVERSATIONS {
+                    self.recent.pop_front();
+                }
+            }
+            self.evict_conversations();
             cx.emit(StoreEvent::SelectionChanged);
             cx.notify();
         }
+    }
+
+    /// Drop transcripts nobody looked at recently; selecting a session
+    /// fetches its history again anyway. Anything still live is kept.
+    fn evict_conversations(&mut self) {
+        if self.conversations.len() <= KEEP_CONVERSATIONS {
+            return;
+        }
+        let keep_children: HashSet<&str> = self
+            .recent
+            .iter()
+            .flat_map(|p| self.children.get(p).into_iter().flatten())
+            .map(|c| c.id.as_str())
+            .collect();
+        let keep: HashSet<String> = self
+            .conversations
+            .iter()
+            .filter(|(id, conv)| {
+                self.recent.contains(id)
+                    || keep_children.contains(id.as_str())
+                    || conv.fetching
+                    || self.busy.contains(*id)
+                    || self.permissions.get(*id).is_some_and(|r| !r.is_empty())
+                    || self.forms.get(*id).is_some_and(|r| !r.is_empty())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.conversations.retain(|id, _| keep.contains(id));
     }
 
     pub fn set_folders(&mut self, folders: Vec<PathBuf>, cx: &mut Context<Self>) {
@@ -851,6 +1199,7 @@ impl Store {
     /// Replace busy state with the server's view (`GET /api/session/active`).
     pub fn set_active(&mut self, active: Vec<String>, cx: &mut Context<Self>) {
         let new: HashSet<String> = active.into_iter().collect();
+        self.interrupting.retain(|sid| new.contains(sid));
         let changed: Vec<String> = self.busy.symmetric_difference(&new).cloned().collect();
         self.busy = new;
         let events = changed
@@ -930,10 +1279,18 @@ impl Store {
         if events.is_empty() {
             return;
         }
+        // A streamed delta only changes one row. Subscribers that show rows
+        // (conversation, tasks) react to the event itself; skipping the
+        // notify keeps every whole-store observer from redrawing per token.
+        let content_only = events
+            .iter()
+            .all(|e| matches!(e, StoreEvent::MessageChanged { .. }));
         for e in events {
             cx.emit(e);
         }
-        cx.notify();
+        if !content_only {
+            cx.notify();
+        }
     }
 
     fn set_busy_inner(&mut self, session_id: &str, busy: bool) -> Vec<StoreEvent> {
@@ -944,6 +1301,7 @@ impl Store {
         };
         if !busy {
             self.retry.remove(session_id);
+            self.interrupting.remove(session_id);
         }
         if changed {
             vec![StoreEvent::StatusChanged {
@@ -982,6 +1340,13 @@ impl Store {
                 | Event::InboxDeliveryChanged { .. }
         ) {
             self.snapshot_revision += 1;
+        }
+        if let Event::InboxEnqueued { session_id, .. }
+        | Event::InboxDelivered { session_id, .. }
+        | Event::InboxCancelled { session_id, .. }
+        | Event::InboxDeliveryChanged { session_id, .. } = &env.event
+        {
+            *self.inbox_revision.entry(session_id.clone()).or_default() += 1;
         }
         // Inbox, background tasks and folder info are session-/folder-level.
         let mut out = match self.apply_m7(&mut env) {
@@ -1041,23 +1406,7 @@ impl Store {
                 return out;
             }
             Event::SessionRemoved { session_id } => {
-                self.sessions.retain(|x| &x.id != session_id);
-                self.conversations.remove(session_id);
-                self.busy.remove(session_id);
-                self.permissions.remove(session_id);
-                self.permission_revision.remove(session_id);
-                self.permission_sending.retain(|(sid, _)| sid != session_id);
-                self.permission_errors
-                    .retain(|(sid, _), _| sid != session_id);
-                self.forms.remove(session_id);
-                self.form_revision.remove(session_id);
-                self.form_sending.retain(|(sid, _)| sid != session_id);
-                self.form_errors.retain(|(sid, _), _| sid != session_id);
-                self.diffs.remove(session_id);
-                self.diff_loading.remove(session_id);
-                self.diff_errors.remove(session_id);
-                self.inbox.remove(session_id);
-                self.children.remove(session_id);
+                self.forget_session(session_id);
                 out.push(StoreEvent::SessionsChanged);
                 if self.selected.as_ref() == Some(session_id) {
                     self.selected = None;
@@ -1207,6 +1556,7 @@ impl Store {
         } else {
             now_ms()
         };
+        let text_delta = matches!(env.event, Event::BlockDelta { .. });
         let changed = |index: usize, inserted: bool| {
             if inserted {
                 StoreEvent::MessageInserted {
@@ -1221,6 +1571,22 @@ impl Store {
             }
         };
 
+        // A server bug (or id collision) must not crash the app: drop the
+        // event and refetch the session's history once its turn ends.
+        if !matches!(env.event, Event::UserPrompt { .. })
+            && let Some(id) = event_message(&env.event)
+            && conv
+                .index_of(id)
+                .is_ok_and(|i| !matches!(conv.messages[i], Message::Assistant(_)))
+        {
+            tracing::warn!(
+                session = %session_id,
+                message = id,
+                "assistant event for a non-assistant message; will reload"
+            );
+            self.needs_reload.insert(session_id.clone());
+            return out;
+        }
         match env.event {
             Event::UserPrompt {
                 message_id,
@@ -1398,6 +1764,9 @@ impl Store {
             }
             _ => {}
         }
+        if !out.is_empty() && !text_delta {
+            conv.revision += 1;
+        }
         out
     }
 
@@ -1410,6 +1779,7 @@ impl Store {
             .conversations
             .entry(session_id.to_string())
             .or_default();
+        conv.revision += 1;
         // The snapshot's order is authoritative (delivery order).
         let old = std::mem::take(&mut conv.messages);
         let in_snapshot: HashSet<String> = history.iter().map(|m| m.id().to_string()).collect();
@@ -1673,6 +2043,188 @@ mod tests {
 
     fn wire(json: &str) -> Envelope {
         Envelope::from_json(json).unwrap()
+    }
+
+    #[test]
+    fn deleting_a_session_forgets_it_and_its_subagents_everywhere() {
+        let mut s = Store::default();
+        let kid = SessionInfo::from_json(
+            &serde_json::json!({"id":"ses_kid","parentID":"ses_a","location":{"directory":"/r"}}),
+        )
+        .unwrap();
+        s.children.insert("ses_a".into(), vec![kid]);
+        for id in ["ses_a", "ses_kid"] {
+            s.reconcile_inner(id, vec![]);
+            s.busy.insert(id.into());
+            s.retry.insert(id.into(), "x".into());
+            s.errors.insert(id.into(), "x".into());
+            s.needs_reload.insert(id.into());
+            s.usage.insert(id.into(), Default::default());
+            s.session_modes.insert(id.into(), None);
+            s.inbox_revision.insert(id.into(), 1);
+            s.unread.insert(id.into());
+        }
+        s.apply_inner(Envelope::bare(Event::SessionRemoved {
+            session_id: "ses_a".into(),
+        }));
+        assert!(s.conversations.is_empty() && s.children.is_empty());
+        assert!(s.busy.is_empty() && s.retry.is_empty() && s.errors.is_empty());
+        assert!(s.needs_reload.is_empty() && s.usage.is_empty() && s.session_modes.is_empty());
+        assert!(s.inbox_revision.is_empty() && s.unread.is_empty());
+    }
+
+    #[test]
+    fn conversation_revision_ignores_text_deltas_but_tracks_tools() {
+        let mut s = Store::default();
+        s.reconcile_inner("ses_a", vec![]);
+        let rev = |s: &Store| s.conversations["ses_a"].revision;
+        s.apply_inner(wire(r#"{"type":"session.step.started","data":{"sessionID":"ses_a","assistantMessageID":"msg_a"}}"#));
+        let before = rev(&s);
+        s.apply_inner(wire(r#"{"type":"session.text.delta","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","ordinal":0,"delta":"Hi"}}"#));
+        assert_eq!(rev(&s), before, "streamed text keeps memoized views valid");
+        s.apply_inner(wire(r#"{"type":"session.tool.input.started","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","id":"c1","name":"todowrite"}}"#));
+        assert!(rev(&s) > before, "a tool call invalidates them");
+    }
+
+    #[test]
+    fn old_transcripts_are_evicted_but_live_ones_stay() {
+        let mut s = Store::default();
+        for i in 0..20 {
+            s.reconcile_inner(&format!("ses_{i}"), vec![]);
+        }
+        s.busy.insert("ses_0".into());
+        for i in 5..20 {
+            let id = format!("ses_{i}");
+            s.selected = Some(id.clone());
+            s.recent.retain(|r| r != &id);
+            s.recent.push_back(id);
+            if s.recent.len() > KEEP_CONVERSATIONS {
+                s.recent.pop_front();
+            }
+        }
+        s.evict_conversations();
+        assert!(s.conversations.contains_key("ses_0"), "busy stays");
+        assert!(!s.conversations.contains_key("ses_1"));
+        assert!(!s.conversations.contains_key("ses_9"));
+        for i in 10..20 {
+            assert!(s.conversations.contains_key(&format!("ses_{i}")));
+        }
+        assert_eq!(s.conversations.len(), KEEP_CONVERSATIONS + 1);
+    }
+
+    #[test]
+    fn assistant_event_for_a_user_message_id_reloads_instead_of_panicking() {
+        let mut s = Store::default();
+        s.reconcile_inner(
+            "ses_a",
+            vec![Message::User(UserMessage {
+                id: "msg_1".into(),
+                text: "hi".into(),
+                attachments: vec![],
+                meta: Meta::default(),
+            })],
+        );
+        let events = s.apply_inner(wire(
+            r#"{"type":"session.text.delta","data":{"sessionID":"ses_a","assistantMessageID":"msg_1","ordinal":0,"delta":"x"}}"#,
+        ));
+        assert!(events.is_empty());
+        assert!(s.needs_reload.contains("ses_a"));
+        let conv = &s.conversations["ses_a"];
+        assert!(matches!(conv.messages.as_slice(), [Message::User(_)]));
+    }
+
+    #[test]
+    fn immediate_send_feedback_is_scoped_and_tracks_concurrent_requests() {
+        let mut s = Store {
+            current_folder: Some("/repo".into()),
+            ..Default::default()
+        };
+        s.submitting
+            .insert(1, SubmissionTarget::Draft("/repo".into()));
+        assert_eq!(s.response_activity(), Some("Sending…"));
+        s.current_folder = Some("/other".into());
+        assert!(!s.is_submitting(), "another draft must not look busy");
+        s.selected = Some("ses_a".into());
+        s.submitting
+            .insert(2, SubmissionTarget::Session("ses_a".into()));
+        s.submitting
+            .insert(3, SubmissionTarget::Session("ses_a".into()));
+        s.submitting.remove(&2);
+        assert!(
+            s.is_submitting(),
+            "one completed request cannot hide another"
+        );
+        s.submitting.remove(&3);
+        assert_eq!(
+            s.response_activity(),
+            None,
+            "failed admissions must clear feedback"
+        );
+        s.current_folder = Some("/repo".into());
+        assert!(
+            !s.is_submitting(),
+            "draft admissions cannot affect an open session"
+        );
+    }
+
+    #[test]
+    fn response_activity_covers_model_latency_and_ends_with_execution() {
+        let mut s = Store {
+            selected: Some("ses_a".into()),
+            ..Default::default()
+        };
+        s.reconcile_inner("ses_a", vec![]);
+        s.apply_inner(wire(
+            r#"{"type":"session.execution.started","data":{"sessionID":"ses_a"}}"#,
+        ));
+        assert_eq!(s.response_activity(), Some("Thinking…"));
+        s.apply_inner(wire(r#"{"type":"session.step.started","data":{"sessionID":"ses_a","assistantMessageID":"msg_a"}}"#));
+        assert_eq!(
+            s.response_activity(),
+            Some("Thinking…"),
+            "empty assistant messages still need feedback"
+        );
+        s.apply_inner(wire(r#"{"type":"session.text.delta","data":{"sessionID":"ses_a","assistantMessageID":"msg_a","ordinal":0,"delta":"Hello"}}"#));
+        assert_eq!(s.response_activity(), Some("Working…"));
+        s.interrupting.insert("ses_a".into());
+        assert_eq!(s.response_activity(), Some("Stopping…"));
+        s.apply_inner(Envelope::bare(Event::ExecutionEnded {
+            session_id: "ses_a".into(),
+            outcome: Outcome::Interrupted {
+                reason: "user".into(),
+            },
+        }));
+        assert_eq!(s.response_activity(), None);
+        assert!(s.interrupting.is_empty());
+    }
+
+    #[test]
+    fn response_activity_yields_to_approval_and_retry_messages() {
+        let mut s = Store {
+            selected: Some("ses_a".into()),
+            ..Default::default()
+        };
+        s.busy.insert("ses_a".into());
+        s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(
+            "ses_a", "perm_a",
+        ))));
+        assert_eq!(
+            s.response_activity(),
+            None,
+            "waiting for the user is not thinking"
+        );
+        s.apply_inner(Envelope::bare(Event::PermissionReplied {
+            session_id: "ses_a".into(),
+            request_id: "perm_a".into(),
+        }));
+        assert_eq!(s.response_activity(), Some("Thinking…"));
+        s.retry
+            .insert("ses_a".into(), "Provider unavailable".into());
+        assert_eq!(
+            s.response_activity(),
+            None,
+            "the retry banner explains the wait"
+        );
     }
 
     #[test]
@@ -2060,13 +2612,11 @@ mod tests {
         ))));
         s.permission_sending
             .insert(("ses_a".into(), "perm_1".into()));
-        s.diffs.insert("ses_a".into(), vec![]);
         s.apply_inner(Envelope::bare(Event::SessionRemoved {
             session_id: "ses_a".into(),
         }));
         assert!(!s.permissions.contains_key("ses_a"));
         assert!(s.permission_sending.is_empty());
-        assert!(s.diffs.is_empty());
     }
 
     #[test]
@@ -2249,6 +2799,7 @@ mod tests {
             Catalog {
                 models: vec![],
                 default_model: Some(mref("default")),
+                configured_agent: None,
                 agents: vec![
                     AgentInfo {
                         id: "plan".into(),
@@ -2268,6 +2819,15 @@ mod tests {
         // Nothing chosen: folder defaults, `build` preferred.
         assert_eq!(s.effective_model(), Some(mref("default")));
         assert_eq!(s.effective_agent().as_deref(), Some("build"));
+        s.catalogs
+            .get_mut(std::path::Path::new("/a"))
+            .unwrap()
+            .configured_agent = Some("plan".into());
+        assert_eq!(s.effective_agent().as_deref(), Some("plan"));
+        s.catalogs
+            .get_mut(std::path::Path::new("/a"))
+            .unwrap()
+            .configured_agent = None;
         // A draft pick applies to new sessions.
         s.draft_model = Some(mref("draft"));
         assert_eq!(s.effective_model(), Some(mref("draft")));

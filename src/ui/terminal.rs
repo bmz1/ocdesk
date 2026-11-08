@@ -26,6 +26,10 @@ use crate::controller::Controller;
 use crate::store::{Store, StoreEvent};
 
 const FONT_SIZE: f32 = 12.5;
+/// Local emulators kept attached (each holds up to 5,000 lines of
+/// scrollback). Older ones are detached; their PTY lives on in opencode and
+/// its snapshot restores the screen when the session is shown again.
+const MAX_ATTACHED: usize = 6;
 const LINE_HEIGHT: f32 = 1.3;
 
 /// Collects what the emulator wants written back to the PTY (answers to
@@ -49,6 +53,8 @@ struct Session {
     listener: Listener,
     input: Option<Sender<Vec<u8>>>,
     status: Status,
+    /// [`TerminalView::clock`] when last shown, for evicting idle emulators.
+    shown: u64,
     _io: Option<Task<()>>,
 }
 
@@ -74,6 +80,7 @@ pub struct TerminalView {
     focus: FocusHandle,
     /// Per session id.
     sessions: HashMap<String, Session>,
+    clock: u64,
     cols: u16,
     rows: u16,
     cell: Option<Size<Pixels>>,
@@ -86,16 +93,31 @@ impl TerminalView {
         controller: Entity<Controller>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subs = vec![cx.subscribe(&store, |_, _, ev: &StoreEvent, cx| {
-            if matches!(ev, StoreEvent::SelectionChanged) {
-                cx.notify();
-            }
-        })];
+        let subs = vec![
+            cx.subscribe(&store, |this, store, ev: &StoreEvent, cx| match ev {
+                StoreEvent::SelectionChanged => cx.notify(),
+                // Deleted sessions' terminals are gone on the server too.
+                StoreEvent::SessionsChanged => {
+                    let s = store.read(cx);
+                    // Before the first list arrives there's nothing to compare against.
+                    if !s.sessions.is_empty() {
+                        let selected = s.selected.clone();
+                        this.sessions.retain(|sid, _| {
+                            s.session(sid).is_some()
+                                || selected.as_ref() == Some(sid)
+                                || s.children.values().flatten().any(|c| &c.id == sid)
+                        });
+                    }
+                }
+                _ => {}
+            }),
+        ];
         Self {
             store,
             controller,
             focus: cx.focus_handle(),
             sessions: HashMap::new(),
+            clock: 0,
             cols: 80,
             rows: 24,
             cell: None,
@@ -114,8 +136,21 @@ impl TerminalView {
     /// Open (or reattach) the selected session's terminal.
     fn ensure(&mut self, cx: &mut Context<Self>) {
         let Some(sid) = self.selected(cx) else { return };
-        if self.sessions.contains_key(&sid) {
+        self.clock += 1;
+        if let Some(s) = self.sessions.get_mut(&sid) {
+            s.shown = self.clock;
             return;
+        }
+        while self.sessions.len() >= MAX_ATTACHED {
+            let Some(oldest) = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, s)| s.shown)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.sessions.remove(&oldest);
         }
         let listener = Listener::default();
         let size = TermSize::new(self.cols as usize, self.rows as usize);
@@ -131,6 +166,7 @@ impl TerminalView {
                 listener,
                 input: None,
                 status: Status::Connecting,
+                shown: self.clock,
                 _io: None,
             },
         );
@@ -194,7 +230,10 @@ impl TerminalView {
                     if let Some(s) = this.sessions.get_mut(&sid) {
                         s.handle(msg);
                     }
-                    cx.notify();
+                    // Background shells keep their screen; only the shown one redraws.
+                    if this.selected(cx).as_deref() == Some(sid.as_str()) {
+                        cx.notify();
+                    }
                 });
                 if alive.is_err() {
                     return;
@@ -706,7 +745,7 @@ impl Render for TerminalView {
                     .py_1()
                     .overflow_hidden()
                     .cursor_text()
-                    .font_family(theme.mono_font_family.clone())
+                    .font_family(theme.mono_font_family)
                     .text_size(font_size)
                     .line_height(cell.height)
                     .on_mouse_down(

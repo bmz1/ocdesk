@@ -59,7 +59,7 @@ fn groups(mode: Mode, store: &Store, controller: &Entity<Controller>) -> Vec<Gro
                 let item = CommandItem::new()
                     .label(format!("{}  ·  {folder}", s.display_title()))
                     .icon(crate::ui::icons::message_square())
-                    .keywords([folder.clone()])
+                    .keywords([folder])
                     .checked(current);
                 let (c, id) = (controller.clone(), s.id.clone());
                 let run = after_close(move |_, cx| {
@@ -185,7 +185,7 @@ fn groups(mode: Mode, store: &Store, controller: &Entity<Controller>) -> Vec<Gro
                 let item = CommandItem::new()
                     .label(format!("{}  ·  {}", m.name, m.provider_id))
                     .icon(IconName::Cpu)
-                    .keywords([m.id.clone(), m.provider_id.clone()])
+                    .keywords([m.id.clone(), m.provider_id])
                     .checked(checked);
                 let c = controller.clone();
                 let run = after_close(move |_, cx| {

@@ -62,11 +62,20 @@ impl TasksDrawer {
                     this.poll = None;
                     cx.notify();
                 }
-                StoreEvent::TasksChanged
-                | StoreEvent::MessagesReset { .. }
-                | StoreEvent::MessageInserted { .. }
-                | StoreEvent::MessageChanged { .. }
-                | StoreEvent::StatusChanged { .. } => cx.notify(),
+                StoreEvent::TasksChanged => cx.notify(),
+                // Only the selected session and its subagents are shown.
+                StoreEvent::MessagesReset { session_id }
+                | StoreEvent::MessageInserted { session_id, .. }
+                | StoreEvent::MessageChanged { session_id, .. }
+                | StoreEvent::StatusChanged { session_id } => {
+                    let s = this.store.read(cx);
+                    let shown = s.selected.as_ref().is_some_and(|sel| {
+                        sel == session_id || s.children_of(sel).iter().any(|c| &c.id == session_id)
+                    });
+                    if shown {
+                        cx.notify();
+                    }
+                }
                 _ => {}
             }),
         ];
@@ -300,17 +309,20 @@ impl TasksDrawer {
             .and_then(|t| t.input.get("prompt").and_then(|p| p.as_str()))
             .unwrap_or_default()
             .to_string();
-        let messages: Vec<Message> = store
+        // The drawer only needs the latest tool activity and answer. Do not
+        // copy the child transcript on every redraw.
+        let transcript = store
             .conversations
             .get(child)
-            .map(|c| c.messages.clone())
-            .unwrap_or_default();
-        let summary = activity_summary(&messages);
-        let result = last_text(&messages).or_else(|| {
+            .map(|c| c.messages.as_slice());
+        let summary = transcript.and_then(activity_summary);
+        let last_message_text = transcript.and_then(last_text);
+        let result = last_message_text.or_else(|| {
             call.as_ref()
                 .filter(|t| !t.output.is_empty())
                 .map(|t| strip_subagent_wrapper(&t.output))
         });
+
         let agent = info
             .as_ref()
             .and_then(|i| i.agent.clone())

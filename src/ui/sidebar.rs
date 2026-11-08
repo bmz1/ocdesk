@@ -628,9 +628,7 @@ impl Sidebar {
                 this.controller
                     .update(cx, |c, cx| c.select_session(Some(id), cx));
             }))
-            .when_some(project.clone(), |el, p| {
-                el.child(super::kit::monogram(&p, 16., cx))
-            })
+            .when_some(project, |el, p| el.child(super::kit::monogram(&p, 16., cx)))
             .child(div().flex_1().min_w_0().truncate().child(title))
             // Trailing slot: status, else the age; actions replace the age
             // under the pointer so times stay aligned.

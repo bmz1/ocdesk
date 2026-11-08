@@ -10,7 +10,7 @@ use gpui_kit::Context;
 use super::Controller;
 use crate::api::model::PromptInput;
 use crate::github::{self, Check, CheckState, PullRequest};
-use crate::store::CheckLog;
+use crate::store::{CheckLog, StoreEvent};
 
 const TICK: Duration = Duration::from_secs(5);
 /// Re-fetch while checks run.
@@ -73,11 +73,13 @@ impl Controller {
         if !s.gh_available || s.pull_requests.get(&dir).is_some_and(|e| e.loading) {
             return;
         }
+        // Only the panel shows fetch progress; the header chip doesn't.
         self.store.update(cx, |s, cx| {
             s.pull_requests.entry(dir.clone()).or_default().loading = true;
-            cx.notify();
+            cx.emit(StoreEvent::PullRequestChanged);
         });
         let d = dir.clone();
+        let dir_key = dir.clone();
         self.run(
             cx,
             async move { github::pull_request(&d).await },
@@ -86,6 +88,7 @@ impl Controller {
                     let e = s.pull_requests.entry(dir).or_default();
                     e.loading = false;
                     e.fetched = Some(Instant::now());
+                    let before = (e.pr.clone(), e.error.clone());
                     match res {
                         Ok(pr) => {
                             // A new push: the old failure logs no longer apply.
@@ -105,7 +108,12 @@ impl Controller {
                         }
                         Err(err) => e.error = Some(format!("{err:#}")),
                     }
-                    cx.notify();
+                    let e = &s.pull_requests[&dir_key];
+                    cx.emit(StoreEvent::PullRequestChanged);
+                    // A poll that found nothing new redraws only the panel.
+                    if (e.pr.clone(), e.error.clone()) != before {
+                        cx.notify();
+                    }
                 });
             },
         );
@@ -119,7 +127,7 @@ impl Controller {
         let link = check.link.clone();
         self.store.update(cx, |s, cx| {
             s.check_logs.insert(link.clone(), CheckLog::Loading);
-            cx.notify();
+            cx.emit(StoreEvent::PullRequestChanged);
         });
         self.run(
             cx,
@@ -133,7 +141,7 @@ impl Controller {
                             Err(e) => CheckLog::Failed(format!("{e:#}")),
                         },
                     );
-                    cx.notify();
+                    cx.emit(StoreEvent::PullRequestChanged);
                 });
             },
         );

@@ -18,7 +18,7 @@ pub enum CheckState {
     Skipped,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Check {
     pub name: String,
     pub workflow: String,
@@ -55,7 +55,7 @@ impl Check {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Comment {
     pub author: String,
     pub body: String,
@@ -63,7 +63,7 @@ pub struct Comment {
 }
 
 /// An unresolved review thread on a line of the diff.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Thread {
     pub path: String,
     pub line: Option<u64>,
@@ -72,7 +72,7 @@ pub struct Thread {
     pub comments: Vec<Comment>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PullRequest {
     pub number: u64,
     pub title: String,
@@ -110,6 +110,8 @@ fn unix(t: &str) -> Option<i64> {
     Some(days * 86400 + hh * 3600 + mm * 60 + ss)
 }
 
+const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn gh(dir: &Path, args: &[&str]) -> Result<String> {
     let out = tokio::process::Command::new("gh")
         .args(args)
@@ -118,8 +120,13 @@ async fn gh(dir: &Path, args: &[&str]) -> Result<String> {
         .env("GH_NO_UPDATE_NOTIFIER", "1")
         .env("NO_COLOR", "1")
         .kill_on_drop(true)
-        .output()
-        .await?;
+        .output();
+    // A hung `gh` (network, auth prompt) would otherwise keep the PR entry
+    // "loading" forever, which blocks every later refresh. Timing out drops
+    // the child, which kills it.
+    let out = tokio::time::timeout(GH_TIMEOUT, out)
+        .await
+        .map_err(|_| anyhow::anyhow!("gh {} timed out", args.first().unwrap_or(&"")))??;
     if !out.status.success() {
         bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -128,13 +135,15 @@ async fn gh(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// Whether the `gh` CLI is installed (not whether it is logged in).
 pub async fn available() -> bool {
-    tokio::process::Command::new("gh")
+    let status = tokio::process::Command::new("gh")
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .kill_on_drop(true)
+        .status();
+    tokio::time::timeout(GH_TIMEOUT, status)
         .await
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|s| s.is_ok_and(|s| s.success()))
 }
 
 const THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved isOutdated path line originalLine comments(first:50){nodes{author{login} body url diffHunk}}}} reviews(first:50){nodes{author{login} body url}}}}}";

@@ -4,7 +4,6 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::api::features::patch_fingerprint;
 use crate::controller::Controller;
 use crate::store::Store;
 
@@ -29,9 +28,10 @@ pub fn render_changes(
         return div().into_any_element();
     };
     let theme = cx.theme();
-    let loading = store.diff_loading.contains(&sid);
+    let dir = store.selected_diff_dir();
+    let loading = dir.as_ref().is_some_and(|d| store.diff_loading.contains(d));
     let refresh_controller = controller.clone();
-    let refresh_sid = sid.clone();
+    let refresh_sid = sid;
     let mut col = v_flex().w_full().gap_3().child(
         h_flex()
             .gap_2()
@@ -53,10 +53,15 @@ pub fn render_changes(
             ),
     );
     let sid = store.selected.as_ref().unwrap();
-    if let Some(error) = store.diff_errors.get(sid) {
+    let Some(diff_dir) = dir else {
+        return col.into_any_element();
+    };
+    if let Some(error) = store.diff_errors.get(&diff_dir) {
         col = col.child(div().text_color(theme.danger).child(error.clone()));
     }
-    if let Some(files) = store.diffs.get(sid) {
+    // Same shape as `Controller::viewed_key`, built once instead of per file.
+    let viewed_prefix = format!("{}\nWorking tree:\n", diff_dir.display());
+    if let Some(files) = store.diffs.get(&diff_dir) {
         if files.is_empty() && !loading {
             col = col.child(
                 div()
@@ -83,14 +88,13 @@ pub fn render_changes(
             );
         }
         for (i, file) in files.iter().enumerate() {
-            let key = controller.read(cx).viewed_key(sid, &file.file, cx);
-            let viewed =
-                store.preferences.viewed.get(&key) == Some(&patch_fingerprint(&file.patch));
+            let key = format!("{viewed_prefix}{}", file.file);
+            let viewed = store.preferences.viewed.get(&key) == Some(&file.fingerprint);
             let collapsed = hooks.collapsed.contains(&file.file) || viewed;
             let mark_c = controller.clone();
             let mark_sid = sid.clone();
             let mark_file = file.file.clone();
-            let patch = file.patch.clone();
+            let fingerprint = file.fingerprint;
             let open_c = controller.clone();
             let open_file = file.file.clone();
             let toggle = hooks.toggle.clone();
@@ -170,7 +174,7 @@ pub fn render_changes(
                                             c.mark_viewed(
                                                 mark_sid.clone(),
                                                 mark_file.clone(),
-                                                patch.clone(),
+                                                fingerprint,
                                                 cx,
                                             )
                                         })
@@ -384,8 +388,8 @@ type Prepared = std::rc::Rc<(Vec<PatchLine>, Option<SideHighlights>)>;
 thread_local! {
     /// Parsed and highlighted patches by (patch, language): rendering runs
     /// every frame, parsing and highlighting only when the patch changes.
-    static PREPARED: std::cell::RefCell<std::collections::HashMap<u64, Prepared>> =
-        Default::default();
+    static PREPARED: std::cell::RefCell<super::lru::Lru<Prepared>> =
+        std::cell::RefCell::new(super::lru::Lru::new(128));
 }
 
 fn prepare(patch: &str, language: Option<&str>) -> Prepared {
@@ -393,19 +397,13 @@ fn prepare(patch: &str, language: Option<&str>) -> Prepared {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (patch, language).hash(&mut h);
     let key = h.finish();
-    if let Some(hit) = PREPARED.with(|c| c.borrow().get(&key).cloned()) {
+    if let Some(hit) = PREPARED.with(|c| c.borrow_mut().get(key)) {
         return hit;
     }
     let parsed = parse_patch(patch);
     let colours = side_highlights(&parsed, language);
     let prepared: Prepared = std::rc::Rc::new((parsed, colours));
-    PREPARED.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.len() >= 128 {
-            c.clear();
-        }
-        c.insert(key, prepared.clone());
-    });
+    PREPARED.with(|c| c.borrow_mut().insert(key, prepared.clone()));
     prepared
 }
 

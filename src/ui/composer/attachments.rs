@@ -196,12 +196,42 @@ impl Composer {
         row.into_any_element()
     }
 }
+fn pastes_dir() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("ocdesk").join("attachments"))
+}
+/// Pasted files outlive their prompt (queued prompts and history replay
+/// read them), so they are pruned by age instead: once a month is plenty.
+const PASTE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+/// Delete paste folders older than [`PASTE_MAX_AGE`]. Blocking; run off the UI thread.
+pub fn prune_old_pastes() {
+    let Some(dir) = pastes_dir() else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > PASTE_MAX_AGE);
+        // Only our own `{:016x}` folders.
+        let ours = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit()));
+        if old && ours && std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "pruned old pasted attachments");
+    }
+}
 fn save_pasted_file(name: &str, bytes: &[u8]) -> anyhow::Result<PathBuf> {
     use std::io::Write as _;
-    let directory = dirs::data_dir()
-        .ok_or_else(|| anyhow::anyhow!("no app data directory"))?
-        .join("ocdesk")
-        .join("attachments");
+    let directory = pastes_dir().ok_or_else(|| anyhow::anyhow!("no app data directory"))?;
     std::fs::create_dir_all(&directory)?;
     #[cfg(unix)]
     {

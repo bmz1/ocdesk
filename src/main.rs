@@ -1,10 +1,12 @@
 mod agents;
 mod api;
+mod app_icon;
 mod controller;
 mod demo;
 mod files;
 mod github;
 mod notifications;
+mod opencode_config;
 mod settings;
 mod shell_env;
 mod sidecar;
@@ -86,6 +88,10 @@ fn main() -> Result<()> {
         ui::theme::install(cx);
         ui::theme::follow_reduced_motion(cx);
         cx.set_app_identity(ui::app_view::APP_ID, "ocdesk");
+        #[cfg(target_os = "macos")]
+        if let Err(e) = app_icon::set_dock_icon() {
+            tracing::warn!("could not set Dock icon: {e:#}");
+        }
         cx.on_app_quit(|_| {
             sidecar::kill_sidecar();
             async {}

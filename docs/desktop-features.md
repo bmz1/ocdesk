@@ -30,23 +30,33 @@ metadata, not base64 file bodies, in its conversation store.
 ## Permission modes
 
 The composer changes the selected session's rules using `PATCH /api/session/id`.
-A new thread receives its mode **before its first prompt**. Its composer choice
-applies to that draft; defaults and project overrides are edited in Settings.
+A new thread inherits OpenCode's configured permissions. An explicit composer
+choice applies to that draft **before its first prompt**, then resets for the
+next new thread. Global and project defaults live in `opencode.json(c)`.
 A server read confirms the displayed mode; unrelated rules display as Custom.
 
 | Mode | Session rules |
 | --- | --- |
-| Supervised (default) | Ask for actions; allow read/glob/grep |
+| Supervised | Ask for actions; allow read/glob/grep |
 | Auto-accept edits | Supervised plus allow edit |
 | Full access | Allow actions, subject to opencode's other restrictions |
 
 **Probed on 2.2.6:** permissions are ordered arrays of
 `{action, resource, effect}`, not v1 configuration maps. Saved project grants
 precede the session's ask rules. Therefore Supervised can still allow actions
-that have an existing saved grant. Settings displays this limitation and lists
-saved grants with explicit **Revoke now** controls. Revoking affects every thread
+that have an existing saved grant. Settings lists
+saved grants with explicit **Revoke** controls. Revoking affects every thread
 in that project. Changing mode does not answer an already-pending approval or
 cancel an executing tool.
+
+## Sending and stopping
+
+Sending a prompt shows **Sending…** immediately, including while a new session
+is being created. A spinner beside **Thinking…** or **Working…** stays below the
+latest message while OpenCode runs, and yields to approval/question cards.
+The composer offers a circular **Stop** button with a solid square on a muted
+background. **Stopping…** appears in the activity indicator and tooltip; duplicate
+interrupts are prevented until the turn stops or the request fails.
 
 ## Notifications and unread
 
@@ -66,21 +76,39 @@ needs testing on a Mac; Linux headless testing cannot verify OS delivery.
 
 ## Settings
 
-Open **Settings** in the sidebar or press Cmd/Ctrl+comma. Changes are staged until
-Save settings (except explicitly immediate saved-grant revocations).
+Open **Settings** in the sidebar or press Cmd/Ctrl+comma. General and keybinding
+changes are staged until **Save app settings**. Configuration files and saved
+approval revocations have their own explicit save/revoke actions.
 
 - Dark, light or system theme; theme changes apply immediately on save.
-- Model (`provider/model`), agent and permission defaults for new threads.
-  Project fields inherit global defaults when blank. Existing sessions keep
-  their own choices. An unchanged model retains its saved reasoning variant.
+- **OpenCode**: global/project JSONC editor for real `opencode.json` and
+  `opencode.jsonc` files, including `.opencode/` files. Existing formats are
+  listed separately; parent configuration is available read-only. New files are
+  created only with **Create configuration**. Comments, line endings and
+  formatting are retained. Syntax errors and external-write conflicts preserve
+  the draft. Save or discard before changing files or closing Settings.
+- **Reload OpenCode** applies configuration through `/api/location/reload` when
+  sessions are idle and no approvals/forms are pending. JSONC syntax is checked
+  before saving; OpenCode checks its configuration fields on reload. The selected
+  file can also be opened in the configured external editor.
 - Editor executable, default `code`; arguments are not parsed as shell commands.
-- Notification toggle and saved-project-grant management.
+- **MCP servers**: choose a project to list its configured servers (including
+  global config), active count, connection/authentication errors, and explicit
+  Connect/Disconnect controls. Refresh reads the real OpenCode status. Setup
+  instructions include local and remote examples under v2 `mcp.servers`, links
+  directly to global/project configuration, and the official authentication guide.
+- Notification toggle and saved-project-grant management across all added
+  projects. Saved approvals refresh after **Always allow** and reconnecting;
+  each project is queried explicitly, independently of the server's startup folder.
 - App keybindings, with validation, duplicate rejection, and empty values to
   unbind. Saving rebuilds app bindings while preserving component/input bindings.
   Focused inputs keep their editing shortcuts when they conflict with app keys.
 
 Existing settings files remain readable. Saves retain live window geometry,
 unread state and viewed-file marks even if those changed while Settings was open.
+Legacy ocdesk model/agent/permission defaults are ignored and no longer saved.
+New threads inherit OpenCode's defaults; composer choices are session/draft
+overrides and do not change the defaults for later threads.
 `OCDESK_THEME` remains a startup theme override; a subsequent Settings save can
 change the theme during the current run.
 

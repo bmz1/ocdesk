@@ -1,9 +1,59 @@
 use super::*;
-use crate::api::features::patch_fingerprint;
 use crate::settings::PermissionMode;
 use gpui_kit::App;
 
 impl Controller {
+    pub fn settings_mcp_servers(
+        &self,
+        directory: PathBuf,
+        change: Option<(String, bool)>,
+    ) -> Result<oneshot::Receiver<Result<Vec<crate::api::model::McpServer>>>> {
+        let api = self
+            .api
+            .clone()
+            .ok_or_else(|| anyhow!("OpenCode is not connected"))?;
+        let (tx, rx) = oneshot::channel();
+        self.rt.spawn(async move {
+            let result = async {
+                if let Some((name, connect)) = change {
+                    api.mcp_set_connected(&directory, &name, connect).await?;
+                }
+                api.mcp_servers(&directory).await
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+        Ok(rx)
+    }
+
+    pub fn reload_configuration(&self, cx: &App) -> Result<oneshot::Receiver<Result<()>>> {
+        let store = self.store.read(cx);
+        if !store.busy.is_empty()
+            || !store.submitting.is_empty()
+            || store.permissions.values().any(|r| !r.is_empty())
+            || store.forms.values().any(|r| !r.is_empty())
+        {
+            anyhow::bail!(
+                "Finish running turns and pending approvals before reloading configuration."
+            );
+        }
+        let api = self
+            .api
+            .clone()
+            .ok_or_else(|| anyhow!("OpenCode is not connected"))?;
+        let (tx, rx) = oneshot::channel();
+        self.rt.spawn(async move {
+            let _ = tx.send(api.reload_configuration().await);
+        });
+        Ok(rx)
+    }
+
+    pub fn configuration_changed(&mut self, cx: &mut Context<Self>) {
+        self.refresh_catalogs(cx);
+        if let Some(sid) = self.store.read(cx).selected.clone() {
+            self.refresh_session_mode(sid, cx);
+        }
+    }
     pub fn preferences(&self) -> Settings {
         self.settings.clone()
     }
@@ -14,49 +64,27 @@ impl Controller {
         // Only screen-editable fields: retain live window, read state and review marks.
         self.update_settings(cx, |s| {
             s.theme = prefs.theme;
-            s.permission_mode = prefs.permission_mode;
-            s.project_defaults = prefs.project_defaults;
             s.keybindings = prefs.keybindings;
             s.editor = prefs.editor;
             s.notifications = prefs.notifications;
-            s.draft_model = prefs.draft_model;
-            s.draft_agent = prefs.draft_agent;
         });
-        let folder = self.store.read(cx).target_folder();
-        if self.store.read(cx).selected.is_none() {
-            self.apply_draft_defaults(folder.as_deref(), cx);
-        }
     }
-    pub(super) fn apply_draft_defaults(
-        &mut self,
-        folder: Option<&std::path::Path>,
-        cx: &mut Context<Self>,
-    ) {
-        let p = folder.and_then(|f| self.settings.project_defaults.get(f));
-        let model = p
-            .and_then(|p| p.model.clone())
-            .or_else(|| self.settings.draft_model.clone());
-        let agent = p
-            .and_then(|p| p.agent.clone())
-            .or_else(|| self.settings.draft_agent.clone());
+    pub(super) fn reset_draft_choices(&mut self, cx: &mut Context<Self>) {
         self.store.update(cx, |s, cx| {
             s.draft_permission = None;
-            s.draft_model = model;
-            s.draft_agent = agent;
+            s.draft_model = None;
+            s.draft_agent = None;
             cx.notify();
         });
     }
     pub fn refresh_session_mode(&mut self, sid: String, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
-        let generation = self.generation;
         let version = *self.mode_requests.entry(sid.clone()).or_default();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(false),
             async move { api.session_mode(&sid).await.map(|m| (sid, m)) },
             move |this, res, cx| {
-                if this.generation != generation {
-                    return;
-                }
                 if let Ok((sid, m)) = res
                     && this.mode_requests.get(&sid) == Some(&version)
                 {
@@ -81,19 +109,16 @@ impl Controller {
         }
         let Some(api) = self.api(cx) else { return };
         *self.mode_requests.entry(sid.clone()).or_default() += 1;
-        let generation = self.generation;
         self.store.update(cx, |s, cx| {
             s.mode_sending.insert(sid.clone());
             cx.notify();
         });
         let id = sid.clone();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(false),
             async move { api.set_session_mode(&id, mode).await },
             move |this, res, cx| {
-                if this.generation != generation {
-                    return;
-                }
                 this.store.update(cx, |s, cx| {
                     s.mode_sending.remove(&sid);
                     if res.is_ok() {
@@ -107,7 +132,21 @@ impl Controller {
             },
         );
     }
+    pub fn inherit_draft_permissions(&mut self, cx: &mut Context<Self>) {
+        self.store.update(cx, |s, cx| {
+            s.draft_permission = None;
+            cx.notify();
+        });
+    }
+    /// Re-read the session's token and cost totals (one cheap request).
     pub fn refresh_usage(&mut self, sid: String, cx: &mut Context<Self>) {
+        self.fetch_usage(sid, false, cx);
+    }
+    /// Everything the usage dialog shows, including account limits.
+    pub fn refresh_usage_details(&mut self, sid: String, cx: &mut Context<Self>) {
+        self.fetch_usage(sid, true, cx);
+    }
+    fn fetch_usage(&mut self, sid: String, details: bool, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
         let Some(folder) = self
             .store
@@ -119,31 +158,47 @@ impl Controller {
         };
         // Coalesce stream bursts. A newer cumulative total invalidates the old REST response.
         if self.store.read(cx).usage_loading.contains(&sid) {
+            if details {
+                self.usage_details_pending.insert(sid);
+            }
             return;
         }
-        let generation = self.generation;
+        let details = details || self.usage_details_pending.remove(&sid);
+        // A loaded conversation already holds the per-model numbers.
+        let history = details && self.store.read(cx).usage_needs_history(&sid);
         let revision = *self.usage_revision.entry(sid.clone()).or_default();
         self.store.update(cx, |s, cx| {
             s.usage_loading.insert(sid.clone());
             s.usage_errors.remove(&sid);
-            cx.notify();
+            cx.emit(StoreEvent::UsageChanged {
+                session_id: sid.clone(),
+            });
         });
         let id = sid.clone();
-        self.run(
+        self.run_on(
             cx,
-            async move { api.usage_report(&id, &folder).await },
+            self.issued(false),
+            async move { api.usage_report(&id, &folder, details, history).await },
             move |this, res, cx| {
-                if this.generation != generation {
-                    return;
-                }
                 let changed = this.usage_revision.get(&sid) != Some(&revision);
                 this.store.update(cx, |s, cx| {
                     s.usage_loading.remove(&sid);
                     match res {
                         Ok(mut report) => {
-                            if changed && let Some(live) = s.usage.get(&sid) {
-                                report.tokens = live.tokens.clone();
-                                report.cost = live.cost;
+                            let old = s.usage.remove(&sid);
+                            if let Some(old) = &old
+                                && changed
+                            {
+                                report.tokens = old.tokens.clone();
+                                report.cost = old.cost;
+                            }
+                            // A summary keeps what the last details fetch found.
+                            if !details && let Some(old) = old {
+                                report = crate::api::features::UsageReport {
+                                    tokens: report.tokens,
+                                    cost: report.cost,
+                                    ..old
+                                };
                             }
                             s.usage.insert(sid.clone(), report);
                         }
@@ -151,10 +206,14 @@ impl Controller {
                             s.usage_errors.insert(sid.clone(), format!("{e:#}"));
                         }
                     }
-                    cx.notify();
+                    cx.emit(StoreEvent::UsageChanged {
+                        session_id: sid.clone(),
+                    });
                 });
-                if changed {
-                    this.refresh_usage(sid, cx);
+                // A newer live total (`changed`) already replaced the REST one
+                // above, so only a dialog request still needs another read.
+                if this.usage_details_pending.contains(&sid) {
+                    this.fetch_usage(sid, false, cx);
                 }
             },
         );
@@ -168,15 +227,28 @@ impl Controller {
         // Same shape as before the scope picker went away, so marks survive.
         format!("{dir}\nWorking tree:\n{file}")
     }
-    pub fn mark_viewed(
+    /// Drop "viewed" marks of files in `dir` that have no changes any more,
+    /// so the map doesn't grow with every file ever reviewed.
+    pub(super) fn prune_viewed(
         &mut self,
-        sid: String,
-        file: String,
-        patch: String,
+        dir: &std::path::Path,
+        files: &[crate::api::model::FileDiff],
         cx: &mut Context<Self>,
     ) {
+        let prefix = format!("{}\nWorking tree:\n", dir.display());
+        let stale = |key: &String| {
+            key.strip_prefix(&prefix)
+                .is_some_and(|file| !files.iter().any(|f| f.file == file))
+        };
+        if !self.settings.viewed.keys().any(stale) {
+            return;
+        }
+        self.update_settings(cx, |s| s.viewed.retain(|k, _| !stale(k)));
+        self.store
+            .update(cx, |_, cx| cx.emit(StoreEvent::ViewedChanged));
+    }
+    pub fn mark_viewed(&mut self, sid: String, file: String, hash: u64, cx: &mut Context<Self>) {
         let key = self.viewed_key(&sid, &file, cx);
-        let hash = patch_fingerprint(&patch);
         self.update_settings(cx, |s| {
             if s.viewed.get(&key) == Some(&hash) {
                 s.viewed.remove(&key);
@@ -184,6 +256,8 @@ impl Controller {
                 s.viewed.insert(key, hash);
             }
         });
+        self.store
+            .update(cx, |_, cx| cx.emit(StoreEvent::ViewedChanged));
     }
     pub fn open_file(&mut self, file: String, cx: &mut Context<Self>) {
         let Some(dir) = self.store.read(cx).target_folder() else {
@@ -286,12 +360,11 @@ impl Controller {
     }
     pub(super) fn product_event(&mut self, env: &Envelope, cx: &mut Context<Self>) {
         if let Event::SessionRemoved { session_id } = &env.event {
-            self.store.update(cx, |s, cx| {
-                s.unread.remove(session_id);
-                s.usage.remove(session_id);
-                s.session_modes.remove(session_id);
-                cx.notify();
-            });
+            // The store forgets its own state when it applies the event.
+            self.mode_requests.remove(session_id);
+            self.usage_revision.remove(session_id);
+            self.usage_details_pending.remove(session_id);
+            self.fetched_epoch.remove(session_id);
             self.update_settings(cx, |s| {
                 s.unread.remove(session_id);
             });
@@ -309,7 +382,11 @@ impl Controller {
                 let r = s.usage.entry(session_id.clone()).or_default();
                 r.tokens = crate::api::features::Tokens::parse(tokens);
                 r.cost = *cost;
-                cx.notify();
+                // Per step: an event (header meter, usage dialog), not a
+                // store-wide redraw.
+                cx.emit(StoreEvent::UsageChanged {
+                    session_id: session_id.clone(),
+                });
             });
         }
         let Some(attention) = crate::notifications::attention(&env.event, self.store.read(cx))
@@ -317,6 +394,10 @@ impl Controller {
             return;
         };
         let key = format!("{}:{:?}", attention.key, env.seq);
+        // Dedupes replays after a reconnect; recent keys are all that matter.
+        if self.attention_seen.len() > 4096 {
+            self.attention_seen.clear();
+        }
         if (env.seq.is_some()
             || matches!(&env.event, Event::PermissionAsked(_) | Event::FormAsked(_)))
             && !self.attention_seen.insert(key)
@@ -349,6 +430,7 @@ impl Controller {
     }
     pub fn refresh_saved_grants(&mut self, cx: &mut Context<Self>) {
         let Some(api) = self.api(cx) else { return };
+        let folders = self.store.read(cx).folders.clone();
         let generation = self.generation;
         self.grant_requests += 1;
         let request = self.grant_requests;
@@ -359,7 +441,7 @@ impl Controller {
         });
         self.run(
             cx,
-            async move { api.saved_grants().await },
+            async move { api.saved_grants(&folders).await },
             move |this, res, cx| {
                 if this.generation != generation || this.grant_requests != request {
                     return;
@@ -380,7 +462,6 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        let generation = self.generation;
         self.grant_requests += 1;
         self.store.update(cx, |s, cx| {
             s.saved_grants_loading = false;
@@ -388,13 +469,11 @@ impl Controller {
             cx.notify();
         });
         let target = id.clone();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(false),
             async move { api.revoke_grant(&target).await },
             move |this, res, cx| {
-                if this.generation != generation {
-                    return;
-                }
                 this.grant_requests += 1;
                 this.store.update(cx, |s, cx| {
                     s.grant_sending.remove(&id);
@@ -433,12 +512,7 @@ impl Controller {
         let store = self.store.read(cx);
         match &store.selected {
             Some(sid) => store.session_modes.get(sid).copied().flatten(),
-            None => Some(store.draft_permission.unwrap_or_else(|| {
-                store
-                    .target_folder()
-                    .map(|f| self.settings.permission_for(&f))
-                    .unwrap_or_default()
-            })),
+            None => store.draft_permission,
         }
     }
 
