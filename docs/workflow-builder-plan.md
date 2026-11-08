@@ -5,13 +5,18 @@ _Status: proposal, 2026-11-08. Nothing implemented._
 ## Idea
 
 A workflow is a **saved list of steps**, like a skill that runs agents one
-after another. A step can hold several agents that run in parallel. Each step
-gets the previous step's output. Under the hood every agent call is
+after another. Each step gets the previous step's output. Branching out is
+done the opencode way: a step's agent hands work to **subagents**, opencode
+runs them in parallel, and their results come back to that agent, which
+synthesizes them. Under the hood every agent call is
 **opencode run headless**; the tab is just a visual way to build, run and
 watch the list.
 
 ```
-[ architect ] → [ swe ] → [ security | review | qa ] → [ synthesizer ]
+[ architect ] → [ swe ] → [ synthesizer ]
+                               ├─ security ┐
+                               ├─ review   ├─ subagents, in parallel,
+                               └─ qa       ┘  results back to synthesizer
 ```
 
 No graph engine, no conditions, no loops, no worktrees in v1.
@@ -58,17 +63,17 @@ next to the agents it uses:
 {
   "name": "feature",
   "steps": [
-    [{"agent": "architect"}],
-    [{"agent": "swe"}],
-    [{"agent": "security"}, {"agent": "review", "command": "review"}, {"agent": "qa"}],
-    [{"agent": "synthesizer"}]
+    {"agent": "architect"},
+    {"agent": "swe"},
+    {"agent": "synthesizer", "subagents": ["security", "review", "qa"]}
   ]
 }
 ```
 
-- `steps` is a list of lists: the outer list runs in order, and the agents in
-  an inner list run at the same time.
-- Per agent, everything is optional except `agent`:
+- `steps` run in order, one after another.
+- Per step, everything is optional except `agent`:
+  - `subagents`: agents this step fans out to (they must be `mode: subagent`
+    or `all` in their agent file);
   - `prompt`: extra text for this step only (`{{task}}` = what you typed at
     run start);
   - `command`: use a command template as the prompt;
@@ -79,14 +84,24 @@ next to the agents it uses:
 
 For each step, in order:
 
-1. Build the message for each agent: the task (or the step's
-   prompt/command), plus the previous step's outputs under `## <agent>`
-   headings.
-2. Run every agent in the step headless, all at once, in the workflow's folder.
-3. Wait for all of them, keep each one's final text, and move on.
+1. Build the message: the task (or the step's prompt/command), plus the
+   previous step's output.
+2. If the step has `subagents`, attach them to the prompt (opencode's
+   `agents` attachment, the same thing an `@security` mention does) and add
+   one line: "Delegate to each of these subagents in parallel, then combine
+   their results." The step's agent calls opencode's `subagent` tool for each;
+   opencode runs them as child sessions and returns their results to it.
+3. Run the step headless in the workflow's folder and wait for it to finish.
+   Its final reply is the step's output.
 
-If an agent fails, the run stops and shows the error. Stop kills whatever is
-running.
+ocdesk does no parallel scheduling of its own: parallelism, the child
+sessions and handing results back are all opencode's subagent mechanism.
+The catch is that the agent decides how to call them; the agent file
+(e.g. `synthesizer.md`) should say "always use your subagents", and the run
+view shows which ones actually ran, so a skipped subagent is visible.
+
+If a step fails, the run stops and shows the error. Stop interrupts the
+running step, which also stops its subagents.
 
 **Headless call.** `opencode run` with the agent, optional model or command,
 and the message. Check its flags on the pinned 2.2.6 first. If it doesn't
@@ -96,21 +111,26 @@ command), read the last reply. To the user it's identical, and the sidecar
 also gives each agent a session to open in the chat view, with its approval
 prompts.
 
-**Outputs** are saved in `.ocdesk/runs/<run>/<step>-<agent>.md`.
+**Outputs** are saved in `.ocdesk/runs/<run>/<step>-<agent>.md`; subagent
+results are part of the step's session (child sessions with `parentID`).
 
 ## The tab
 
 - **Workflows tab:** lists the folder's workflows; *New*, *Edit*, *Run*.
-- **Editor:** the steps as a row of cards with arrows between them, parallel
-  agents stacked inside one step. A card is an agent picker (from opencode's
-  list, showing its description and model), an optional command picker, an
-  optional model override and an optional extra prompt. Buttons: add step,
-  add parallel agent, delete, move left/right. Save writes the JSON.
+- **Editor:** the steps as a row of cards with arrows between them. A card
+  is an agent picker (from opencode's list, showing its description and
+  model), a subagent multi-picker (only `subagent`/`all` agents), an optional
+  command picker, an optional model override and an optional extra prompt.
+  Subagents show as small chips branching off the card. Buttons: add step,
+  delete, move left/right. Save writes the JSON.
 - **Agents:** *Open agent file* on a card opens its `.md` in the editor;
   *New agent* writes a starter `.opencode/agent/<name>.md`. opencode reloads
   agents on its own (`agent.updated`, which ocdesk already listens for).
 - **Run:** type the task, press Run. The same row of cards, each showing
-  waiting / running / done / failed. Click a card to read its output. Run
+  waiting / running / done / failed, and its subagent chips light up as
+  their child sessions start and finish (`session.created` with `parentID`,
+  already tracked for the Tasks panel). Click a card or chip to open that
+  session. Run
   history lists past runs with *Run again*.
 
 ## Phases
@@ -124,5 +144,5 @@ prompts.
 ## Later, only if needed
 
 - Loops ("synthesizer says fix → back to SWE, max 2 times").
-- Worktrees when two agents in one step both edit files.
+- Worktrees when two subagents in one step both edit files.
 - A free canvas instead of the row of cards.
