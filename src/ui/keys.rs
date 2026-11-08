@@ -242,7 +242,41 @@ pub fn apply(
     cx.clear_key_bindings();
     cx.bind_keys(retained);
     cx.bind_keys(bindings);
+    cx.bind_keys(terminal_passthrough());
     Ok(())
+}
+/// Key context of the focused terminal.
+pub const TERMINAL_CONTEXT: &str = "Terminal";
+
+/// Keys the shell needs (Tab completion, Ctrl+letter, Alt+arrows): inside the
+/// terminal they bind to `NoAction`, which masks app shortcuts and focus
+/// navigation so the key reaches the terminal's own key handler. Ctrl+Shift,
+/// Cmd, F-keys, Ctrl+Tab and Ctrl+` shortcuts still work there.
+fn terminal_passthrough() -> Vec<KeyBinding> {
+    let mut keys: Vec<String> = ["tab", "shift-tab", "escape", "enter"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    keys.extend(('a'..='z').map(|c| format!("ctrl-{c}")));
+    keys.extend(('a'..='z').map(|c| format!("alt-{c}")));
+    for k in [
+        "/", ".", ",", "[", "]", "\\", "space", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+    ] {
+        keys.push(format!("ctrl-{k}"));
+    }
+    for k in ["up", "down", "left", "right", "backspace"] {
+        keys.push(format!("alt-{k}"));
+    }
+    // `KeyBinding::new` wants `'static` strings; build them once.
+    static KEYS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        keys.into_iter()
+            .map(|k| &*Box::leak(k.into_boxed_str()))
+            .collect()
+    })
+    .iter()
+    .map(|k| KeyBinding::new(k, NoAction {}, Some(TERMINAL_CONTEXT)))
+    .collect()
 }
 pub fn bind(cx: &mut App) {
     let prefs = crate::settings::Settings::load();

@@ -95,14 +95,24 @@ impl Api {
     }
 
     /// Start the user's shell in the session's directory.
-    pub async fn create_terminal(&self, session_id: &str, cols: u16, rows: u16) -> Result<PtyInfo> {
+    pub async fn create_terminal(
+        &self,
+        session_id: &str,
+        cwd: Option<&std::path::Path>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<PtyInfo> {
         let path = format!("/api/experimental/session/{}/terminal", id(session_id));
-        let body = json!({
+        let mut body = json!({
             "args": [],
             "title": "Terminal",
             "env": {},
             "size": { "cols": cols, "rows": rows },
         });
+        // The server's own cwd can be `/` when ocdesk is started from a launcher.
+        if let Some(cwd) = cwd {
+            body["cwd"] = json!(cwd.to_string_lossy());
+        }
         let v = self.send(self.req(Method::POST, &path).json(&body)).await?;
         PtyInfo::from_json(&v["data"]).ok_or_else(|| anyhow!("unexpected terminal response: {v}"))
     }

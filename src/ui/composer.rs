@@ -15,11 +15,13 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{
     Enter, Escape, IndentInline, InlineToken, InputEvent, MoveDown, MoveLeft, MoveRight, MoveUp,
     Textarea, TextareaState, ToggleCodeActions,
 };
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
 };
@@ -145,6 +147,9 @@ pub struct Composer {
     placeholder_busy: bool,
     /// The next paste goes in as text, however large (Cmd/Ctrl+Shift+V).
     paste_inline: bool,
+    /// Search state of the model picker popover, and whether it is open.
+    model_search: Entity<CommandState>,
+    model_open: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -164,6 +169,7 @@ impl Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let model_search = cx.new(|cx| CommandState::new(window, cx));
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder(PLACEHOLDER_IDLE)
@@ -213,6 +219,8 @@ impl Composer {
             esc_armed: None,
             placeholder_busy: false,
             paste_inline: false,
+            model_search,
+            model_open: false,
             _subs: subs,
         }
     }
@@ -1035,35 +1043,85 @@ impl Composer {
                 }
             }
             models.sort_by_key(|m| providers.iter().position(|p| *p == m.provider_id));
+            // One group per provider; `picks[section][row]` is the model.
+            let mut groups: Vec<CommandGroup> = Vec::new();
+            let mut picks: Vec<Vec<ModelRef>> = Vec::new();
+            for provider in &providers {
+                let mut group = CommandGroup::new().label(provider.clone());
+                let mut refs = Vec::new();
+                for m in models.iter().filter(|m| &m.provider_id == provider) {
+                    let r = m.as_ref();
+                    let checked = model.as_ref().is_some_and(|cur| cur.same_model(&r));
+                    group = group.item(
+                        CommandItem::new()
+                            .label(m.name.clone())
+                            .keywords([m.id.clone(), m.provider_id.clone()])
+                            .checked(checked),
+                    );
+                    refs.push(r);
+                }
+                groups.push(group);
+                picks.push(refs);
+            }
+            let groups = std::rc::Rc::new(groups);
+            let picks = std::rc::Rc::new(picks);
+            let search = self.model_search.clone();
+            let weak = cx.weak_entity();
+            let close = {
+                let weak = weak.clone();
+                move |cx: &mut App| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.model_open = false;
+                        cx.notify();
+                    });
+                }
+            };
             let c = controller.clone();
-            let current = model.clone();
             row = row.child(
-                crate::ui::kit::quiet_select("model-picker", label)
-                    .tooltip("Model")
-                    .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
-                        menu = menu.scrollable(true).max_h(px(360.)).min_w(px(220.));
-                        let mut provider: Option<&str> = None;
-                        for m in &models {
-                            if provider != Some(m.provider_id.as_str()) {
-                                if provider.is_some() {
-                                    menu = menu.separator();
-                                }
-                                menu = menu.label(m.provider_id.clone());
-                                provider = Some(&m.provider_id);
+                Popover::new("model-picker-popover")
+                    .anchor(Anchor::BottomLeft)
+                    .open(self.model_open)
+                    .on_open_change({
+                        let weak = weak.clone();
+                        let search = search.clone();
+                        move |open, window, cx| {
+                            let open = *open;
+                            let _ = weak.update(cx, |this, cx| {
+                                this.model_open = open;
+                                cx.notify();
+                            });
+                            if open {
+                                search.update(cx, |s, cx| {
+                                    s.set_query("", window, cx);
+                                    s.focus(window, cx);
+                                });
                             }
-                            let r = m.as_ref();
-                            let checked = current.as_ref().is_some_and(|cur| cur.same_model(&r));
-                            let c = c.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(m.name.clone())
-                                    .checked(checked)
-                                    .on_click(move |_, _, cx| {
-                                        let r = r.clone();
-                                        c.update(cx, |c, cx| c.choose_model(r, cx));
-                                    }),
-                            );
                         }
-                        menu
+                    })
+                    .trigger(crate::ui::kit::quiet_select("model-picker", label).tooltip("Model"))
+                    .p_0()
+                    .w(px(320.))
+                    .content(move |_, _, _| {
+                        let picks = picks.clone();
+                        let c = c.clone();
+                        let close_confirm = close.clone();
+                        let close_cancel = close.clone();
+                        let mut command = Command::new(&search)
+                            .placeholder("Search models…")
+                            .max_h(px(380.))
+                            .bordered(false);
+                        for g in groups.iter() {
+                            command = command.group(g.clone());
+                        }
+                        command
+                            .on_confirm(move |ix, _, cx| {
+                                if let Some(r) = picks.get(ix.section).and_then(|g| g.get(ix.row)) {
+                                    let r = r.clone();
+                                    c.update(cx, |c, cx| c.choose_model(r, cx));
+                                }
+                                close_confirm(cx);
+                            })
+                            .on_cancel(move |_, cx| close_cancel(cx))
                     }),
             );
 

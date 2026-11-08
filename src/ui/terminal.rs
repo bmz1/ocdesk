@@ -52,6 +52,13 @@ struct Session {
     _io: Option<Task<()>>,
 }
 
+/// A run of cells drawn at a fixed grid column.
+struct Segment {
+    col: usize,
+    text: String,
+    runs: Vec<TextRun>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Status {
     Connecting,
@@ -134,11 +141,20 @@ impl TerminalView {
         let (cols, rows) = (self.cols, self.rows);
         let attachment = format!("ocdesk-{:x}", rand::random::<u64>());
         let session = sid.clone();
+        let cwd = self
+            .store
+            .read(cx)
+            .session(&sid)
+            .map(|s| s.directory.clone())
+            .filter(|d| !d.as_os_str().is_empty());
         let opened = rt.spawn(async move {
             let existing = api.session_terminals(&session).await?;
             let info = match existing.into_iter().find(|p| p.exit_code.is_none()) {
                 Some(p) => p,
-                None => api.create_terminal(&session, cols, rows).await?,
+                None => {
+                    api.create_terminal(&session, cwd.as_deref(), cols, rows)
+                        .await?
+                }
             };
             let (info, checkpoint) = api.pty_snapshot(&info.id).await?;
             let (tx, rx) = api.connect_pty(&info.id, info.tail, &attachment).await?;
@@ -493,6 +509,9 @@ impl Render for TerminalView {
         self.ensure(cx);
         let font = Font {
             family: theme.mono_font_family.clone(),
+            fallbacks: Some(FontFallbacks::from_fonts(vec![
+                crate::ui::theme::SYMBOLS_FONT.to_string(),
+            ])),
             ..Font::default()
         };
         let font_size = px(FONT_SIZE);
@@ -516,28 +535,38 @@ impl Render for TerminalView {
             let show_cursor = content.display_offset == 0
                 && matches!(s.status, Status::Live)
                 && self.focus.is_focused(window);
-            let mut row_text = String::new();
-            let mut runs: Vec<TextRun> = Vec::new();
+            // Each line is a set of segments pinned to their grid column, so
+            // glyphs from fallback fonts (Nerd Font icons, emoji, bold faces
+            // with other metrics) can't shift the rest of the row. ASCII in
+            // the mono font stays in long runs; anything else gets its own.
+            let mut segs: Vec<Segment> = Vec::new();
             let mut current_line = None;
-            let flush =
-                |text: &mut String, runs: &mut Vec<TextRun>, lines: &mut Vec<AnyElement>| {
-                    let t = std::mem::take(text);
-                    let r = std::mem::take(runs);
-                    lines.push(
-                        div()
-                            .h(cell.height)
-                            .whitespace_nowrap()
-                            .child(StyledText::new(t).with_runs(r))
-                            .into_any_element(),
-                    );
-                };
+            let mut prev_wide = false;
+            let flush_line = |segs: &mut Vec<Segment>, lines: &mut Vec<AnyElement>| {
+                let segs = std::mem::take(segs);
+                lines.push(
+                    div()
+                        .relative()
+                        .h(cell.height)
+                        .children(segs.into_iter().map(|seg| {
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left(cell.width * seg.col as f32)
+                                .whitespace_nowrap()
+                                .child(StyledText::new(seg.text).with_runs(seg.runs))
+                        }))
+                        .into_any_element(),
+                );
+            };
             for indexed_cell in content.display_iter {
                 let line = indexed_cell.point.line;
                 if current_line != Some(line) {
                     if current_line.is_some() {
-                        flush(&mut row_text, &mut runs, &mut lines);
+                        flush_line(&mut segs, &mut lines);
                     }
                     current_line = Some(line);
+                    prev_wide = false;
                 }
                 let c = &indexed_cell.cell;
                 if c.flags.contains(Flags::WIDE_CHAR_SPACER) {
@@ -550,7 +579,6 @@ impl Render for TerminalView {
                 }
                 let at_cursor = show_cursor && indexed_cell.point == cursor;
                 if at_cursor {
-                    std::mem::swap(&mut cfg, &mut cbg);
                     cbg = theme.foreground;
                     cfg = theme.background;
                 }
@@ -559,7 +587,6 @@ impl Render for TerminalView {
                 }
                 let ch = if c.c == '\0' { ' ' } else { c.c };
                 let len = ch.len_utf8();
-                row_text.push(ch);
                 let mut f = font.clone();
                 if c.flags.contains(Flags::BOLD) {
                     f.weight = FontWeight::BOLD;
@@ -579,7 +606,22 @@ impl Render for TerminalView {
                     }),
                     strikethrough: None,
                 };
-                match runs.last_mut() {
+                let col = indexed_cell.point.column.0;
+                // Plain ASCII with the regular face keeps its run; anything else
+                // starts a segment at its own column.
+                let plain = ch.is_ascii() && !c.flags.intersects(Flags::BOLD | Flags::ITALIC);
+                let start_new = !plain || prev_wide || segs.is_empty();
+                prev_wide = !plain;
+                if start_new {
+                    segs.push(Segment {
+                        col,
+                        text: String::new(),
+                        runs: Vec::new(),
+                    });
+                }
+                let seg = segs.last_mut().expect("segment");
+                seg.text.push(ch);
+                match seg.runs.last_mut() {
                     Some(last)
                         if last.font == run.font
                             && last.color == run.color
@@ -588,11 +630,11 @@ impl Render for TerminalView {
                     {
                         last.len += len
                     }
-                    _ => runs.push(run),
+                    _ => seg.runs.push(run),
                 }
             }
             if current_line.is_some() {
-                flush(&mut row_text, &mut runs, &mut lines);
+                flush_line(&mut segs, &mut lines);
             }
         }
         let view = cx.entity().downgrade();
@@ -655,6 +697,7 @@ impl Render for TerminalView {
             .child(
                 div()
                     .id("terminal")
+                    .key_context(crate::ui::keys::TERMINAL_CONTEXT)
                     .track_focus(&self.focus)
                     .relative()
                     .flex_1()
