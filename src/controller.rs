@@ -21,8 +21,9 @@ use gpui_kit::{Context, Entity, Task};
 
 use crate::api::model::{FsEntry, ModelRef, PermissionDecision, PromptInput};
 use crate::api::{Api, Envelope, Event, HttpError};
+use crate::domain::choice::{ChoiceToken, OptimisticChoices};
 use crate::domain::requests::{
-    ConnectionEpoch, Issued, RequestClock, RequestScope, ServerGeneration,
+    ConnectionEpoch, Issued, RequestClock, RequestScope, Revisions, ServerGeneration,
 };
 use crate::settings::Settings;
 use crate::sidecar::{self, SidecarConfig};
@@ -96,16 +97,21 @@ pub struct Controller {
     requests: RequestClock,
     grant_requests: u64,
     submission_seq: u64,
-    mode_requests: std::collections::HashMap<String, u64>,
-    usage_revision: std::collections::HashMap<String, u64>,
+    /// Bumped per permission-mode change, so an older mode read is dropped.
+    mode_requests: Revisions<String>,
+    /// Bumped per live usage total, so an older REST total is not shown.
+    usage_revision: Revisions<String>,
+    /// Outstanding optimistic model/agent choices per session.
+    model_choices: OptimisticChoices<ModelRef>,
+    agent_choices: OptimisticChoices<String>,
     /// Connection epoch in which each session's event-maintained state
     /// (history, approvals, inbox, tasks) was last fetched.
     fetched_epoch: std::collections::HashMap<String, ConnectionEpoch>,
     /// The usage dialog asked for details while a summary was in flight.
     usage_details_pending: std::collections::HashSet<String>,
     attention_seen: std::collections::HashSet<String>,
-    diff_requests: std::collections::HashMap<PathBuf, u64>,
-    task_requests: std::collections::HashMap<PathBuf, u64>,
+    diff_requests: Revisions<PathBuf>,
+    task_requests: Revisions<PathBuf>,
     pump: Option<(tokio::task::AbortHandle, Task<()>)>,
     exit_watch: Option<Task<()>>,
     recent_crashes: Vec<Instant>,
@@ -158,6 +164,8 @@ impl Controller {
             diff_requests: Default::default(),
             task_requests: Default::default(),
             mode_requests: Default::default(),
+            model_choices: Default::default(),
+            agent_choices: Default::default(),
             grant_requests: 0,
             submission_seq: 0,
             usage_revision: Default::default(),
@@ -338,6 +346,9 @@ impl Controller {
     fn start_sidecar(&mut self, cx: &mut Context<Self>) {
         self.requests.restart();
         self.fetched_epoch.clear();
+        // Their completions are discarded with the old generation.
+        self.model_choices.clear();
+        self.agent_choices.clear();
         let generation = self.requests.generation();
         self.api = None;
         self.store.update(cx, |s, cx| {
@@ -894,9 +905,7 @@ impl Controller {
         else {
             return;
         };
-        let request = self.task_requests.entry(dir.clone()).or_default();
-        *request += 1;
-        let request = *request;
+        let request = self.task_requests.bump(dir.clone());
         let issued = self.issued(RequestScope::Connection);
         let revision = self.store.read(cx).tasks_revision;
         let target = sid.clone();
@@ -908,7 +917,7 @@ impl Controller {
                 Ok((kids?, shells?))
             },
             move |this, res, cx| {
-                if !this.is_current(issued) || this.task_requests.get(&folder) != Some(&request) {
+                if !this.is_current(issued) || !this.task_requests.is_current(&folder, request) {
                     return;
                 }
                 if this.store.read(cx).tasks_revision != revision {
@@ -1046,22 +1055,24 @@ impl Controller {
         }
         let Some(api) = self.api(cx) else { return };
         self.store.update(cx, |s, cx| {
-            s.set_draft_choice(None, Some("build".into()), cx);
-            s.apply(
-                Envelope::bare(Event::AgentSelected {
-                    session_id: sid.clone(),
-                    agent: "build".into(),
-                }),
-                cx,
-            )
+            s.set_draft_choice(None, Some("build".into()), cx)
         });
+        let token = self.show_agent(&sid, "build", cx);
+        let target = sid.clone();
         // The prompt must run with the new agent, so it waits for the switch.
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move { api.switch_agent(&sid, "build").await },
-            move |this, res, cx| match res {
-                Ok(()) => this.send_prompt(prompt, cx),
-                Err(e) => this.notice(format!("Could not switch to the build agent: {e:#}"), cx),
+            move |this, res, cx| {
+                let failed = res.is_err();
+                this.settle_agent(target, token, "build".into(), failed, cx);
+                match res {
+                    Ok(()) => this.send_prompt(prompt, cx),
+                    Err(e) => {
+                        this.notice(format!("Could not switch to the build agent: {e:#}"), cx)
+                    }
+                }
             },
         );
     }
@@ -1095,39 +1106,17 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        let previous = self
-            .store
-            .read(cx)
-            .session(&sid)
-            .and_then(|s| s.model.clone());
-        // Optimistic; the stream confirms with session.model.selected.
-        self.store.update(cx, |s, cx| {
-            s.apply(
-                Envelope::bare(Event::ModelSelected {
-                    session_id: sid.clone(),
-                    model: model.clone(),
-                }),
-                cx,
-            )
-        });
+        let token = self.show_model(&sid, &model, cx);
         let target = sid.clone();
-        self.run(
+        let chosen = model.clone();
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move { api.switch_model(&sid, &model).await },
             move |this, res, cx| {
-                let Err(e) = res else { return };
-                this.notice(format!("Could not switch model: {e:#}"), cx);
-                // Roll back the optimistic choice.
-                if let Some(prev) = previous {
-                    this.store.update(cx, |s, cx| {
-                        s.apply(
-                            Envelope::bare(Event::ModelSelected {
-                                session_id: target,
-                                model: prev,
-                            }),
-                            cx,
-                        )
-                    });
+                this.settle_model(target, token, chosen, res.is_err(), cx);
+                if let Err(e) = res {
+                    this.notice(format!("Could not switch model: {e:#}"), cx);
                 }
             },
         );
@@ -1144,24 +1133,109 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        self.store.update(cx, |s, cx| {
-            s.apply(
-                Envelope::bare(Event::AgentSelected {
-                    session_id: sid.clone(),
-                    agent: agent.clone(),
-                }),
-                cx,
-            )
-        });
-        self.run(
+        let token = self.show_agent(&sid, &agent, cx);
+        let target = sid.clone();
+        let chosen = agent.clone();
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move { api.switch_agent(&sid, &agent).await },
-            |this, res, cx| {
+            move |this, res, cx| {
+                this.settle_agent(target, token, chosen, res.is_err(), cx);
                 if let Err(e) = res {
                     this.notice(format!("Could not switch agent: {e:#}"), cx);
                 }
             },
         );
+    }
+
+    // Optimistic choices: shown at once, confirmed by the stream
+    // (session.model.selected / session.agent.selected). See domain::choice
+    // for what a late or failed completion may still change.
+
+    fn show_model(&mut self, sid: &str, model: &ModelRef, cx: &mut Context<Self>) -> ChoiceToken {
+        let shown = self
+            .store
+            .read(cx)
+            .session(sid)
+            .and_then(|s| s.model.clone());
+        let token = self.model_choices.choose(sid, shown);
+        self.show_selection(
+            Event::ModelSelected {
+                session_id: sid.to_owned(),
+                model: model.clone(),
+            },
+            cx,
+        );
+        token
+    }
+
+    fn settle_model(
+        &mut self,
+        sid: String,
+        token: ChoiceToken,
+        model: ModelRef,
+        failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !failed {
+            self.model_choices.succeeded(&sid, token, model);
+        } else if let Some(model) = self.model_choices.failed(&sid, token) {
+            tracing::debug!(session_id = %sid, "rolling back failed model choice");
+            self.show_selection(
+                Event::ModelSelected {
+                    session_id: sid,
+                    model,
+                },
+                cx,
+            );
+        }
+    }
+
+    fn show_agent(&mut self, sid: &str, agent: &str, cx: &mut Context<Self>) -> ChoiceToken {
+        let shown = self
+            .store
+            .read(cx)
+            .session(sid)
+            .and_then(|s| s.agent.clone());
+        let token = self.agent_choices.choose(sid, shown);
+        self.show_selection(
+            Event::AgentSelected {
+                session_id: sid.to_owned(),
+                agent: agent.to_owned(),
+            },
+            cx,
+        );
+        token
+    }
+
+    fn settle_agent(
+        &mut self,
+        sid: String,
+        token: ChoiceToken,
+        agent: String,
+        failed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !failed {
+            self.agent_choices.succeeded(&sid, token, agent);
+        } else if let Some(agent) = self.agent_choices.failed(&sid, token) {
+            tracing::debug!(session_id = %sid, "rolling back failed agent choice");
+            self.show_selection(
+                Event::AgentSelected {
+                    session_id: sid,
+                    agent,
+                },
+                cx,
+            );
+        }
+    }
+
+    /// Apply a locally decided selection; it bypasses [`Self::on_event`], so
+    /// the optimistic trackers don't mistake it for a server report.
+    fn show_selection(&mut self, event: Event, cx: &mut Context<Self>) {
+        self.store
+            .update(cx, |s, cx| s.apply(Envelope::bare(event), cx));
     }
 
     /// Fuzzy file search for `@` mentions. `None` when opencode isn't running.
@@ -1729,9 +1803,7 @@ impl Controller {
         }
         let Some(api) = self.api(cx) else { return };
         let generation = self.requests.generation();
-        let request = self.diff_requests.entry(dir.clone()).or_default();
-        *request += 1;
-        let request = *request;
+        let request = self.diff_requests.bump(dir.clone());
         self.store.update(cx, |s, cx| s.begin_diff(dir.clone(), cx));
         let d = dir.clone();
         self.run(
@@ -1739,7 +1811,7 @@ impl Controller {
             async move { api.working_diff(&d).await },
             move |this, res, cx| {
                 if this.requests.generation() != generation
-                    || this.diff_requests.get(&dir) != Some(&request)
+                    || !this.diff_requests.is_current(&dir, request)
                 {
                     return;
                 }
@@ -1908,8 +1980,8 @@ impl Controller {
             s.forget_folder(&folder);
             s.set_folders(folders, cx);
         });
-        self.diff_requests.remove(&folder);
-        self.task_requests.remove(&folder);
+        self.diff_requests.forget(&folder);
+        self.task_requests.forget(&folder);
     }
 
     pub fn toggle_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {

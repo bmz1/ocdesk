@@ -79,14 +79,14 @@ impl Controller {
     }
     pub fn refresh_session_mode(&mut self, sid: String, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
-        let version = *self.mode_requests.entry(sid.clone()).or_default();
+        let version = self.mode_requests.current(sid.clone());
         self.run_on(
             cx,
             self.issued(RequestScope::Server),
             async move { api.session_mode(&sid).await.map(|m| (sid, m)) },
             move |this, res, cx| {
                 if let Ok((sid, m)) = res
-                    && this.mode_requests.get(&sid) == Some(&version)
+                    && this.mode_requests.is_current(&sid, version)
                 {
                     this.store.update(cx, |s, cx| {
                         s.session_modes.insert(sid, m);
@@ -108,7 +108,7 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        *self.mode_requests.entry(sid.clone()).or_default() += 1;
+        self.mode_requests.bump(sid.clone());
         self.store.update(cx, |s, cx| {
             s.mode_sending.insert(sid.clone());
             cx.notify();
@@ -166,7 +166,7 @@ impl Controller {
         let details = details || self.usage_details_pending.remove(&sid);
         // A loaded conversation already holds the per-model numbers.
         let history = details && self.store.read(cx).usage_needs_history(&sid);
-        let revision = *self.usage_revision.entry(sid.clone()).or_default();
+        let revision = self.usage_revision.current(sid.clone());
         self.store.update(cx, |s, cx| {
             s.usage_loading.insert(sid.clone());
             s.usage_errors.remove(&sid);
@@ -180,7 +180,14 @@ impl Controller {
             self.issued(RequestScope::Server),
             async move { api.usage_report(&id, &folder, details, history).await },
             move |this, res, cx| {
-                let changed = this.usage_revision.get(&sid) != Some(&revision);
+                if this.store.read(cx).session(&sid).is_none() {
+                    // Deleted while in flight: don't resurrect its usage entry.
+                    this.store.update(cx, |s, _| {
+                        s.usage_loading.remove(&sid);
+                    });
+                    return;
+                }
+                let changed = !this.usage_revision.is_current(&sid, revision);
                 this.store.update(cx, |s, cx| {
                     s.usage_loading.remove(&sid);
                     match res {
@@ -361,8 +368,10 @@ impl Controller {
     pub(super) fn product_event(&mut self, env: &Envelope, cx: &mut Context<Self>) {
         if let Event::SessionRemoved { session_id } = &env.event {
             // The store forgets its own state when it applies the event.
-            self.mode_requests.remove(session_id);
-            self.usage_revision.remove(session_id);
+            self.mode_requests.forget(session_id);
+            self.usage_revision.forget(session_id);
+            self.model_choices.forget(session_id);
+            self.agent_choices.forget(session_id);
             self.usage_details_pending.remove(session_id);
             self.fetched_epoch.remove(session_id);
             self.update_settings(cx, |s| {
@@ -371,13 +380,23 @@ impl Controller {
             cx.dismiss_system_notification(&format!("ocdesk:{session_id}"));
             return;
         }
+        // Server reports keep optimistic rollbacks pointed at its value.
+        match &env.event {
+            Event::ModelSelected { session_id, model } => {
+                self.model_choices.observed(session_id, model)
+            }
+            Event::AgentSelected { session_id, agent } => {
+                self.agent_choices.observed(session_id, agent)
+            }
+            _ => {}
+        }
         if let Event::UsageUpdated {
             session_id,
             tokens,
             cost,
         } = &env.event
         {
-            *self.usage_revision.entry(session_id.clone()).or_default() += 1;
+            self.usage_revision.bump(session_id.clone());
             self.store.update(cx, |s, cx| {
                 let r = s.usage.entry(session_id.clone()).or_default();
                 r.tokens = crate::api::features::Tokens::parse(tokens);
