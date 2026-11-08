@@ -32,6 +32,8 @@ gpui_kit::assets::icon_assets!(
         ChevronsDownUp,
         Bot,
         FileDiff,
+        Globe,
+        MousePointerClick,
         GitPullRequest,
         CircleCheck,
         CircleX,
@@ -140,4 +142,10 @@ pub fn circle_x() -> Icon {
 
 pub fn circle_dashed() -> Icon {
     Icon::new(Lucide::CircleDashed)
+}
+pub fn globe() -> Icon {
+    Icon::new(Lucide::Globe)
+}
+pub fn mouse_pointer() -> Icon {
+    Icon::new(Lucide::MousePointerClick)
 }

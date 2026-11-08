@@ -107,6 +107,7 @@ pub enum PanelTab {
     Files,
     Agents,
     PullRequest,
+    Browser,
 }
 
 impl Default for Settings {

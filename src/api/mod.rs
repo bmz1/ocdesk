@@ -92,6 +92,55 @@ impl Api {
         Ok(serde_json::from_str(&body)?)
     }
 
+    /// A plugin RPC call: `POST /api/rpc/{rpc}/{method} {input}` → `output`.
+    pub async fn rpc(
+        &self,
+        directory: &Path,
+        rpc: &str,
+        method: &str,
+        input: Value,
+    ) -> Result<Value> {
+        let v = self
+            .send(
+                self.req(Method::POST, &format!("/api/rpc/{rpc}/{method}"))
+                    .query(&[("location[directory]", directory)])
+                    .json(&json!({ "input": input })),
+            )
+            .await?;
+        Ok(v.get("output").cloned().unwrap_or(Value::Null))
+    }
+
+    /// A plugin RPC call that stays open for as long as the server keeps it
+    /// (the browser plugin's `attach`): no request timeout.
+    pub async fn rpc_long(
+        &self,
+        directory: &Path,
+        rpc: &str,
+        method: &str,
+        input: Value,
+    ) -> Result<Value> {
+        let resp = self
+            .req(Method::POST, &format!("/api/rpc/{rpc}/{method}"))
+            .query(&[("location[directory]", directory)])
+            .json(&json!({ "input": input }))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            bail!(
+                "HTTP {status}: {}",
+                body.chars().take(300).collect::<String>()
+            );
+        }
+        let v: Value = if body.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&body)?
+        };
+        Ok(v.get("output").cloned().unwrap_or(Value::Null))
+    }
+
     /// All sessions in every location, newest first (`GET /api/session`).
     /// Sub-agent sessions are dropped.
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {

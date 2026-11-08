@@ -10,6 +10,8 @@ Behaviour is keyed on the last user message:
     contains "tool:edit"  -> calls the write tool on mock_note.txt, then summarizes
     contains "tool:task"  -> calls the subagent tool (spawns a "general" subagent), then summarizes
     contains "tool:sleep" -> runs `sleep 20` through the shell tool (a long-running command)
+    contains "tool:browser" -> code mode (`execute`): opens a page in the desktop browser
+                             (opencode's browser plugin), snapshots it, clicks, screenshots
     contains "slow"       -> a reply streamed over ~10 s (for queue/steer testing)
     contains "long"       -> streams a long markdown answer with code blocks
     contains "rich"       -> long reasoning + every markdown construct (tables, quotes, lists, code)
@@ -183,6 +185,18 @@ class Handler(BaseHTTPRequestHandler):
                 stream_text("Thinking about the tool output.", "reasoning_content")
                 stream_text("The tool finished. Output was:\n\n```\n" + str(msgs[-1].get("content"))[:400] + "\n```\n")
                 chunk({}, "stop")
+            elif "tool:browser" in user:
+                url = (re.search(r"https?://\S+|file://\S+", user) or [None])[0] or "https://example.com"
+                stream_text("Checking the page in the browser.\n")
+                tool_call(pick("execute"), {"code": (
+                    f"const tab = await tools.browser.tabs.open({{ url: {json.dumps(url)} }});\n"
+                    "const snap = await tools.browser.snapshot({ tabID: tab.id });\n"
+                    "const ref = (snap.content.match(/button(?![^\\n]*\\[disabled\\])[^\\n]*\\[ref=(e\\d+)\\]/) || [])[1];\n"
+                    "if (ref) await tools.browser.click({ tabID: tab.id, ref });\n"
+                    "await tools.browser.tabs.focus({ tabID: tab.id });\n"
+                    "const shot = await tools.browser.screenshot({ tabID: tab.id });\n"
+                    "return { title: tab.title, clicked: ref ?? null, snapshot: snap.content.slice(0, 300), files: shot.files };"
+                )})
             elif "tool:sleep" in user:
                 stream_text("Starting a long command.\n")
                 tool_call(pick("shell", "bash"), {"command": "sleep 20 && echo slept", "description": "Wait a while"})

@@ -1,6 +1,7 @@
 mod agents;
 mod api;
 mod app_icon;
+mod browser;
 mod controller;
 mod demo;
 mod files;
