@@ -29,7 +29,8 @@ gpui_kit::assets::icon_assets!(
         Shield,
         FolderOpen,
         Files,
-        ChevronsDownUp
+        ChevronsDownUp,
+        Bot
     ]
 );
 
@@ -112,4 +113,7 @@ pub fn files() -> Icon {
 }
 pub fn collapse_all() -> Icon {
     Icon::new(Lucide::ChevronsDownUp)
+}
+pub fn bot() -> Icon {
+    Icon::new(Lucide::Bot)
 }

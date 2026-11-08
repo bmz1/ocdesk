@@ -122,6 +122,49 @@ server-default model is resolved from the context when absent from session info.
 Provider limits from the experimental endpoint may be unavailable; that is
 shown explicitly, including endpoint errors, rather than rendered as zero.
 
+## Agents and subagents
+
+Multi-agent pipelines (architect → swe → parallel security/review/qa →
+report) are plain opencode agents: a primary **lead** agent whose prompt
+delegates to subagents. ocdesk adds no workflow engine; it edits the agent
+files and shows the delegation.
+
+**Agents panel** (`Mod+Shift+A`, right panel). Lists the agent files
+opencode 2.2.6 loads for the session's folder: `<root>/{agent,agents}/**/*.md`
+for the roots `.opencode`, `.claude` and `.agents` in the folder, and
+`$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode` on every
+platform), `~/.claude` and `~/.agents` globally. (Checked against the
+2.2.6 sources: `core/src/config/plugin/agent.ts`, `config/discovery.ts`.)
+Built-in agents from `GET /api/agent` are listed read-only.
+
+- The editor changes `description`, `mode` (`primary` / `subagent` / `all`;
+  missing means `all`), `model` (`provider/model#variant`, chosen from the
+  folder's models) and the body, which opencode uses as the system prompt.
+  Every other frontmatter entry (permissions, request, color, steps,
+  comments) is kept verbatim; a legacy separate `variant` key is dropped
+  when the model is set, since the variant now lives in the model string.
+- Saving writes a temp file and renames it, refuses to overwrite a file that
+  changed on disk since it was opened, and then re-reads the folder's agents
+  so the composer's pickers update without waiting for opencode's
+  `agent.updated`.
+- **New → Project/Global agent** creates `<root>/agent/<name>.md` (or
+  `agents/` if only that exists), never overwriting. **New → Team template**
+  writes `lead` (primary) plus `architect`, `swe`, `security`, `review`, `qa`
+  (subagents) into `.opencode/agent/`, skipping names that already exist.
+  Pick `lead` in the composer to run the team.
+- Delegation is the model's call: the template's lead prompt says to always
+  use its subagents and to start the three reviewers together, but opencode
+  doesn't enforce an order.
+
+**Fan-out tree.** Two or more consecutive `subagent` calls in one reply are
+drawn as one tree: "Delegated to 3 subagents · 2 done · 1 running", then a
+branch per call with `@agent`, its task, the child session's model and run
+time, its status and the first line of its result (or error). A branch opens
+the subagent in the Tasks panel. A single delegation keeps the one-line task
+row. Demo mode seeds a fan-out turn.
+
+![Agents panel and fan-out tree](screenshots/agents-panel.png)
+
 ## Verification
 
 Run the existing Rust checks plus:

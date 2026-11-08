@@ -558,7 +558,7 @@ impl Controller {
         }
     }
 
-    fn refresh_catalog(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_catalog(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
         self.refresh_folder_info(folder.clone(), cx);
         let generation = self.generation;

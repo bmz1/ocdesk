@@ -264,6 +264,42 @@ impl Controller {
             },
         );
     }
+    /// Open an agent file (found by `agents::discover`, possibly outside the
+    /// project) in the configured editor.
+    pub fn open_agent_file(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let editor = self
+            .settings
+            .editor
+            .clone()
+            .unwrap_or_else(|| "code".into());
+        self.run(
+            cx,
+            async move {
+                let mut child = tokio::process::Command::new(editor)
+                    .arg("--")
+                    .arg(path)
+                    .spawn()?;
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+                Ok(())
+            },
+            |this, res, cx| {
+                if let Err(e) = res {
+                    this.notice(format!("Could not open editor: {e:#}"), cx)
+                }
+            },
+        );
+    }
+
+    /// Agent files changed on disk: re-read the folder's agents now instead
+    /// of waiting for opencode's `agent.updated`.
+    pub fn agents_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(folder) = self.store.read(cx).catalog_folder() {
+            self.refresh_catalog(folder, cx);
+        }
+    }
+
     pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.store.update(cx, |s, cx| {
             s.window_active = active;

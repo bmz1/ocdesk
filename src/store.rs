@@ -808,16 +808,6 @@ impl Store {
         self.emit_all(events, cx);
     }
 
-    pub fn set_busy(&mut self, session_id: &str, busy: bool, cx: &mut Context<Self>) {
-        let events = self.set_busy_inner(session_id, busy);
-        self.emit_all(events, cx);
-    }
-
-    pub fn clear_error(&mut self, session_id: &str) {
-        self.errors.remove(session_id);
-        self.retry.remove(session_id);
-    }
-
     /// Fold one event. Emits [`StoreEvent`]s and notifies when anything changed.
     pub fn apply(&mut self, env: Envelope, cx: &mut Context<Self>) {
         let events = self.apply_inner(env);

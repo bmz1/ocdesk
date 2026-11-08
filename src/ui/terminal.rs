@@ -18,7 +18,7 @@ use alacritty_terminal::vte::ansi::{Color as TColor, NamedColor, Processor, Rgb}
 use futures::StreamExt as _;
 use futures::channel::mpsc::Sender;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 
 use crate::api::pty::{PtyMsg, frame};

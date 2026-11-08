@@ -112,6 +112,7 @@ pub enum PanelTab {
     Tasks,
     Terminal,
     Files,
+    Agents,
 }
 
 impl Default for Settings {

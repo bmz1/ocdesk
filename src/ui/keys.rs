@@ -20,6 +20,7 @@ actions!(
         StopTurn,
         ToggleChanges,
         ToggleTasks,
+        ToggleAgents,
         ShowShortcuts,
         OpenSettings,
         Quit,
@@ -77,6 +78,11 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, &'static str)> {
             "secondary-shift-t",
             Box::new(ToggleTasks),
             "Background tasks (subagents, shells)",
+        ),
+        (
+            "secondary-shift-a",
+            Box::new(ToggleAgents),
+            "Agents: edit opencode agents",
         ),
         ("secondary-k", Box::new(CommandPalette), "Command palette"),
         (
@@ -342,6 +348,7 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Changes", ToggleChanges),
             MenuItem::action("Background Tasks", ToggleTasks),
+            MenuItem::action("Agents", ToggleAgents),
             MenuItem::action("Terminal", ToggleTerminal),
             MenuItem::action("Files", ToggleFiles),
             MenuItem::separator(),

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use futures::channel::mpsc::Sender;
+use futures::{SinkExt as _, StreamExt as _};
 use reqwest::Method;
 use serde_json::{Value, json};
 

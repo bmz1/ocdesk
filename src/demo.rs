@@ -15,7 +15,7 @@ use std::time::Duration;
 use gpui_kit::{App, Entity};
 
 use crate::api::model::{
-    AssistantMessage, Block, BlockKind, Message, ToolCall, ToolStatus, UserMessage,
+    AssistantMessage, Block, BlockKind, Message, SessionInfo, ToolCall, ToolStatus, UserMessage,
 };
 use crate::api::{Envelope, Event, events::Outcome};
 use crate::store::{Connection, Store};
@@ -80,6 +80,19 @@ fn showcase(now: u64) -> Vec<Message> {
             output: out.into(),
             error: None,
             metadata: serde_json::Value::Null,
+        }))
+    };
+    let subagent = |id: &str, agent: &str, task: &str, out: Option<&str>, status| {
+        Block::Tool(Box::new(ToolCall {
+            call_id: id.into(),
+            name: "subagent".into(),
+            status,
+            input: serde_json::json!({"agent": agent, "description": task, "prompt": task}),
+            output: out
+                .map(|o| format!("<subagent sessionID=ses_{id} state=completed>{o}</subagent>"))
+                .unwrap_or_default(),
+            error: None,
+            metadata: serde_json::json!({"sessionID": format!("ses_{id}")}),
         }))
     };
     let prose = |kind, ordinal, text: &str, secs: u64| Block::Prose {
@@ -220,6 +233,37 @@ fn showcase(now: u64) -> Vec<Message> {
             error: None,
             meta: meta("plan", 21),
         }),
+        user("msg_z7", "Review the heartbeat change before I merge it"),
+        Message::Assistant(AssistantMessage {
+            id: "msg_z8".into(),
+            blocks: vec![
+                subagent(
+                    "c7",
+                    "security",
+                    "Security review of the diff",
+                    Some("No issues: the timer is cleared on close and no input reaches it."),
+                    ToolStatus::Completed,
+                ),
+                subagent(
+                    "c8",
+                    "review",
+                    "Code review of the diff",
+                    Some("Two nits: name the 25 s constant and clear the timer in `close()`."),
+                    ToolStatus::Completed,
+                ),
+                subagent(
+                    "c9",
+                    "qa",
+                    "Test a flapping server",
+                    None,
+                    ToolStatus::Running,
+                ),
+            ],
+            completed: true,
+            finish: Some("stop".into()),
+            error: None,
+            meta: meta("lead", 30),
+        }),
         user("msg_z5", "Run the migration against staging"),
         Message::Assistant(AssistantMessage {
             id: "msg_z6".into(),
@@ -250,6 +294,31 @@ fn seed_showcase_state(s: &mut Store, cx: &mut gpui_kit::Context<Store>) {
     {
         s.set_permissions(SESSION_ID, vec![r], cx);
     }
+    // The fan-out turn's subagent sessions (model and timing on its rows).
+    let now = s.session(SESSION_ID).map(|x| x.updated).unwrap_or_default();
+    let kid = |id: &str, agent: &str, model: &str, secs: u64| SessionInfo {
+        id: format!("ses_{id}"),
+        title: agent.into(),
+        directory: Default::default(),
+        created: now.saturating_sub(40_000),
+        updated: now.saturating_sub(40_000) + secs * 1000,
+        parent_id: Some(SESSION_ID.into()),
+        model: Some(crate::api::model::ModelRef {
+            provider_id: "anthropic".into(),
+            id: model.into(),
+            variant: None,
+        }),
+        agent: Some(agent.into()),
+    };
+    s.set_children(
+        SESSION_ID,
+        vec![
+            kid("c7", "security", "claude-opus-5-5", 34),
+            kid("c8", "review", "claude-sonnet-5-5", 21),
+            kid("c9", "qa", "claude-haiku-5-5", 0),
+        ],
+        cx,
+    );
     s.usage.insert(
         SESSION_ID.into(),
         crate::api::features::UsageReport {

@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod app_view;
 pub mod changes;
 pub mod composer;

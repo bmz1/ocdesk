@@ -68,6 +68,7 @@ pub struct ConversationView {
     /// Editor tabs next to the chat, and the Files panel.
     files: Entity<super::editor_tabs::FileTabs>,
     explorer: Entity<super::explorer::FileExplorer>,
+    agents: Entity<super::agents::AgentsPanel>,
     transcript_focus: FocusHandle,
     density: crate::settings::Density,
     /// Free-text inputs for pending question forms, keyed (form, field).
@@ -113,6 +114,8 @@ impl ConversationView {
         let explorer = cx.new(|cx| {
             super::explorer::FileExplorer::new(store.clone(), controller.clone(), files.clone(), cx)
         });
+        let agents =
+            cx.new(|cx| super::agents::AgentsPanel::new(store.clone(), controller.clone(), cx));
         let mut subs = subs;
         subs.push(cx.observe(&files, |_, _, cx| cx.notify()));
         let prefs = store.read(cx).preferences.clone();
@@ -139,6 +142,7 @@ impl ConversationView {
             terminal,
             files,
             explorer,
+            agents,
             transcript_focus: cx.focus_handle(),
             density: prefs.density,
             expanded_tools: Default::default(),
@@ -426,6 +430,7 @@ impl ConversationView {
                 focus.focus(window, cx);
             }
             Some(PanelTab::Files) => {}
+            Some(PanelTab::Agents) => self.agents.update(cx, |a, cx| a.reload(cx)),
             None => self.focus_main(window, cx),
         }
         let saved = self.panel;
@@ -993,6 +998,7 @@ impl Render for ConversationView {
                             scrolls: &scrolls,
                             density,
                             found: find_calls.as_deref(),
+                            children: s.selected.as_ref().map_or(&[][..], |id| s.children_of(id)),
                         };
                         let next = c.messages.get(ix + 1);
                         let start = c.messages[..ix]
@@ -1104,6 +1110,7 @@ impl Render for ConversationView {
                             PanelTab::Tasks => "Background tasks: subagents and shells",
                             PanelTab::Terminal => "Terminal for this session",
                             PanelTab::Files => "Files: browse and open in a tab",
+                            PanelTab::Agents => "Agents: opencode agent files for this folder",
                         },
                         action,
                         None,
@@ -1194,6 +1201,13 @@ impl Render for ConversationView {
                         &super::keys::ToggleFiles,
                     ))
                     .child(tab_button(
+                        "toggle-agents",
+                        PanelTab::Agents,
+                        "Agents".into(),
+                        super::icons::bot(),
+                        &super::keys::ToggleAgents,
+                    ))
+                    .child(tab_button(
                         "toggle-terminal",
                         PanelTab::Terminal,
                         "Terminal".into(),
@@ -1223,6 +1237,11 @@ impl Render for ConversationView {
                     .into_any_element(),
                 PanelTab::Files => self
                     .explorer
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                PanelTab::Agents => self
+                    .agents
                     .clone()
                     .cached(StyleRefinement::default().size_full())
                     .into_any_element(),
