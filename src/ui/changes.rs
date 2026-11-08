@@ -29,7 +29,9 @@ pub fn render_changes(
     };
     let theme = cx.theme();
     let dir = store.selected_diff_dir();
-    let loading = dir.as_ref().is_some_and(|d| store.diff_loading.contains(d));
+    let loading = dir
+        .as_ref()
+        .is_some_and(|d| store.diff_status.is_loading(d));
     let refresh_controller = controller.clone();
     let refresh_sid = sid;
     let mut col = v_flex().w_full().gap_3().child(
@@ -56,8 +58,8 @@ pub fn render_changes(
     let Some(diff_dir) = dir else {
         return col.into_any_element();
     };
-    if let Some(error) = store.diff_errors.get(&diff_dir) {
-        col = col.child(div().text_color(theme.danger).child(error.clone()));
+    if let Some(error) = store.diff_status.error(&diff_dir) {
+        col = col.child(div().text_color(theme.danger).child(error.to_owned()));
     }
     // Same shape as `Controller::viewed_key`, built once instead of per file.
     let viewed_prefix = format!("{}\nWorking tree:\n", diff_dir.display());

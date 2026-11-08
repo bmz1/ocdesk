@@ -2,5 +2,6 @@
 //! orchestration, I/O and GPUI notifications stay with their existing owners.
 
 pub(crate) mod choice;
+pub(crate) mod fetch;
 pub(crate) mod history;
 pub(crate) mod requests;

@@ -18,6 +18,7 @@ use crate::api::model::{
     SkillInfo, Timing, ToolCall, ToolStatus, UserMessage, VcsInfo,
 };
 use crate::api::{Envelope, Event};
+use crate::domain::fetch::{FetchStatus, FetchStatuses};
 use crate::domain::history::{HistoryLoad, HistoryRequests, LoadTicket};
 
 use serde_json::Value;
@@ -260,8 +261,7 @@ pub struct Store {
     pub pull_requests: HashMap<PathBuf, PrEntry>,
     pub check_logs: HashMap<String, CheckLog>,
     pub saved_grants: Vec<crate::api::features::SavedGrant>,
-    pub saved_grants_loading: bool,
-    pub saved_grants_error: Option<String>,
+    pub(crate) saved_grants_status: FetchStatus,
     pub grant_sending: HashSet<String>,
     pub preferences: crate::settings::Settings,
     pub unread: std::collections::BTreeSet<String>,
@@ -270,8 +270,7 @@ pub struct Store {
     pub session_modes: HashMap<String, Option<crate::settings::PermissionMode>>,
     pub mode_sending: HashSet<String>,
     pub usage: HashMap<String, crate::api::features::UsageReport>,
-    pub usage_loading: HashSet<String>,
-    pub usage_errors: HashMap<String, String>,
+    pub(crate) usage_status: FetchStatuses<String>,
     /// The user's folders, in sidebar order. Each is an opencode location.
     pub folders: Vec<PathBuf>,
     pub collapsed: HashSet<PathBuf>,
@@ -326,8 +325,7 @@ pub struct Store {
     /// from the fields' defaults and edited as the user picks or types.
     pub form_drafts: HashMap<String, Value>,
     pub diffs: HashMap<PathBuf, Vec<FileDiff>>,
-    pub diff_loading: HashSet<PathBuf>,
-    pub diff_errors: HashMap<PathBuf, String>,
+    pub(crate) diff_status: FetchStatuses<PathBuf>,
     /// Folders whose diff may be outdated (a turn ended while not shown).
     pub diff_stale: HashSet<PathBuf>,
     /// Per folder (location directory).
@@ -895,8 +893,7 @@ impl Store {
         self.session_modes.remove(sid);
         self.mode_sending.remove(sid);
         self.usage.remove(sid);
-        self.usage_loading.remove(sid);
-        self.usage_errors.remove(sid);
+        self.usage_status.remove(sid);
         self.unread.remove(sid);
     }
 
@@ -914,8 +911,7 @@ impl Store {
             self.tooling.remove(dir);
             self.catalogs.remove(dir);
             self.diffs.remove(dir);
-            self.diff_loading.remove(dir);
-            self.diff_errors.remove(dir);
+            self.diff_status.remove(dir);
             self.diff_stale.remove(dir);
             self.shell_snapshots.remove(dir);
         }
@@ -936,10 +932,9 @@ impl Store {
     /// A folder's diff starts loading. Diffs are per folder (opencode's
     /// working-tree diff), shared by every session in it.
     pub fn begin_diff(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        let start = self.diff_loading.insert(dir.clone());
-        let errors_removed = self.diff_errors.remove(&dir).is_some();
+        let changed = self.diff_status.begin(dir.clone());
         self.diff_stale.remove(&dir);
-        if start || errors_removed {
+        if changed {
             cx.emit(StoreEvent::DiffsChanged { dir });
             cx.notify();
         }
@@ -954,21 +949,10 @@ impl Store {
         error: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let mut changed = self.diff_loading.remove(&dir);
+        let mut changed = self.diff_status.finish(dir.clone(), error);
         if let Some(diffs) = diffs {
             changed |= self.diffs.get(&dir) != Some(&diffs);
             self.diffs.insert(dir.clone(), diffs);
-        }
-        if self.diff_errors.get(&dir) != error.as_ref() {
-            changed = true;
-            match error {
-                Some(e) => {
-                    self.diff_errors.insert(dir.clone(), e);
-                }
-                None => {
-                    self.diff_errors.remove(&dir);
-                }
-            }
         }
         if changed {
             cx.emit(StoreEvent::DiffsChanged { dir });
@@ -2080,11 +2064,11 @@ mod tests {
         let folder = PathBuf::from("/repo");
         let tree = PathBuf::from("/repo-wt");
         s.worktrees.insert(folder.clone(), vec![tree.clone()]);
-        s.diff_loading.insert(tree.clone());
+        s.diff_status.begin(tree.clone());
         s.diff_stale.insert(folder.clone());
         let forgotten = s.forget_folder(&folder);
         assert_eq!(forgotten, vec![tree.clone(), folder.clone()]);
-        assert!(!s.diff_loading.contains(&tree));
+        assert!(!s.diff_status.is_loading(&tree));
         assert!(!s.diff_stale.contains(&folder));
         assert!(!s.worktrees.contains_key(&folder));
     }

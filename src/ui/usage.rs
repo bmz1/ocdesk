@@ -54,8 +54,8 @@ impl Render for UsageDetails {
         let theme = cx.theme().clone();
         let s = self.store.read(cx);
         let report = s.usage_view(&self.sid);
-        let error = s.usage_errors.get(&self.sid).cloned();
-        let loading = s.usage_loading.contains(&self.sid);
+        let error = s.usage_status.error(&self.sid).map(str::to_owned);
+        let loading = s.usage_status.is_loading(&self.sid);
         let mut col = v_flex().gap_5();
 
         if let Some(r) = &report {

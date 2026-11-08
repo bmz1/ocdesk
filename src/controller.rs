@@ -363,13 +363,13 @@ impl Controller {
             s.interrupting.clear();
             s.permission_sending.clear();
             s.form_sending.clear();
-            for dir in std::mem::take(&mut s.diff_loading) {
+            for dir in s.diff_status.abandon_all() {
                 cx.emit(StoreEvent::DiffsChanged { dir });
             }
             s.mode_sending.clear();
-            s.usage_loading.clear();
+            s.usage_status.abandon_all();
             s.grant_sending.clear();
-            s.saved_grants_loading = false;
+            s.saved_grants_status.abandon();
             cx.notify();
         });
         self.stop_pump();

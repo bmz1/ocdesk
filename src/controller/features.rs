@@ -157,7 +157,7 @@ impl Controller {
             return;
         };
         // Coalesce stream bursts. A newer cumulative total invalidates the old REST response.
-        if self.store.read(cx).usage_loading.contains(&sid) {
+        if self.store.read(cx).usage_status.is_loading(&sid) {
             if details {
                 self.usage_details_pending.insert(sid);
             }
@@ -168,8 +168,7 @@ impl Controller {
         let history = details && self.store.read(cx).usage_needs_history(&sid);
         let revision = self.usage_revision.current(sid.clone());
         self.store.update(cx, |s, cx| {
-            s.usage_loading.insert(sid.clone());
-            s.usage_errors.remove(&sid);
+            s.usage_status.begin(sid.clone());
             cx.emit(StoreEvent::UsageChanged {
                 session_id: sid.clone(),
             });
@@ -182,36 +181,30 @@ impl Controller {
             move |this, res, cx| {
                 if this.store.read(cx).session(&sid).is_none() {
                     // Deleted while in flight: don't resurrect its usage entry.
-                    this.store.update(cx, |s, _| {
-                        s.usage_loading.remove(&sid);
-                    });
+                    this.store.update(cx, |s, _| s.usage_status.remove(&sid));
                     return;
                 }
                 let changed = !this.usage_revision.is_current(&sid, revision);
                 this.store.update(cx, |s, cx| {
-                    s.usage_loading.remove(&sid);
-                    match res {
-                        Ok(mut report) => {
-                            let old = s.usage.remove(&sid);
-                            if let Some(old) = &old
-                                && changed
-                            {
-                                report.tokens = old.tokens.clone();
-                                report.cost = old.cost;
-                            }
-                            // A summary keeps what the last details fetch found.
-                            if !details && let Some(old) = old {
-                                report = crate::api::features::UsageReport {
-                                    tokens: report.tokens,
-                                    cost: report.cost,
-                                    ..old
-                                };
-                            }
-                            s.usage.insert(sid.clone(), report);
+                    let error = res.as_ref().err().map(|e| format!("{e:#}"));
+                    s.usage_status.finish(sid.clone(), error);
+                    if let Ok(mut report) = res {
+                        let old = s.usage.remove(&sid);
+                        if let Some(old) = &old
+                            && changed
+                        {
+                            report.tokens = old.tokens.clone();
+                            report.cost = old.cost;
                         }
-                        Err(e) => {
-                            s.usage_errors.insert(sid.clone(), format!("{e:#}"));
+                        // A summary keeps what the last details fetch found.
+                        if !details && let Some(old) = old {
+                            report = crate::api::features::UsageReport {
+                                tokens: report.tokens,
+                                cost: report.cost,
+                                ..old
+                            };
                         }
+                        s.usage.insert(sid.clone(), report);
                     }
                     cx.emit(StoreEvent::UsageChanged {
                         session_id: sid.clone(),
@@ -453,8 +446,7 @@ impl Controller {
         self.grant_requests += 1;
         let request = self.grant_requests;
         self.store.update(cx, |s, cx| {
-            s.saved_grants_loading = true;
-            s.saved_grants_error = None;
+            s.saved_grants_status.begin();
             cx.notify();
         });
         self.run_on(
@@ -466,10 +458,10 @@ impl Controller {
                     return;
                 }
                 this.store.update(cx, |s, cx| {
-                    s.saved_grants_loading = false;
-                    match res {
-                        Ok(grants) => s.saved_grants = grants,
-                        Err(e) => s.saved_grants_error = Some(format!("{e:#}")),
+                    let error = res.as_ref().err().map(|e| format!("{e:#}"));
+                    s.saved_grants_status.finish(error);
+                    if let Ok(grants) = res {
+                        s.saved_grants = grants;
                     }
                     cx.notify();
                 });
@@ -483,7 +475,7 @@ impl Controller {
         let Some(api) = self.api(cx) else { return };
         self.grant_requests += 1;
         self.store.update(cx, |s, cx| {
-            s.saved_grants_loading = false;
+            s.saved_grants_status.abandon();
             s.grant_sending.insert(id.clone());
             cx.notify();
         });
