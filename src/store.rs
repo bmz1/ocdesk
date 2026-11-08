@@ -901,8 +901,10 @@ impl Store {
     }
 
     /// Drop everything kept about a folder that was removed from the
-    /// sidebar, including its worktree checkouts.
-    pub(crate) fn forget_folder(&mut self, folder: &Path) {
+    /// sidebar, including its worktree checkouts. Returns every directory
+    /// forgotten, so request owners can invalidate their reads for them too.
+    #[must_use]
+    pub(crate) fn forget_folder(&mut self, folder: &Path) -> Vec<PathBuf> {
         let mut dirs = self.worktrees.remove(folder).unwrap_or_default();
         dirs.push(folder.to_path_buf());
         self.projects.remove(folder);
@@ -917,6 +919,7 @@ impl Store {
             self.diff_stale.remove(dir);
             self.shell_snapshots.remove(dir);
         }
+        dirs
     }
 
     /// The folder whose working-tree diff the selected session shows.
@@ -2069,6 +2072,21 @@ mod tests {
             .lines()
             .filter_map(Envelope::from_json)
             .collect()
+    }
+
+    #[test]
+    fn forget_folder_reports_worktree_checkouts_it_dropped() {
+        let mut s = Store::default();
+        let folder = PathBuf::from("/repo");
+        let tree = PathBuf::from("/repo-wt");
+        s.worktrees.insert(folder.clone(), vec![tree.clone()]);
+        s.diff_loading.insert(tree.clone());
+        s.diff_stale.insert(folder.clone());
+        let forgotten = s.forget_folder(&folder);
+        assert_eq!(forgotten, vec![tree.clone(), folder.clone()]);
+        assert!(!s.diff_loading.contains(&tree));
+        assert!(!s.diff_stale.contains(&folder));
+        assert!(!s.worktrees.contains_key(&folder));
     }
 
     fn sid() -> String {

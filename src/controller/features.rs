@@ -450,7 +450,6 @@ impl Controller {
     pub fn refresh_saved_grants(&mut self, cx: &mut Context<Self>) {
         let Some(api) = self.api(cx) else { return };
         let folders = self.store.read(cx).folders.clone();
-        let generation = self.requests.generation();
         self.grant_requests += 1;
         let request = self.grant_requests;
         self.store.update(cx, |s, cx| {
@@ -458,11 +457,12 @@ impl Controller {
             s.saved_grants_error = None;
             cx.notify();
         });
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move { api.saved_grants(&folders).await },
             move |this, res, cx| {
-                if this.requests.generation() != generation || this.grant_requests != request {
+                if this.grant_requests != request {
                     return;
                 }
                 this.store.update(cx, |s, cx| {

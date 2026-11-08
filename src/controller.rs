@@ -707,10 +707,10 @@ impl Controller {
     pub(crate) fn refresh_catalog(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
         self.refresh_folder_info(folder.clone(), cx);
-        let generation = self.requests.generation();
         let dir = folder.clone();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move {
                 let (models, default_model, agents, configured_agent) = futures::join!(
                     api.models(&dir),
@@ -729,17 +729,12 @@ impl Controller {
                     configured_agent: configured_agent.unwrap_or_default(),
                 })
             },
-            move |this, res: Result<Catalog>, cx| {
-                if this.requests.generation() != generation {
-                    return;
-                }
-                match res {
-                    Ok(c) => this.store.update(cx, |s, cx| s.set_catalog(folder, c, cx)),
-                    Err(e) => tracing::warn!(
-                        "could not read models/agents for {}: {e:#}",
-                        folder.display()
-                    ),
-                }
+            move |this, res: Result<Catalog>, cx| match res {
+                Ok(c) => this.store.update(cx, |s, cx| s.set_catalog(folder, c, cx)),
+                Err(e) => tracing::warn!(
+                    "could not read models/agents for {}: {e:#}",
+                    folder.display()
+                ),
             },
         );
     }
@@ -748,10 +743,10 @@ impl Controller {
     /// part fails on its own (e.g. a folder that isn't a git repository).
     fn refresh_folder_info(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
-        let generation = self.requests.generation();
         let dir = folder.clone();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move {
                 let (commands, skills, mcp, vcs, project) = futures::join!(
                     api.commands(&dir),
@@ -791,9 +786,6 @@ impl Controller {
                 Ok((tooling, vcs.ok(), project.ok(), worktrees, wt_vcs))
             },
             move |this, res: Result<_>, cx| {
-                if this.requests.generation() != generation {
-                    return;
-                }
                 let Ok((tooling, vcs, project, worktrees, wt_vcs)) = res else {
                     return;
                 };
@@ -1802,17 +1794,15 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        let generation = self.requests.generation();
         let request = self.diff_requests.bump(dir.clone());
         self.store.update(cx, |s, cx| s.begin_diff(dir.clone(), cx));
         let d = dir.clone();
-        self.run(
+        self.run_on(
             cx,
+            self.issued(RequestScope::Server),
             async move { api.working_diff(&d).await },
             move |this, res, cx| {
-                if this.requests.generation() != generation
-                    || !this.diff_requests.is_current(&dir, request)
-                {
+                if !this.diff_requests.is_current(&dir, request) {
                     return;
                 }
                 if let Ok(files) = &res {
@@ -1976,12 +1966,17 @@ impl Controller {
         if selected_in_folder {
             self.select_session(None, cx);
         }
-        self.store.update(cx, |s, cx| {
-            s.forget_folder(&folder);
+        let forgotten = self.store.update(cx, |s, cx| {
+            let forgotten = s.forget_folder(&folder);
             s.set_folders(folders, cx);
+            forgotten
         });
-        self.diff_requests.forget(&folder);
-        self.task_requests.forget(&folder);
+        // Worktree checkouts go with their folder: an in-flight diff or task
+        // read for one must not re-create state for a directory now gone.
+        for dir in &forgotten {
+            self.diff_requests.forget(dir);
+            self.task_requests.forget(dir);
+        }
     }
 
     pub fn toggle_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
