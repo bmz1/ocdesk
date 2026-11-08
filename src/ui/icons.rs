@@ -26,7 +26,10 @@ gpui_kit::assets::icon_assets!(
         PinOff,
         Archive,
         MessageSquare,
-        Shield
+        Shield,
+        FolderOpen,
+        Files,
+        ChevronsDownUp
     ]
 );
 
@@ -100,4 +103,13 @@ pub fn message_square() -> Icon {
 }
 pub fn shield() -> Icon {
     Icon::new(Lucide::Shield)
+}
+pub fn folder_open() -> Icon {
+    Icon::new(Lucide::FolderOpen)
+}
+pub fn files() -> Icon {
+    Icon::new(Lucide::Files)
+}
+pub fn collapse_all() -> Icon {
+    Icon::new(Lucide::ChevronsDownUp)
 }

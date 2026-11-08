@@ -261,12 +261,30 @@ pub fn render_changes(
                                         })
                                     }),
                             )
+                            .child({
+                                let path = file.file.clone();
+                                Button::new(SharedString::from(format!("open-tab-{i}")))
+                                    .icon(gpui_kit::component::IconName::File)
+                                    .ghost()
+                                    .xsmall()
+                                    .tooltip("Open in a tab")
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        window.dispatch_action(
+                                            Box::new(super::keys::OpenFile {
+                                                path: path.clone(),
+                                                line: None,
+                                            }),
+                                            cx,
+                                        );
+                                    })
+                            })
                             .child(
                                 Button::new(SharedString::from(format!("open-file-{i}")))
                                     .icon(gpui_kit::component::IconName::ExternalLink)
                                     .ghost()
                                     .xsmall()
-                                    .tooltip("Open in editor")
+                                    .tooltip("Open in external editor")
                                     .on_click(move |_, _, cx| {
                                         cx.stop_propagation();
                                         open_c

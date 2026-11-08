@@ -228,6 +228,12 @@ pub enum Event {
         session_id: String,
         message: String,
     },
+    /// `filesystem.changed` for a watched file (see `Api::watch_file`).
+    /// `file` is as the server sends it (absolute or folder-relative).
+    FileChanged {
+        file: String,
+        removed: bool,
+    },
     /// Anything we don't model yet. Carries the wire `type` for logging.
     Other(String),
 }
@@ -355,6 +361,10 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
         },
         "shell.deleted" => Event::ShellDeleted {
             id: str_at(d, "/id")?,
+        },
+        "filesystem.changed" => Event::FileChanged {
+            file: str_at(d, "/file")?,
+            removed: d.get("event").and_then(Value::as_str) == Some("unlink"),
         },
         "vcs.branch.updated" => Event::BranchChanged {
             branch: str_at(d, "/branch"),
@@ -498,6 +508,25 @@ mod tests {
         );
         let c = Envelope::from_json(r#"{"type":"agent.updated","data":{}}"#).unwrap();
         assert_eq!(c.event, Event::CatalogChanged);
+    }
+
+    #[test]
+    fn decodes_filesystem_changed() {
+        // Shape from the 2.2.6 OpenAPI schema (`filesystem.changed`).
+        let e = Envelope::from_json(r#"{"id":"evt_1","created":5,"type":"filesystem.changed","location":{"directory":"/repo"},"data":{"file":"src/a.rs","event":"unlink"}}"#).unwrap();
+        assert_eq!(
+            e.event,
+            Event::FileChanged {
+                file: "src/a.rs".into(),
+                removed: true
+            }
+        );
+        assert_eq!(e.directory.as_deref(), Some(std::path::Path::new("/repo")));
+        let c = Envelope::from_json(
+            r#"{"type":"filesystem.changed","data":{"file":"/repo/b.rs","event":"change"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(c.event, Event::FileChanged { removed: false, .. }));
     }
 
     #[test]

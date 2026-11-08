@@ -6,6 +6,7 @@
 
 pub mod events;
 pub mod features;
+pub mod fs;
 pub mod model;
 pub mod pty;
 

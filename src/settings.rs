@@ -68,6 +68,8 @@ pub struct Settings {
     /// Right-hand panel: open tab (`None`: closed) and width.
     pub panel: Option<PanelTab>,
     pub panel_width: Option<f32>,
+    /// Editor tabs open per folder (paths relative to it), in tab order.
+    pub open_files: BTreeMap<PathBuf, Vec<String>>,
 }
 
 /// Transcript density, cycled with Ctrl+O.
@@ -109,6 +111,7 @@ pub enum PanelTab {
     Changes,
     Tasks,
     Terminal,
+    Files,
 }
 
 impl Default for Settings {
@@ -134,6 +137,7 @@ impl Default for Settings {
             pinned: Vec::new(),
             panel: None,
             panel_width: None,
+            open_files: BTreeMap::new(),
         }
     }
 }

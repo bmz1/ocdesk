@@ -3,7 +3,9 @@
 Goal: next to the chat, a **file viewer and basic read/write editor** in the
 main area, as tabs: `[Chat] [main.rs ●] [Cargo.toml]`. Modeled on Orca
 (stablyai/orca), adapted to ocdesk's constraints (GPUI, pure opencode client).
-Nothing here is implemented yet.
+**Status (2026-11-08):** phases 1 and 2 are implemented, except "Add
+selection to chat" and the Compare view (the conflict banner offers Reload /
+Keep mine). See handoff.md for what was verified.
 
 ## 1. Research
 

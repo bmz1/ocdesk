@@ -86,6 +86,16 @@ model/agent picked for new sessions are saved in
 session is reopened on start unless a folder is passed on the command line.
 Drag the sidebar's right edge to resize it (double-click resets it).
 
+**Files and editor tabs.** Files open in tabs next to the chat
+(`[Chat] [main.rs ●]`), from the **Files** panel, `Mod+P`, a read/edit tool
+row (↗) or the Changes panel. Tabs belong to the folder and are reopened on
+start. Saving is explicit (`Mod+S`): before writing, ocdesk checks that the
+file on disk is still the version the tab was based on. When the agent (or
+anything else) changes an open file, a tab without unsaved edits reloads; a
+tab with unsaved edits is never overwritten and offers *Reload* or *Keep
+mine*. Binary files aren't shown; files over 2 MB open read-only. See
+[docs/file-editor-plan.md](docs/file-editor-plan.md).
+
 **Keyboard.** `Mod` is Cmd on macOS and Ctrl elsewhere; `Mod+/` shows the list.
 
 | Keys | Action |
@@ -106,6 +116,10 @@ Drag the sidebar's right edge to resize it (double-click resets it).
 | `Ctrl+O` (macOS) / `Ctrl+Shift+O` | Transcript detail: normal → verbose → hide successful work |
 | `Mod+Shift+I` / `Mod+Shift+R` / `Mod+Shift+M` | Choose model / next reasoning effort / next permission mode |
 | `Mod+Shift+D` / `Mod+Shift+T` / `` Ctrl+` `` | Right panel: Changes / Tasks / Terminal |
+| `Mod+Shift+E` | Right panel: Files (folder tree; click a file to open it in a tab) |
+| `Mod+P` | Go to file (opens it in an editor tab) |
+| `Mod+S` / `Mod+W` | Save / close the editor tab |
+| `Mod+1`, `Mod+Shift+]` / `Mod+Shift+[` | Chat tab, next / previous tab |
 | `Mod+Shift+C` | Copy the last reply |
 | `Mod+Shift+V` | Paste large text inline instead of as a file |
 | `Mod+/` | Keyboard shortcuts |
