@@ -31,7 +31,7 @@ last callers (clippy `dead_code`).
 `agent.updated`, that the model picker lists real models, and that the
 `lead` template actually fans out in parallel.
 
-## Previous work: file explorer + editor tabs
+## Previous work: file explorer + editor tabs 
 
 Branch `claude/file-viewer-editor-tabs-531vxs`. Plan and research:
 [docs/file-editor-plan.md](docs/file-editor-plan.md) (Orca reference, API,

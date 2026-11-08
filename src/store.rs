@@ -196,6 +196,8 @@ pub enum CheckLog {
 #[derive(Default)]
 pub struct Store {
     pub snapshot_revision: u64,
+    pub tasks_revision: u64,
+    pub(crate) shell_snapshots: HashMap<PathBuf, HashSet<String>>,
     /// The `gh` CLI is installed: the Pull request tab and chip show.
     pub gh_available: bool,
     /// Per checkout directory.
@@ -587,6 +589,12 @@ impl Store {
                 M7::Handled(vec![])
             }
             Event::ShellCreated(info) => {
+                if let Some(dir) = &env.directory {
+                    self.shell_snapshots
+                        .entry(dir.clone())
+                        .or_default()
+                        .insert(info.id.clone());
+                }
                 self.shells.insert(info.id.clone(), info.clone());
                 M7::Handled(vec![StoreEvent::TasksChanged])
             }
@@ -655,13 +663,37 @@ impl Store {
         cx.notify();
     }
 
-    /// Replace the shells of one folder with a snapshot.
-    pub fn set_shells(&mut self, shells: Vec<ShellInfo>, cx: &mut Context<Self>) {
+    /// Replace only this folder's shell snapshot, including removed shells.
+    pub fn set_shells(&mut self, dir: &Path, shells: Vec<ShellInfo>, cx: &mut Context<Self>) {
+        self.replace_shells(dir, shells);
+        cx.emit(StoreEvent::TasksChanged);
+        cx.notify();
+    }
+
+    fn replace_shells(&mut self, dir: &Path, shells: Vec<ShellInfo>) {
+        let ids: HashSet<_> = shells.iter().map(|sh| sh.id.clone()).collect();
+        let previous = self
+            .shell_snapshots
+            .insert(dir.to_path_buf(), ids.clone())
+            .unwrap_or_default();
+        let removed: HashSet<_> = self
+            .shells
+            .iter()
+            .filter(|(id, sh)| {
+                !ids.contains(*id)
+                    && (previous.contains(*id)
+                        || sh
+                            .session_id
+                            .as_deref()
+                            .and_then(|sid| self.session(sid))
+                            .is_some_and(|s| s.directory == dir))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.shells.retain(|id, _| !removed.contains(id));
         for sh in shells {
             self.shells.insert(sh.id.clone(), sh);
         }
-        cx.emit(StoreEvent::TasksChanged);
-        cx.notify();
     }
 
     /// Subagent sessions of a session, oldest first.
@@ -923,6 +955,18 @@ impl Store {
     }
 
     pub(crate) fn apply_inner(&mut self, mut env: Envelope) -> Vec<StoreEvent> {
+        if matches!(
+            env.event,
+            Event::SessionUpserted(_)
+                | Event::SessionRemoved { .. }
+                | Event::SessionRenamed { .. }
+                | Event::ShellCreated(_)
+                | Event::ShellExited { .. }
+                | Event::ShellDeleted { .. }
+        ) {
+            self.tasks_revision += 1;
+        }
+
         if matches!(
             env.event,
             Event::ExecutionStarted { .. }
@@ -1803,6 +1847,45 @@ mod tests {
         let second = s.begin_load("ses_c");
         assert_ne!(first, second);
         assert_eq!(s.conversations["ses_c"].load_seq, second);
+    }
+
+    #[test]
+    fn shell_snapshots_remove_missing_entries_only_in_their_folder() {
+        let mut s = Store::default();
+        let shell = |id: &str| ShellInfo {
+            id: id.into(),
+            status: "running".into(),
+            command: "sleep".into(),
+            session_id: None,
+            exit: None,
+            started: 0,
+            completed: None,
+        };
+        s.replace_shells(Path::new("/a"), vec![shell("a")]);
+        s.replace_shells(Path::new("/b"), vec![shell("b")]);
+        s.replace_shells(Path::new("/a"), vec![]);
+        assert!(!s.shells.contains_key("a"));
+        assert!(s.shells.contains_key("b"));
+        // Location-tagged events without session metadata are also reconciled.
+        s.apply_inner(wire(r#"{"type":"shell.created","location":{"directory":"/a"},"data":{"info":{"id":"event","status":"running"}}}"#));
+        assert!(s.shells.contains_key("event"));
+        s.replace_shells(Path::new("/a"), vec![]);
+        assert!(!s.shells.contains_key("event"));
+    }
+
+    #[test]
+    fn live_task_events_invalidate_in_flight_task_snapshots() {
+        let mut s = Store::default();
+        for json in [
+            r#"{"type":"shell.created","data":{"info":{"id":"a","status":"running"}}}"#,
+            r#"{"type":"shell.exited","data":{"id":"a","status":"exited"}}"#,
+            r#"{"type":"shell.deleted","data":{"id":"a"}}"#,
+            r#"{"type":"session.created","data":{"sessionID":"child","parentID":"parent","location":{"directory":"/a"}}}"#,
+        ] {
+            let revision = s.tasks_revision;
+            s.apply_inner(wire(json));
+            assert_ne!(revision, s.tasks_revision);
+        }
     }
 
     #[test]

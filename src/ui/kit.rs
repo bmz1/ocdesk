@@ -35,13 +35,19 @@ impl RowStatus {
     }
 }
 
+/// The app's spinner. Constant rotation is linear: the library default
+/// (ease-in-out per turn) visibly stalls once a revolution.
+pub fn spinner() -> Spinner {
+    Spinner::new().ease(linear)
+}
+
 /// The status slot: spinner or a coloured dot, 16 px wide so titles align.
 pub fn status_slot(status: RowStatus, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let dot = |c: Hsla| div().size(px(7.)).rounded_full().bg(c).into_any_element();
     let inner = match status {
         RowStatus::None => div().into_any_element(),
-        RowStatus::Running => Spinner::new()
+        RowStatus::Running => spinner()
             .xsmall()
             .color(theme.muted_foreground)
             .into_any_element(),

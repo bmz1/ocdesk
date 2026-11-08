@@ -287,7 +287,14 @@ pub fn render_permissions(store: &Store, controller: Entity<Controller>, cx: &Ap
         if let Some(error) = store.permission_errors.get(&key) {
             card = card.child(div().text_color(theme.danger).child(error.clone()));
         }
-        col = col.child(card);
+        // The one thing the agent is blocked on: arrive with a short fade and
+        // a 4 px rise so it catches the eye; leave instantly once answered.
+        // Keyed by request so it plays once, not on every re-render.
+        col = col.child(card.relative().with_animation(
+            SharedString::from(format!("permission-enter-{}", request.id)),
+            Animation::new(std::time::Duration::from_millis(160)).with_easing(ease_out_quint()),
+            |card, delta| card.opacity(delta).top(px(4. * (1. - delta))),
+        ));
     }
     div()
         .id("permission-queue")

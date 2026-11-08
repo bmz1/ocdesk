@@ -68,7 +68,11 @@ pub fn open(controller: Entity<Controller>, window: &mut Window, cx: &mut App) {
     let prefs = controller.read(cx).preferences();
     let view = cx.new(|cx| SettingsView::new(controller, prefs, window, cx));
     window.open_dialog(cx, move |dialog, _, _| {
-        dialog.title("Settings").w(px(780.)).child(view.clone())
+        dialog
+            .entrance(gpui_kit::component::dialog::DialogEntrance::Fade)
+            .title("Settings")
+            .w(px(780.))
+            .child(view.clone())
     });
 }
 fn input(

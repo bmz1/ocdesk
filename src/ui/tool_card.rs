@@ -7,7 +7,6 @@ use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::clipboard::Clipboard;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -149,7 +148,7 @@ fn task_row(
             .child(div().min_w_0().truncate().child(title))
             .child(div().flex_none().text_xs().child(detail))
             .when(running, |el| {
-                el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+                el.child(super::kit::spinner().xsmall().color(theme.muted_foreground))
             })
             .when_some(target, |el, target| {
                 el.child(Icon::new(IconName::ChevronRight).xsmall())
@@ -292,7 +291,7 @@ fn render_fanout(calls: &[&ToolCall], message_id: &str, ctx: &ToolCtx, cx: &App)
         .child(super::icons::workflow().small())
         .child(div().min_w_0().truncate().child(summary))
         .when(running > 0, |el| {
-            el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+            el.child(super::kit::spinner().xsmall().color(theme.muted_foreground))
         });
     let last = calls.len() - 1;
     let branches = calls.iter().enumerate().map(|(i, t)| {
@@ -375,7 +374,9 @@ fn render_fanout(calls: &[&ToolCall], message_id: &str, ctx: &ToolCtx, cx: &App)
                             })
                             .child(div().flex_none().text_xs().text_color(color).child(state))
                             .when(state == "running", |el| {
-                                el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+                                el.child(
+                                    super::kit::spinner().xsmall().color(theme.muted_foreground),
+                                )
                             })
                             .when(target.is_some(), |el| {
                                 el.child(
@@ -447,7 +448,7 @@ fn render_group(tools: &[&ToolCall], message_id: &str, ctx: &ToolCtx, cx: &App) 
             )
         })
         .when(running, |el| {
-            el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+            el.child(super::kit::spinner().xsmall().color(theme.muted_foreground))
         })
         .child(chevron(open));
     v_flex()
@@ -497,7 +498,7 @@ fn render_tool(t: &ToolCall, message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyEl
                 .child(row_summary(t)),
         )
         .when(is_running(t), |el| {
-            el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+            el.child(super::kit::spinner().xsmall().color(theme.muted_foreground))
         })
         .children(open_file_button(t, &key))
         .child(chevron(open));

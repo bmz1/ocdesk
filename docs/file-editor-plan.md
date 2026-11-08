@@ -154,9 +154,14 @@ and instant). Then:
 1. `GET fs/read` with `If-None-Match: <etag>`.
    - 304 → write.
    - 200 → the disk moved: go to the conflict banner and don't write.
-2. `POST experimental/fs/write`, then re-read headers for the new ETag (write
-   returns none), and set `disk_text` and `dirty=false`.
+2. `POST experimental/fs/write`, then re-read the content and ETag (write
+   returns none). Accept the ETag only if the decoded, complete content matches
+   the submitted text. A different readback becomes a conflict; missing or failed
+   readbacks never mark the buffer saved. Without an ETag, the preflight read
+   compares content instead.
 3. Errors → notice bar (existing `controller.notice`). The buffer stays dirty.
+   File-change events received during an operation queue another check of that
+   file once the operation completes.
 
 The race between steps 1 and 2 is accepted. Closing a dirty tab, switching
 folders with dirty tabs, or quitting (`on_app_quit`) → a confirm dialog:

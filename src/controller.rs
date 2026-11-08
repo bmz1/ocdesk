@@ -81,6 +81,7 @@ pub struct Controller {
     usage_revision: std::collections::HashMap<String, u64>,
     attention_seen: std::collections::HashSet<String>,
     diff_requests: std::collections::HashMap<String, u64>,
+    task_requests: std::collections::HashMap<PathBuf, u64>,
     pump: Option<(tokio::task::AbortHandle, Task<()>)>,
     exit_watch: Option<Task<()>>,
     recent_crashes: Vec<Instant>,
@@ -136,6 +137,7 @@ impl Controller {
             generation: 0,
             connection_epoch: 0,
             diff_requests: Default::default(),
+            task_requests: Default::default(),
             mode_requests: Default::default(),
             grant_requests: 0,
             usage_revision: Default::default(),
@@ -748,28 +750,47 @@ impl Controller {
     /// Re-read a session's subagent sessions and its folder's shells.
     pub fn refresh_tasks(&mut self, sid: String, cx: &mut Context<Self>) {
         let Some(api) = self.api.clone() else { return };
-        let dir = self
+        let Some(dir) = self
             .store
             .read(cx)
             .session(&sid)
-            .map(|s| s.directory.clone());
+            .map(|s| s.directory.clone())
+        else {
+            return;
+        };
+        let request = self.task_requests.entry(dir.clone()).or_default();
+        *request += 1;
+        let request = *request;
+        let guard = (
+            self.generation,
+            self.connection_epoch,
+            self.store.read(cx).tasks_revision,
+        );
         let target = sid.clone();
+        let folder = dir.clone();
         self.run(
             cx,
             async move {
-                let kids = api.children(&sid).await?;
-                let shells = match dir {
-                    Some(d) => api.shells(&d).await.unwrap_or_default(),
-                    None => vec![],
-                };
-                Ok((kids, shells))
+                let (kids, shells) = futures::join!(api.children(&sid), api.shells(&dir));
+                Ok((kids?, shells?))
             },
-            move |this, res, cx| match res {
-                Ok((kids, shells)) => this.store.update(cx, |s, cx| {
-                    s.set_children(&target, kids, cx);
-                    s.set_shells(shells, cx);
-                }),
-                Err(e) => tracing::warn!("could not read tasks of {target}: {e:#}"),
+            move |this, res, cx| {
+                if (this.generation, this.connection_epoch) != (guard.0, guard.1)
+                    || this.task_requests.get(&folder) != Some(&request)
+                {
+                    return;
+                }
+                if this.store.read(cx).tasks_revision != guard.2 {
+                    this.refresh_tasks(target, cx);
+                    return;
+                }
+                match res {
+                    Ok((kids, shells)) => this.store.update(cx, |s, cx| {
+                        s.set_children(&target, kids, cx);
+                        s.set_shells(&folder, shells, cx);
+                    }),
+                    Err(e) => tracing::warn!("could not read tasks of {target}: {e:#}"),
+                }
             },
         );
     }
@@ -1705,7 +1726,7 @@ impl Controller {
         let original_selection = store.selected.clone();
         let (draft_model, draft_agent) = (store.draft_model.clone(), store.draft_agent.clone());
         let Some(folder) = target.map(|t| t.1).or_else(|| store.target_folder()) else {
-            self.notice("Add a folder first", cx);
+            self.notice("Add a project first", cx);
             return;
         };
         let permission_mode = store

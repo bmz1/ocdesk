@@ -71,6 +71,7 @@ struct Buffer {
     /// A load, save or revalidation is in flight.
     busy: bool,
     saving: bool,
+    revalidate_pending: bool,
     close_after_save: bool,
     /// Line to reveal once loaded (1-based).
     pending_line: Option<u32>,
@@ -94,6 +95,26 @@ struct Folder {
 enum Saved {
     Done { etag: Option<String> },
     Changed(Conflict),
+}
+
+/// Validate the content/version pair returned after a write. A concurrent
+/// writer is a conflict, never a successful save with that writer's ETag.
+fn saved_readback(read: ReadResult, expected: &str) -> Result<Saved> {
+    match read {
+        ReadResult::Missing => Ok(Saved::Changed(Conflict::Deleted)),
+        ReadResult::NotModified => Err(anyhow!("unexpected 304 while verifying saved file")),
+        ReadResult::Body { bytes, etag, total } => match files::decode(&bytes, total) {
+            Content::Text {
+                text,
+                truncated: false,
+                ..
+            } if text == expected => Ok(Saved::Done { etag }),
+            Content::Text { text, crlf, .. } => {
+                Ok(Saved::Changed(Conflict::Changed { text, etag, crlf }))
+            }
+            Content::Binary => Err(anyhow!("file became binary while verifying save")),
+        },
+    }
 }
 
 /// Await a controller reply; `None` means opencode isn't running.
@@ -271,7 +292,7 @@ impl FileTabs {
         self.restore(window, cx);
         let Some(rel) = files::relative_to(&dir, path) else {
             self.controller.update(cx, |c, cx| {
-                c.show_notice(format!("{path} is outside this folder"), cx)
+                c.show_notice(format!("{path} is outside this project"), cx)
             });
             return;
         };
@@ -339,6 +360,7 @@ impl FileTabs {
             conflict: None,
             busy: false,
             saving: false,
+            revalidate_pending: false,
             close_after_save: false,
             pending_line: line,
             _sub: sub,
@@ -389,7 +411,12 @@ impl FileTabs {
                     }
                     Err(e) => b.status = Status::Failed(format!("{e:#}")),
                 }
+                let pending = std::mem::take(&mut b.revalidate_pending);
+                let pending_file = b.rel.clone();
                 cx.notify();
+                if pending {
+                    this.revalidate(Some(dir.clone()), Some(pending_file), window, cx);
+                }
             });
         })
         .detach();
@@ -412,7 +439,11 @@ impl FileTabs {
                 let matches = file.as_deref().is_none_or(|file| {
                     file == b.rel || files::relative_to(d, file).as_deref() == Some(&b.rel)
                 });
-                if !matches || b.busy || b.status == Status::Loading {
+                if !matches {
+                    continue;
+                }
+                if b.busy || b.status == Status::Loading {
+                    b.revalidate_pending = true;
                     continue;
                 }
                 b.busy = true;
@@ -429,7 +460,7 @@ impl FileTabs {
                     };
                     b.busy = false;
                     match res {
-                        Ok(ReadResult::NotModified) => return,
+                        Ok(ReadResult::NotModified) => {}
                         Ok(ReadResult::Missing) => {
                             if b.status == Status::Ready {
                                 b.conflict = Some(Conflict::Deleted);
@@ -461,7 +492,12 @@ impl FileTabs {
                         }
                         Err(e) => tracing::warn!("revalidate {}: {e:#}", b.rel),
                     }
+                    let pending = std::mem::take(&mut b.revalidate_pending);
+                    let pending_file = b.rel.clone();
                     cx.notify();
+                    if pending {
+                        this.revalidate(Some(dir.clone()), Some(pending_file), window, cx);
+                    }
                 });
             })
             .detach();
@@ -507,16 +543,21 @@ impl FileTabs {
         let controller = self.controller.clone();
         cx.spawn_in(window, async move |this, cx| {
             let fut = async {
-                // The disk must still hold what this tab was based on.
-                if let Some(tag) = etag {
-                    let rx = controller
-                        .update(cx, |c, _| c.fs_read(dir.clone(), rel.clone(), Some(tag)));
+                // Check contents even when the server supplied no ETag.
+                {
+                    let rx =
+                        controller.update(cx, |c, _| c.fs_read(dir.clone(), rel.clone(), etag));
                     match recv(rx).await? {
                         ReadResult::NotModified => {}
+                        ReadResult::Missing if deleted => {}
                         ReadResult::Missing => return Ok(Saved::Changed(Conflict::Deleted)),
                         ReadResult::Body { bytes, etag, total } => {
                             match files::decode(&bytes, total) {
-                                Content::Text { text, .. } if text == disk => {}
+                                Content::Text {
+                                    text,
+                                    truncated: false,
+                                    ..
+                                } if text == disk => {}
                                 Content::Text { text, crlf, .. } => {
                                     return Ok(Saved::Changed(Conflict::Changed {
                                         text,
@@ -537,22 +578,20 @@ impl FileTabs {
                 }
                 let rx = controller.update(cx, |c, _| c.fs_write(dir.clone(), rel.clone(), bytes));
                 recv(rx).await?;
-                // The write returns no ETag: read it back for the next check.
+                // Never attach a version to content it did not describe.
                 let rx = controller.update(cx, |c, _| c.fs_read(dir.clone(), rel.clone(), None));
-                let etag = match recv(rx).await {
-                    Ok(ReadResult::Body { etag, .. }) => etag,
-                    _ => None,
-                };
-                Ok::<_, anyhow::Error>(Saved::Done { etag })
+                saved_readback(recv(rx).await?, &text)
             };
             let res = fut.await;
-            let _ = this.update_in(cx, |this, _, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 let Some(b) = this.buffer_mut(&dir, id) else {
                     return;
                 };
                 b.busy = false;
                 b.saving = false;
                 let close = std::mem::take(&mut b.close_after_save);
+                let pending = std::mem::take(&mut b.revalidate_pending);
+                let pending_file = b.rel.clone();
                 match res {
                     Ok(Saved::Done { etag }) => {
                         b.disk = text;
@@ -570,6 +609,9 @@ impl FileTabs {
                     }
                 }
                 cx.notify();
+                if pending {
+                    this.revalidate(Some(dir.clone()), Some(pending_file), window, cx);
+                }
             });
         })
         .detach();
@@ -1035,4 +1077,46 @@ fn centered(text: &str, theme: &gpui_kit::component::Theme) -> Div {
         .text_sm()
         .text_color(theme.muted_foreground)
         .child(text.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Conflict, Saved, saved_readback};
+    use crate::api::fs::ReadResult;
+
+    #[test]
+    fn concurrent_write_during_save_is_a_conflict() {
+        let result = saved_readback(
+            ReadResult::Body {
+                bytes: b"agent edit".to_vec(),
+                etag: Some("agent-version".into()),
+                total: 10,
+            },
+            "user edit",
+        )
+        .unwrap();
+        assert!(
+            matches!(result, Saved::Changed(Conflict::Changed { text, etag, .. })
+            if text == "agent edit" && etag.as_deref() == Some("agent-version"))
+        );
+    }
+
+    #[test]
+    fn only_matching_content_accepts_the_readback_version() {
+        let result = saved_readback(
+            ReadResult::Body {
+                bytes: b"user edit\r\n".to_vec(),
+                etag: Some("user-version".into()),
+                total: 11,
+            },
+            "user edit\n",
+        )
+        .unwrap();
+        assert!(matches!(result, Saved::Done { etag } if etag.as_deref() == Some("user-version")));
+        assert!(saved_readback(ReadResult::NotModified, "user edit").is_err());
+        assert!(matches!(
+            saved_readback(ReadResult::Missing, "user edit").unwrap(),
+            Saved::Changed(Conflict::Deleted)
+        ));
+    }
 }

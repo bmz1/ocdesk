@@ -8,7 +8,6 @@ use std::path::PathBuf;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, h_flex, v_flex,
 };
@@ -139,7 +138,7 @@ impl PullRequestPanel {
             .font_weight(FontWeight::MEDIUM)
             .child(div().flex_1().min_w_0().child(title))
             .when(loading, |el| {
-                el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+                el.child(super::kit::spinner().xsmall().color(theme.muted_foreground))
             })
             .when_some(url, |el, url| {
                 el.child(
@@ -302,7 +301,7 @@ impl PullRequestPanel {
                         .gap_2()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(Spinner::new().xsmall())
+                        .child(super::kit::spinner().xsmall())
                         .child("Loading log…")
                         .into_any_element(),
                     Some(CheckLog::Failed(e)) => div()

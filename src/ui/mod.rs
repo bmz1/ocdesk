@@ -47,7 +47,7 @@ pub fn add_folder(controller: Entity<Controller>, window: &mut Window, cx: &mut 
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Add folder".into()),
+            prompt: Some("Add project".into()),
         })
     });
     let handle = window.window_handle();
@@ -81,7 +81,7 @@ fn open_path_dialog(controller: Entity<Controller>, window: &mut Window, cx: &mu
         }
         let (input, controller) = (input.clone(), controller.clone());
         alert
-            .title("Add folder")
+            .title("Add project")
             .description(Input::new(&input))
             .confirm()
             .ok_text("Add")

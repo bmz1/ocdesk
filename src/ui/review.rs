@@ -55,7 +55,7 @@ fn fingerprint(store: &Store) -> u64 {
             (
                 &f.file,
                 &f.status,
-                f.patch.len(),
+                &f.patch,
                 f.additions,
                 f.deletions,
                 f.more,
@@ -68,7 +68,9 @@ fn fingerprint(store: &Store) -> u64 {
     store.diff_loading.contains(sid).hash(&mut h);
     store.diff_errors.get(sid).hash(&mut h);
     store.preferences.viewed.len().hash(&mut h);
-    store.preferences.viewed.values().sum::<u64>().hash(&mut h);
+    let mut viewed: Vec<_> = store.preferences.viewed.iter().collect();
+    viewed.sort_unstable_by_key(|(key, _)| *key);
+    viewed.hash(&mut h);
     h.finish()
 }
 
@@ -350,6 +352,36 @@ impl Render for ChangesPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn fingerprint_tracks_content_and_viewed_file_identity_without_overflow() {
+        let mut store = Store {
+            selected: Some("session".into()),
+            ..Default::default()
+        };
+        let file = crate::api::model::FileDiff {
+            file: "a.rs".into(),
+            status: "modified".into(),
+            patch: "-a\n+b".into(),
+            additions: 1,
+            deletions: 1,
+            more: false,
+        };
+        store.diffs.insert("session".into(), vec![file]);
+        let before = fingerprint(&store);
+        store.diffs.get_mut("session").unwrap()[0].patch = "-c\n+d".into();
+        assert_ne!(before, fingerprint(&store));
+        for i in 0..5 {
+            store
+                .preferences
+                .viewed
+                .insert(format!("file-{i}"), u64::MAX);
+        }
+        let before = fingerprint(&store);
+        store.preferences.viewed.remove("file-0");
+        store.preferences.viewed.insert("other".into(), u64::MAX);
+        assert_ne!(before, fingerprint(&store));
+    }
 
     #[::core::prelude::v1::test]
     fn comments_become_one_prompt_with_locations() {

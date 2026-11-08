@@ -27,6 +27,7 @@ pub fn open(sid: String, controller: Entity<Controller>, window: &mut Window, cx
     });
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
+            .entrance(gpui_kit::component::dialog::DialogEntrance::Fade)
             .title("Usage and context")
             .w(px(650.))
             .child(view.clone())
