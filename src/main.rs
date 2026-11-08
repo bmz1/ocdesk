@@ -1,4 +1,5 @@
-mod api;mod controller;
+mod api;
+mod controller;
 mod demo;
 mod notifications;
 mod settings;
