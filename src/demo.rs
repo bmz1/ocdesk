@@ -8,6 +8,8 @@
 //!   `OCDESK_DEMO=250` gives the 500-message perf case.
 //! - `OCDESK_DEMO_DELAY_MS`: delay between streamed words, default 15.
 //! - `OCDESK_DEMO_AUTOPLAY=<prompt>`: send this prompt once at startup.
+//! - `OCDESK_DEMO_APPROVAL=1`: show a pending command approval.
+//! - `OCDESK_DEMO_ERROR=1`: end the history with a failed step.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -144,7 +146,7 @@ fn showcase(now: u64) -> Vec<Message> {
             uri: Some(crate::api::model::file_uri(std::path::Path::new(&path))),
         });
     }
-    vec![
+    let mut turns = vec![
         first,
         Message::Assistant(AssistantMessage {
             id: "msg_z2".into(),
@@ -264,7 +266,26 @@ fn showcase(now: u64) -> Vec<Message> {
             error: None,
             meta: meta("lead", 30),
         }),
-        user("msg_z5", "Run the migration against staging"),
+    ];
+    // OCDESK_DEMO_ERROR=1 ends the history with a failed step (Retry banner).
+    if std::env::var("OCDESK_DEMO_ERROR").is_ok() {
+        turns.extend(failed_turn(
+            user("msg_z5", "Run the migration against staging"),
+            &tool,
+            &meta,
+        ));
+    }
+    turns
+}
+
+fn failed_turn(
+    prompt: Message,
+    tool: &dyn Fn(&str, &str, serde_json::Value, &str, ToolStatus) -> Block,
+    meta: &dyn Fn(&str, u64) -> crate::api::model::Meta,
+) -> [Message; 2] {
+    use serde_json::json;
+    [
+        prompt,
         Message::Assistant(AssistantMessage {
             id: "msg_z6".into(),
             blocks: vec![tool(

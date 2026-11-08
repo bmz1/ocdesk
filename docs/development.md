@@ -62,7 +62,8 @@ assistant, default 20); prompts get a streamed markdown reply through the
 same `Store::apply` path real events take. `OCDESK_DEMO=250` is the
 500-message perf case. `OCDESK_DEMO_DELAY_MS` sets the per-word delay
 (default 15), `OCDESK_DEMO_AUTOPLAY=<prompt>` sends one prompt at startup
-(`long` in it gives the long answer).
+(`long` in it gives the long answer). `OCDESK_DEMO_APPROVAL=1` adds a pending
+command approval and `OCDESK_DEMO_ERROR=1` ends the history with a failed step.
 
 ```sh
 OCDESK_DEMO=250 OCDESK_DEMO_AUTOPLAY="long answer" OCDESK_FRAME_LOG=1 cargo run
