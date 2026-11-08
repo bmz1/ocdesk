@@ -129,6 +129,9 @@ verify registration in an isolated directory.
 
 ## Architecture
 
+See [State machines and transition ownership](state-machines.md) for the lifecycle
+inventory, async ownership contracts and regression scenarios.
+
 ```
 src/
   main.rs            bootstrap: logging, tokio runtime thread, signals, window

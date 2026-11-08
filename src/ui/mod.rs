@@ -13,6 +13,7 @@ pub mod icons;
 pub mod images;
 pub mod keys;
 pub mod kit;
+mod lifecycle;
 pub mod lru;
 pub mod mention;
 pub mod message;

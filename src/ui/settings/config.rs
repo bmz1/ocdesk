@@ -3,6 +3,16 @@ use super::*;
 use crate::opencode_config::{self as config, ConfigFile, Snapshot};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 
+/// Disk I/O and server reload are mutually exclusive; dirty state is independent.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Operation {
+    #[default]
+    Idle,
+    Loading,
+    Saving,
+    Reloading,
+}
+
 pub struct ConfigEditor {
     controller: Entity<Controller>,
     projects: Vec<PathBuf>,
@@ -13,9 +23,7 @@ pub struct ConfigEditor {
     editor: Entity<EditorState>,
     baseline: String,
     dirty: bool,
-    busy: bool,
-    saving: bool,
-    reloading: bool,
+    operation: Operation,
     error: Option<String>,
     message: Option<String>,
     _sub: Subscription,
@@ -55,9 +63,7 @@ impl ConfigEditor {
             editor,
             baseline: String::new(),
             dirty: false,
-            busy: false,
-            saving: false,
-            reloading: false,
+            operation: Operation::Idle,
             error: None,
             message: None,
             _sub: sub,
@@ -65,7 +71,7 @@ impl ConfigEditor {
     }
 
     pub fn has_unsaved_changes(&self) -> bool {
-        self.dirty || self.saving
+        self.dirty || self.operation == Operation::Saving
     }
 
     pub fn show_project(
@@ -74,7 +80,8 @@ impl ConfigEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy || self.reloading || (self.project == project && self.snapshot.is_some()) {
+        if self.operation != Operation::Idle || (self.project == project && self.snapshot.is_some())
+        {
             return;
         }
         if self.dirty {
@@ -88,7 +95,7 @@ impl ConfigEditor {
     }
 
     pub fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.reloading {
+        if self.operation != Operation::Idle {
             return;
         }
         if self.dirty {
@@ -105,7 +112,7 @@ impl ConfigEditor {
         let project = self.project.clone();
         self.snapshot = None;
         self.files.clear();
-        self.busy = true;
+        self.operation = Operation::Loading;
         self.error = None;
         self.message = None;
         self.editor.update(cx, |e, cx| e.set_readonly(true, cx));
@@ -124,7 +131,7 @@ impl ConfigEditor {
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = false;
+                this.operation = Operation::Idle;
                 match result {
                     Ok((files, snapshot)) => {
                         this.files = files;
@@ -157,10 +164,10 @@ impl ConfigEditor {
     }
 
     fn read_file(&mut self, file: ConfigFile, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.reloading {
+        if self.operation != Operation::Idle {
             return;
         }
-        self.busy = true;
+        self.operation = Operation::Loading;
         self.editor.update(cx, |e, cx| e.set_readonly(true, cx));
         let task = cx
             .background_executor()
@@ -168,7 +175,7 @@ impl ConfigEditor {
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = false;
+                this.operation = Operation::Idle;
                 match result {
                     Ok(snapshot) => this.install(snapshot, window, cx),
                     Err(e) => {
@@ -188,7 +195,7 @@ impl ConfigEditor {
         let Some(snapshot) = self.snapshot.clone() else {
             return;
         };
-        if self.busy || self.reloading || snapshot.file.inherited {
+        if self.operation != Operation::Idle || snapshot.file.inherited {
             return;
         }
         let crlf = snapshot
@@ -197,8 +204,7 @@ impl ConfigEditor {
             .is_some_and(|s| s.contains("\r\n"));
         let text = String::from_utf8(crate::files::encode(&self.editor.read(cx).value(), crlf))
             .expect("UTF-8 editor content");
-        self.busy = true;
-        self.saving = true;
+        self.operation = Operation::Saving;
         self.error = None;
         self.message = None;
         self.editor.update(cx, |e, cx| e.set_readonly(true, cx));
@@ -208,8 +214,7 @@ impl ConfigEditor {
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = false;
-                this.saving = false;
+                this.operation = Operation::Idle;
                 match result {
                     Ok(snapshot) => {
                         this.install(snapshot, window, cx);
@@ -230,7 +235,7 @@ impl ConfigEditor {
     }
 
     fn reload_opencode(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.dirty || self.reloading {
+        if self.operation != Operation::Idle || self.dirty {
             return;
         }
         let rx = match self.controller.read(cx).reload_configuration(cx) {
@@ -241,7 +246,7 @@ impl ConfigEditor {
                 return;
             }
         };
-        self.reloading = true;
+        self.operation = Operation::Reloading;
         self.error = None;
         self.message = None;
         cx.spawn(async move |this, cx| {
@@ -249,7 +254,7 @@ impl ConfigEditor {
                 .await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("OpenCode reload was interrupted")));
             let _ = this.update(cx, |this, cx| {
-                this.reloading = false;
+                this.operation = Operation::Idle;
                 match result {
                     Ok(()) => {
                         this.message = Some("OpenCode configuration reloaded.".into());
@@ -269,7 +274,7 @@ impl ConfigEditor {
 impl Render for ConfigEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let locked = self.busy || self.reloading;
+        let locked = self.operation != Operation::Idle;
         let scope_locked = locked || self.dirty;
         let weak = cx.weak_entity();
         let projects = self.projects.clone();
@@ -295,8 +300,7 @@ impl Render for ConfigEditor {
                             .checked(current_project.as_ref() == Some(&folder))
                             .on_click(move |_, window, cx| {
                                 let _ = weak.update(cx, |this, cx| {
-                                    this.project = Some(folder.clone());
-                                    this.load(window, cx);
+                                    this.show_project(Some(folder.clone()), window, cx);
                                 });
                             }),
                     );
@@ -344,14 +348,15 @@ impl Render for ConfigEditor {
             .child(h_flex().gap_1().items_center()
                 .child(Button::new("config-global").label("Global").small()
                     .when(self.project.is_none(), |b| b.outline()).when(self.project.is_some(), |b| b.ghost())
-                    .disabled(scope_locked).on_click(cx.listener(|this, _, window, cx| { this.project = None; this.load(window, cx); })))
+                    .disabled(scope_locked).on_click(cx.listener(|this, _, window, cx| { this.show_project(None, window, cx); })))
                 .child(project)
                 .child(div().flex_1())
                 .child(Button::new("config-schema").label("Config reference ↗").ghost().xsmall()
                     .on_click(|_, _, cx| cx.open_url("https://opencode.ai/v2/docs/config"))))
             .child(div().w_full().min_w_0().overflow_x_hidden().child(chooser))
             .child(div().text_xs().text_color(theme.muted_foreground).child(
-                if self.busy { "Loading / saving configuration…" }
+                if self.operation == Operation::Loading { "Loading configuration…" }
+                else if self.operation == Operation::Saving { "Saving configuration…" }
                 else if inherited { "Inherited from a parent directory · read-only. Choose this project's config to add overrides." }
                 else if missing { "No file yet. Create this JSONC configuration when you're ready." }
                 else if self.dirty { "Unsaved changes · save or discard before switching files." }
@@ -373,7 +378,7 @@ impl Render for ConfigEditor {
                         this.controller.update(cx, |c, cx| c.open_agent_file(snapshot.file.path.clone(), cx));
                     } }))))
             .child(h_flex().gap_2().items_center()
-                .child(Button::new("config-reload-opencode").label(if self.reloading { "Reloading OpenCode…" } else { "Reload OpenCode" }).outline().small()
+                .child(Button::new("config-reload-opencode").label(if self.operation == Operation::Reloading { "Reloading OpenCode…" } else { "Reload OpenCode" }).outline().small()
                     .disabled(locked || self.dirty).on_click(cx.listener(|this, _, _, cx| this.reload_opencode(cx))))
                 .child(div().text_xs().text_color(theme.muted_foreground).child("Available when all sessions are idle.")))
     }

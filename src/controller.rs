@@ -1040,7 +1040,11 @@ impl Controller {
     /// Switch the selected session to the build agent and implement the
     /// plan it just wrote.
     pub fn implement_plan(&mut self, cx: &mut Context<Self>) {
-        let Some(sid) = self.store.read(cx).selected.clone() else {
+        let store = self.store.read(cx);
+        let Some(sid) = store.selected.clone() else {
+            return;
+        };
+        let Some(folder) = store.session(&sid).map(|s| s.directory.clone()) else {
             return;
         };
         let prompt = PromptInput {
@@ -1052,21 +1056,25 @@ impl Controller {
             return;
         }
         let Some(api) = self.api(cx) else { return };
-        self.store.update(cx, |s, cx| {
-            s.set_draft_choice(None, Some("build".into()), cx)
-        });
+        // Shown at once and rolled back on failure (see domain::choice); the
+        // draft default for new sessions only changes once the server agreed.
         let token = self.show_agent(&sid, "build", cx);
-        let target = sid.clone();
-        // The prompt must run with the new agent, so it waits for the switch.
+        let session = sid.clone();
+        // Switching threads while the request runs must not retarget the
+        // prompt. A sidecar restart also invalidates this continuation.
         self.run_on(
             cx,
             self.issued(RequestScope::Server),
-            async move { api.switch_agent(&sid, "build").await },
+            async move { api.switch_agent(&session, "build").await },
             move |this, res, cx| {
-                let failed = res.is_err();
-                this.settle_agent(target, token, "build".into(), failed, cx);
+                this.settle_agent(sid.clone(), token, "build".into(), res.is_err(), cx);
                 match res {
-                    Ok(()) => this.send_prompt(prompt, cx),
+                    Ok(()) => {
+                        this.store.update(cx, |s, cx| {
+                            s.set_draft_choice(None, Some("build".into()), cx)
+                        });
+                        this.submit_to(Submission::Prompt(prompt), Some((Some(sid), folder)), cx);
+                    }
                     Err(e) => {
                         this.notice(format!("Could not switch to the build agent: {e:#}"), cx)
                     }
