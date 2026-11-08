@@ -30,6 +30,9 @@ pub enum TaskView {
     List,
     Subagent(String),
     Shell(String),
+    /// The Browser panel, at this agent-browser session (or following the
+    /// conversation). Handled by the conversation view, not this drawer.
+    Browser(Option<crate::browser::SessionKey>),
 }
 
 /// Something in the transcript that opens the drawer.
@@ -94,6 +97,7 @@ impl TasksDrawer {
                 self.controller.update(cx, |c, cx| c.load_child(child, cx));
             }
             TaskView::Shell(id) => self.start_polling(id.clone(), cx),
+            TaskView::Browser(_) => {}
         }
         self.view = view;
         cx.notify();
@@ -458,7 +462,9 @@ impl Render for TasksDrawer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let (title, body) = match self.view.clone() {
-            TaskView::List => ("Background tasks".to_string(), self.render_list(cx)),
+            TaskView::List | TaskView::Browser(_) => {
+                ("Background tasks".to_string(), self.render_list(cx))
+            }
             TaskView::Subagent(child) => {
                 let store = self.store.read(cx);
                 let parent = store.selected.clone().unwrap_or_default();

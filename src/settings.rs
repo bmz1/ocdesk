@@ -113,6 +113,7 @@ pub enum PanelTab {
     Terminal,
     Files,
     Agents,
+    Browser,
 }
 
 impl Default for Settings {

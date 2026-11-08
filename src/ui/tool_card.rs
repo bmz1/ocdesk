@@ -249,6 +249,22 @@ pub fn render_tools(
                 continue;
             }
         }
+        // A run of agent-browser shell calls: one Browser row.
+        if browser_call(t).is_some() {
+            let n = tools[i - 1..]
+                .iter()
+                .take_while(|t| browser_call(t).is_some())
+                .count();
+            flush(&mut run, &mut out);
+            out.push(render_browser(
+                &tools[i - 1..i - 1 + n],
+                message_id,
+                ctx,
+                cx,
+            ));
+            i += n - 1;
+            continue;
+        }
         if hidden_in(t, ctx.density) && t.name != "subagent" {
             continue;
         }
@@ -407,6 +423,135 @@ fn render_fanout(calls: &[&ToolCall], message_id: &str, ctx: &ToolCtx, cx: &App)
         .gap_1()
         .child(header)
         .child(v_flex().w_full().pl_1().children(branches))
+        .into_any_element()
+}
+
+/// The agent-browser invocations of a shell call, if it makes any.
+fn browser_call(t: &ToolCall) -> Option<Vec<crate::browser::Invocation>> {
+    if !matches!(t.name.as_str(), "shell" | "bash") {
+        return None;
+    }
+    let inv = crate::browser::invocations(str_input(t, "command")?);
+    (!inv.is_empty()).then_some(inv)
+}
+
+/// Consecutive agent-browser calls as one row: "Browser · open a.dev,
+/// snapshot, click @e2 +3". The globe opens the Browser panel on that
+/// session; the row expands into the individual calls.
+fn render_browser(calls: &[&ToolCall], message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyElement {
+    use super::tasks::TaskView;
+    let theme = cx.theme();
+    let inv: Vec<crate::browser::Invocation> = calls
+        .iter()
+        .filter_map(|t| browser_call(t))
+        .flatten()
+        .collect();
+    let actions: Vec<String> = inv
+        .iter()
+        .map(|i| {
+            // `snapshot -i --json` reads better as `snapshot`.
+            let a = i
+                .action
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if a.starts_with("snapshot") {
+                "snapshot".into()
+            } else {
+                a
+            }
+        })
+        .filter(|a| !a.is_empty())
+        .collect();
+    let shown = 3;
+    let mut summary = actions
+        .iter()
+        .take(shown)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if actions.len() > shown {
+        summary.push_str(&format!(" +{}", actions.len() - shown));
+    }
+    let session = inv.last().map(|i| i.session.clone());
+    let session_label = session
+        .as_ref()
+        .filter(|s| s.name != crate::browser::DEFAULT_SESSION || s.namespace.is_some())
+        .map(|s| s.label());
+    let running = calls.iter().any(|t| is_running(t));
+    let failed = calls
+        .iter()
+        .filter(|t| t.status == ToolStatus::Error)
+        .count();
+    let key = key(message_id, &format!("browser-{}", calls[0].call_id));
+    let open = ctx.is_open(&key) || calls.iter().any(|t| ctx.found(t));
+    let toggle = ctx.toggle.clone();
+    let click_key = key.clone();
+    let open_panel = ctx.open_task.clone();
+    let header = h_flex()
+        .id(SharedString::from(format!("browser-{key}")))
+        .max_w_full()
+        .gap_1p5()
+        .items_center()
+        .text_sm()
+        .text_color(theme.muted_foreground)
+        .cursor_pointer()
+        .hover(|s| s.text_color(theme.foreground))
+        .on_click(move |_, _, cx| toggle(click_key.clone(), cx))
+        .child(
+            div()
+                .id(SharedString::from(format!("browser-open-{key}")))
+                .flex_none()
+                .rounded_sm()
+                .hover(|s| s.text_color(theme.primary))
+                .child(super::icons::globe().small())
+                .tooltip(|window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new("Show in the Browser panel")
+                        .build(window, cx)
+                })
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    open_panel(TaskView::Browser(session.clone()), cx)
+                }),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme.foreground)
+                .child("Browser"),
+        )
+        .when_some(session_label, |el, s| {
+            el.child(div().flex_none().child(format!("@{s}")))
+        })
+        .child(div().min_w_0().truncate().child(summary))
+        .when(failed > 0, |el| {
+            el.child(
+                div()
+                    .flex_none()
+                    .text_color(theme.danger)
+                    .child(format!("· {failed} failed")),
+            )
+        })
+        .when(running, |el| {
+            el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+        })
+        .child(chevron(open));
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(header)
+        .when(open, |col| {
+            col.child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .pl_3()
+                    .border_l_1()
+                    .border_color(theme.border)
+                    .children(calls.iter().map(|t| render_tool(t, message_id, ctx, cx))),
+            )
+        })
         .into_any_element()
 }
 

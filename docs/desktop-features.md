@@ -122,6 +122,55 @@ server-default model is resolved from the context when absent from session info.
 Provider limits from the experimental endpoint may be unavailable; that is
 shown explicitly, including endpoint errors, rather than rendered as zero.
 
+## Browser (agent-browser)
+
+First-class support for [agent-browser](https://agent-browser.dev), the
+browser automation CLI agents run from the shell. ocdesk shows the browser
+the agent drives and lets you take over. Verified against agent-browser
+0.41.2 (`src/browser.rs` has the details).
+
+**Browser panel** (`Mod+Shift+B`, right panel; the globe tab shows a dot
+while any agent-browser session runs).
+- Shows the session the selected conversation used last (parsed from its
+  `agent-browser …` shell calls: `--session`, `--namespace`,
+  `AGENT_BROWSER_SESSION=…`, `npx agent-browser`, chained commands), else
+  the first live one. The picker pins another session or goes back to
+  following the conversation.
+- Live view over agent-browser's screencast WebSocket (JPEG frames at up to
+  12 fps, decoded off the UI thread; replaced frames are freed from the GPU
+  atlas). The stream is open only while the tab shows. The header has the
+  current URL; the footer the viewport size and tab count.
+- **Take control** (pointer button) forwards clicks, scrolling and typing
+  (text, Enter, Backspace, Tab, Escape, arrows, Home/End, Page Up/Down) to
+  the page. It's off by default so a stray click doesn't disturb the agent,
+  and turns off when the session ends.
+- Empty state: install command (`npm i -g agent-browser && agent-browser
+  install`) when it isn't on `PATH`, and **Add agent-browser skill to this
+  folder**, which writes `.opencode/skill/agent-browser/SKILL.md` (opencode
+  loads skills from `.opencode/{skill,skills}/<name>/SKILL.md`). The skill
+  points agents at `agent-browser skills get core` for the version-matched
+  guide.
+
+**Read-only discovery.** ocdesk never runs the agent-browser CLI against a
+session: a command with different launch options (env, `--allow-file-access`,
+…) relaunches the browser and loses the page. It reads
+`<socket dir>/<session>.stream` (the port) and `.pid` instead; the socket
+dir is `$AGENT_BROWSER_SOCKET_DIR`, else `$XDG_RUNTIME_DIR/agent-browser`,
+else `~/.agent-browser`, with `namespaces/<ns>/run/` for `--namespace`.
+The agent's shell inherits ocdesk's environment through the sidecar, so
+both resolve the same directory.
+
+**Coordinates.** Frames are the page viewport. Input is mapped with one
+scale from the width (`metadata.deviceWidth / frame width`):
+`deviceHeight` reported the window height (720) for a 577 px viewport.
+
+**Transcript.** Consecutive `agent-browser` shell calls fold into one row,
+"Browser @session open a.dev, snapshot, click @e2 +3", which expands into
+the calls; its globe opens the Browser panel on that session. Demo mode
+seeds such a turn.
+
+![Browser panel](screenshots/browser-panel.png)
+
 ## Agents and subagents
 
 Multi-agent pipelines (architect → swe → parallel security/review/qa →

@@ -115,7 +115,7 @@ mine*. Binary files aren't shown; files over 2 MB open read-only. See
 | `Enter` / `Esc` with an empty prompt | Allow once / deny a pending approval (typed text + Enter denies with feedback) |
 | `Ctrl+O` (macOS) / `Ctrl+Shift+O` | Transcript detail: normal → verbose → hide successful work |
 | `Mod+Shift+I` / `Mod+Shift+R` / `Mod+Shift+M` | Choose model / next reasoning effort / next permission mode |
-| `Mod+Shift+D` / `Mod+Shift+T` / `Mod+Shift+A` / `` Ctrl+` `` | Right panel: Changes / Tasks / Agents / Terminal |
+| `Mod+Shift+D` / `Mod+Shift+T` / `Mod+Shift+A` / `Mod+Shift+B` / `` Ctrl+` `` | Right panel: Changes / Tasks / Agents / Browser / Terminal |
 | `Mod+Shift+E` | Right panel: Files (folder tree; click a file to open it in a tab) |
 | `Mod+P` | Go to file (opens it in an editor tab) |
 | `Mod+S` / `Mod+W` | Save / close the editor tab |
@@ -143,7 +143,7 @@ transcript; click one to see it full size.
 **Right panel.** **Changes** reviews the latest turn, working tree, branch or
 commits file by file; hover a line and press `+` to comment, then **Send to
 agent** turns the comments into one prompt. **Tasks** lists subagents and
-background shells. **Agents** edits opencode's agent files (description,
+background shells. **Browser** shows the browser an agent drives with [agent-browser](https://agent-browser.dev), live, and can take control; see [desktop features](docs/desktop-features.md#browser-agent-browser). **Agents** edits opencode's agent files (description,
 mode, model, prompt) and adds a starter team; see
 [desktop features](docs/desktop-features.md#agents-and-subagents).
 **Terminal** opens the session's shell (opencode's

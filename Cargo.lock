@@ -4482,6 +4482,7 @@ dependencies = [
  "dirs 6.0.0",
  "futures",
  "gpui-kit",
+ "image",
  "libc",
  "rand 0.9.5",
  "reqwest",

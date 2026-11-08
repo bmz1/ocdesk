@@ -607,6 +607,12 @@ impl Controller {
 }
 
 impl Controller {
+    /// The Tokio runtime, for views with their own I/O that doesn't need
+    /// opencode (the browser stream).
+    pub fn runtime(&self) -> tokio::runtime::Handle {
+        self.rt.clone()
+    }
+
     /// The API client and the Tokio runtime, for views that run their own
     /// long-lived I/O (the terminal). `None` while opencode isn't running.
     pub fn api_and_runtime(&self) -> Option<(crate::api::Api, tokio::runtime::Handle)> {

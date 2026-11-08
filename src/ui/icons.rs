@@ -30,7 +30,10 @@ gpui_kit::assets::icon_assets!(
         FolderOpen,
         Files,
         ChevronsDownUp,
-        Bot
+        Bot,
+        FileDiff,
+        Globe,
+        MousePointerClick
     ]
 );
 
@@ -116,4 +119,13 @@ pub fn collapse_all() -> Icon {
 }
 pub fn bot() -> Icon {
     Icon::new(Lucide::Bot)
+}
+pub fn file_diff() -> Icon {
+    Icon::new(Lucide::FileDiff)
+}
+pub fn globe() -> Icon {
+    Icon::new(Lucide::Globe)
+}
+pub fn mouse_pointer() -> Icon {
+    Icon::new(Lucide::MousePointerClick)
 }

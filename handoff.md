@@ -5,7 +5,26 @@ State of ocdesk for whoever picks it up next. Read this first, then
 
 _Last updated: 2026-11-08, file explorer + editor tabs on `claude/file-viewer-editor-tabs-531vxs` (from master @ `85630cf`)._
 
-## Current work: Agents panel + subagent fan-out
+## Current work: agent-browser panel + icon-only tabs
+
+On `claude/jolly-noether-1nz80d` (restarted from master after #13 merged).
+Right-panel tab buttons are icon-only (label info moved to the tooltip; a
+dot marks running tasks / a live browser). New **Browser** tab for
+[agent-browser](https://agent-browser.dev): `src/browser.rs` (read-only
+session discovery, command parsing, stream client, skill text, unit tests),
+`src/ui/browser.rs` (panel), `tool_card::render_browser` (transcript row).
+Details: [docs/desktop-features.md](docs/desktop-features.md#browser-agent-browser).
+
+Validation: fmt, clippy `-D warnings`, `cargo test` (**106 passed**). Driven
+under Xvfb in demo mode against a **real agent-browser 0.41.2** session
+(binary from the npm tarball, Playwright's Chromium via
+`AGENT_BROWSER_EXECUTABLE_PATH`): live frames, agent-side DOM changes,
+click / Backspace / typing through Take control (checked with `eval`),
+session close → empty state, a session started with the panel open, Add
+skill. Not checked: macOS, `XDG_RUNTIME_DIR` set on a real desktop (layout
+verified with the CLI), a real opencode agent using the skill end to end.
+
+## Previous work: Agents panel + subagent fan-out
 
 On `claude/jolly-noether-1nz80d`. The owner first asked for an n8n-style
 workflow builder, then settled on something smaller: multi-agent pipelines

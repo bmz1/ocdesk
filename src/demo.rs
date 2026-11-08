@@ -264,6 +264,43 @@ fn showcase(now: u64) -> Vec<Message> {
             error: None,
             meta: meta("lead", 30),
         }),
+        user("msg_b1", "Open the app and check the login form"),
+        Message::Assistant(AssistantMessage {
+            id: "msg_b2".into(),
+            blocks: vec![
+                tool(
+                    "b1",
+                    "shell",
+                    json!({"command": "agent-browser --session demo1 open http://localhost:3000/login"}),
+                    "✓ Sign in",
+                    ToolStatus::Completed,
+                ),
+                tool(
+                    "b2",
+                    "shell",
+                    json!({"command": "agent-browser --session demo1 snapshot -i"}),
+                    "- textbox \"Email\" [ref=e1]\n- textbox \"Password\" [ref=e2]\n- button \"Sign in\" [ref=e3]",
+                    ToolStatus::Completed,
+                ),
+                tool(
+                    "b3",
+                    "shell",
+                    json!({"command": "agent-browser --session demo1 fill @e1 test@example.com && agent-browser --session demo1 click @e3"}),
+                    "✓ Done",
+                    ToolStatus::Completed,
+                ),
+                prose(
+                    BlockKind::Text,
+                    0,
+                    "The form submits, but the error message for a wrong password is never shown.",
+                    0,
+                ),
+            ],
+            completed: true,
+            finish: Some("stop".into()),
+            error: None,
+            meta: meta("build", 19),
+        }),
         user("msg_z5", "Run the migration against staging"),
         Message::Assistant(AssistantMessage {
             id: "msg_z6".into(),

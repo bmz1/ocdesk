@@ -69,6 +69,7 @@ pub struct ConversationView {
     files: Entity<super::editor_tabs::FileTabs>,
     explorer: Entity<super::explorer::FileExplorer>,
     agents: Entity<super::agents::AgentsPanel>,
+    browser: Entity<super::browser::BrowserPanel>,
     transcript_focus: FocusHandle,
     density: crate::settings::Density,
     /// Free-text inputs for pending question forms, keyed (form, field).
@@ -116,7 +117,14 @@ impl ConversationView {
         });
         let agents =
             cx.new(|cx| super::agents::AgentsPanel::new(store.clone(), controller.clone(), cx));
+        let browser =
+            cx.new(|cx| super::browser::BrowserPanel::new(store.clone(), controller.clone(), cx));
+        let initially =
+            store.read(cx).preferences.panel == Some(crate::settings::PanelTab::Browser);
+        browser.update(cx, |b, cx| b.set_visible(initially, cx));
         let mut subs = subs;
+        // The Browser tab's activity dot.
+        subs.push(cx.observe(&browser, |_, _, cx| cx.notify()));
         subs.push(cx.observe(&files, |_, _, cx| cx.notify()));
         let prefs = store.read(cx).preferences.clone();
         // Density changes every row's height.
@@ -143,6 +151,7 @@ impl ConversationView {
             files,
             explorer,
             agents,
+            browser,
             transcript_focus: cx.focus_handle(),
             density: prefs.density,
             expanded_tools: Default::default(),
@@ -431,8 +440,13 @@ impl ConversationView {
             }
             Some(PanelTab::Files) => {}
             Some(PanelTab::Agents) => self.agents.update(cx, |a, cx| a.reload(cx)),
+            Some(PanelTab::Browser) => {
+                let focus = self.browser.read(cx).focus_handle().clone();
+                focus.focus(window, cx);
+            }
             None => self.focus_main(window, cx),
         }
+        self.sync_browser(cx);
         let saved = self.panel;
         self.controller
             .update(cx, |c, cx| c.update_settings(cx, |s| s.panel = saved));
@@ -444,9 +458,21 @@ impl ConversationView {
     }
 
     pub fn open_task(&mut self, view: super::tasks::TaskView, cx: &mut Context<Self>) {
-        self.panel = Some(crate::settings::PanelTab::Tasks);
-        self.tasks.update(cx, |t, cx| t.show(view, cx));
+        if let super::tasks::TaskView::Browser(key) = view {
+            self.panel = Some(crate::settings::PanelTab::Browser);
+            self.browser.update(cx, |b, cx| b.show(key, cx));
+        } else {
+            self.panel = Some(crate::settings::PanelTab::Tasks);
+            self.tasks.update(cx, |t, cx| t.show(view, cx));
+        }
+        self.sync_browser(cx);
         cx.notify();
+    }
+
+    /// The browser stream is open only while its tab shows.
+    fn sync_browser(&mut self, cx: &mut Context<Self>) {
+        let visible = self.panel == Some(crate::settings::PanelTab::Browser);
+        self.browser.update(cx, |b, cx| b.set_visible(visible, cx));
     }
 
     /// The editor tabs (for app-level shortcuts).
@@ -1095,43 +1121,51 @@ impl Render for ConversationView {
         use crate::settings::PanelTab;
         let panel_tab = self.panel.filter(|_| has_selection);
         let weak = cx.entity().downgrade();
-        let tab_button =
-            |id: &'static str, tab: PanelTab, label: String, icon: Icon, action: &dyn Action| {
-                let weak = weak.clone();
-                Button::new(id)
-                    .icon(icon)
-                    .label(label)
-                    .ghost()
-                    .small()
-                    .selected(panel_tab == Some(tab))
-                    .tooltip_with_action(
-                        match tab {
-                            PanelTab::Changes => "Changes: review diffs and comment",
-                            PanelTab::Tasks => "Background tasks: subagents and shells",
-                            PanelTab::Terminal => "Terminal for this session",
-                            PanelTab::Files => "Files: browse and open in a tab",
-                            PanelTab::Agents => "Agents: opencode agent files for this folder",
-                        },
-                        action,
-                        None,
+        // Icon-only tab buttons: what the label used to say (diff size,
+        // running tasks) is in the tooltip, and a dot marks activity.
+        let dot_color = theme.primary;
+        let tab_button = |id: &'static str,
+                          tab: PanelTab,
+                          tooltip: String,
+                          icon: Icon,
+                          action: &dyn Action,
+                          active: bool| {
+            let weak = weak.clone();
+            div()
+                .relative()
+                .child(
+                    Button::new(id)
+                        .icon(icon)
+                        .ghost()
+                        .small()
+                        .selected(panel_tab == Some(tab))
+                        .tooltip_with_action(tooltip, action, None)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| this.toggle_panel(tab, window, cx));
+                        }),
+                )
+                .when(active, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top(px(3.))
+                            .right(px(3.))
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(dot_color),
                     )
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| this.toggle_panel(tab, window, cx));
-                    })
-            };
-        let changes_label = {
+                })
+        };
+        let changes = {
             let s = self.store.read(cx);
             s.selected
                 .as_ref()
                 .and_then(|sid| s.diffs.get(sid))
                 .filter(|d| !d.is_empty())
                 .map(|d| {
-                    let (a, r) = d
-                        .iter()
-                        .fold((0, 0), |(a, r), f| (a + f.additions, r + f.deletions));
-                    format!("+{a} −{r}")
+                    d.iter()
+                        .fold((0, 0), |(a, r), f| (a + f.additions, r + f.deletions))
                 })
-                .unwrap_or_else(|| "Changes".into())
         };
         let sidebar_hidden = self.store.read(cx).preferences.sidebar_hidden;
         let header = h_flex()
@@ -1178,41 +1212,57 @@ impl Render for ConversationView {
                     .child(tab_button(
                         "toggle-changes",
                         PanelTab::Changes,
-                        changes_label,
-                        Icon::new(IconName::File),
+                        match changes {
+                            Some((a, r)) => format!("Changes +{a} −{r}: review diffs and comment"),
+                            None => "Changes: review diffs and comment".into(),
+                        },
+                        super::icons::file_diff(),
                         &super::keys::ToggleChanges,
+                        false,
                     ))
                     .child(tab_button(
                         "toggle-tasks",
                         PanelTab::Tasks,
                         if running > 0 {
-                            format!("Tasks · {running}")
+                            format!("Background tasks: {running} running")
                         } else {
-                            "Tasks".to_string()
+                            "Background tasks: subagents and shells".into()
                         },
                         super::icons::workflow(),
                         &super::keys::ToggleTasks,
+                        running > 0,
                     ))
                     .child(tab_button(
                         "toggle-files",
                         PanelTab::Files,
-                        "Files".into(),
+                        "Files: browse and open in a tab".into(),
                         super::icons::files(),
                         &super::keys::ToggleFiles,
+                        false,
                     ))
                     .child(tab_button(
                         "toggle-agents",
                         PanelTab::Agents,
-                        "Agents".into(),
+                        "Agents: opencode agent files for this folder".into(),
                         super::icons::bot(),
                         &super::keys::ToggleAgents,
+                        false,
+                    ))
+                    .child(tab_button(
+                        "toggle-browser",
+                        PanelTab::Browser,
+                        "Browser: watch and control agent-browser".into(),
+                        super::icons::globe(),
+                        &super::keys::ToggleBrowser,
+                        self.browser.read(cx).active(),
                     ))
                     .child(tab_button(
                         "toggle-terminal",
                         PanelTab::Terminal,
-                        "Terminal".into(),
+                        "Terminal for this session".into(),
                         super::icons::terminal(),
                         &super::keys::ToggleTerminal,
+                        false,
                     ))
             });
 
@@ -1237,6 +1287,11 @@ impl Render for ConversationView {
                     .into_any_element(),
                 PanelTab::Files => self
                     .explorer
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                PanelTab::Browser => self
+                    .browser
                     .clone()
                     .cached(StyleRefinement::default().size_full())
                     .into_any_element(),

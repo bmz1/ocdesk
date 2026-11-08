@@ -1,5 +1,6 @@
 mod agents;
 mod api;
+mod browser;
 mod controller;
 mod demo;
 mod files;
