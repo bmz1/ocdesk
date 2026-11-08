@@ -413,6 +413,11 @@ impl Render for AppView {
                     });
                 }),
             )
+            .on_action(cx.listener(|this, _: &keys::ToggleBrowser, window, cx| {
+                this.conversation.update(cx, |c, cx| {
+                    c.toggle_panel(crate::settings::PanelTab::Browser, window, cx)
+                });
+            }))
             .on_action(cx.listener(|this, _: &keys::ToggleAgents, window, cx| {
                 this.conversation.update(cx, |c, cx| {
                     c.toggle_panel(crate::settings::PanelTab::Agents, window, cx)

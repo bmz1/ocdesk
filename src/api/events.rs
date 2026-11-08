@@ -236,6 +236,9 @@ pub enum Event {
     },
     /// Anything we don't model yet. Carries the wire `type` for logging.
     Other(String),
+    /// `rpc.experimental.browser.control`: the browser plugin talks to its
+    /// desktop (`crate::browser`). Data as sent.
+    BrowserControl(Value),
 }
 
 impl Envelope {
@@ -283,6 +286,7 @@ fn decode(ty: &str, d: &Value, created: u64) -> Option<Event> {
     let ordinal = || u64_at(d, "/ordinal");
     Some(match ty {
         // `session.created` carries the location but no title or times.
+        "rpc.experimental.browser.control" => Event::BrowserControl(d.clone()),
         "session.created" => Event::SessionUpserted(
             SessionInfo {
                 id: sid()?,

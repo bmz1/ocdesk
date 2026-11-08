@@ -74,6 +74,7 @@ pub struct ConversationView {
     files: Entity<super::editor_tabs::FileTabs>,
     explorer: Entity<super::explorer::FileExplorer>,
     agents: Entity<super::agents::AgentsPanel>,
+    browser: Entity<super::browser::BrowserPanel>,
     pull_request: Entity<super::pull_request::PullRequestPanel>,
     transcript_focus: FocusHandle,
     density: crate::settings::Density,
@@ -132,6 +133,13 @@ impl ConversationView {
         });
         let agents =
             cx.new(|cx| super::agents::AgentsPanel::new(store.clone(), controller.clone(), cx));
+        let browser =
+            cx.new(|cx| super::browser::BrowserPanel::new(store.clone(), controller.clone(), cx));
+        {
+            let shown =
+                store.read(cx).preferences.panel == Some(crate::settings::PanelTab::Browser);
+            browser.update(cx, |b, cx| b.set_visible(shown, cx));
+        }
         let pull_request = cx.new(|cx| {
             super::pull_request::PullRequestPanel::new(store.clone(), controller.clone(), cx)
         });
@@ -153,6 +161,7 @@ impl ConversationView {
             files,
             explorer,
             agents,
+            browser,
             pull_request,
             transcript_focus: cx.focus_handle(),
             density: prefs.density,
@@ -444,8 +453,13 @@ impl ConversationView {
             Some(PanelTab::Files) => {}
             Some(PanelTab::Agents) => self.agents.update(cx, |a, cx| a.reload(cx)),
             Some(PanelTab::PullRequest) => self.pull_request.update(cx, |p, cx| p.refresh(cx)),
+            Some(PanelTab::Browser) => {
+                let focus = self.browser.read(cx).focus_handle().clone();
+                focus.focus(window, cx);
+            }
             None => self.focus_main(window, cx),
         }
+        self.sync_browser(cx);
         let saved = self.panel;
         self.controller
             .update(cx, |c, cx| c.update_settings(cx, |s| s.panel = saved));
@@ -459,7 +473,14 @@ impl ConversationView {
     pub fn open_task(&mut self, view: super::tasks::TaskView, cx: &mut Context<Self>) {
         self.panel = Some(crate::settings::PanelTab::Tasks);
         self.tasks.update(cx, |t, cx| t.show(view, cx));
+        self.sync_browser(cx);
         cx.notify();
+    }
+
+    /// The browser screencast runs only while the Browser tab shows.
+    fn sync_browser(&mut self, cx: &mut Context<Self>) {
+        let shown = self.panel == Some(crate::settings::PanelTab::Browser);
+        self.browser.update(cx, |b, cx| b.set_visible(shown, cx));
     }
 
     pub fn dirty_files(&self, cx: &App) -> Vec<String> {
@@ -1316,6 +1337,14 @@ impl Render for ConversationView {
                         false,
                     ))
                     .child(tab_button(
+                        "toggle-browser",
+                        PanelTab::Browser,
+                        "Browser: the agent's browser, live".into(),
+                        super::icons::globe(),
+                        &super::keys::ToggleBrowser,
+                        self.browser.read(cx).active(),
+                    ))
+                    .child(tab_button(
                         "toggle-terminal",
                         PanelTab::Terminal,
                         "Terminal for this session".into(),
@@ -1346,6 +1375,11 @@ impl Render for ConversationView {
                     .into_any_element(),
                 PanelTab::Files => self
                     .explorer
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                PanelTab::Browser => self
+                    .browser
                     .clone()
                     .cached(StyleRefinement::default().size_full())
                     .into_any_element(),

@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod app_view;
+pub mod browser;
 pub mod changes;
 pub mod composer;
 pub mod conversation;

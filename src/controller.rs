@@ -94,6 +94,9 @@ where
     }
 }
 
+/// How long a new session's first prompt waits for the browser attachment.
+const BROWSER_ATTACH_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub struct Controller {
     rt: tokio::runtime::Handle,
     store: Entity<Store>,
@@ -137,6 +140,8 @@ pub struct Controller {
     restore_session: Option<String>,
     /// Pending debounced settings save; replaced per change, dropped on flush.
     save_debounce: Option<Task<()>>,
+    /// ocdesk as opencode's desktop browser (agent browser tools).
+    pub browser: crate::browser::Host,
 }
 
 impl Controller {
@@ -166,6 +171,7 @@ impl Controller {
             s.set_folders(folders, cx);
         });
         let mut this = Self {
+            browser: crate::browser::Host::new(rt.clone()),
             rt,
             store,
             settings,
@@ -534,9 +540,13 @@ impl Controller {
                 self.store
                     .update(cx, |s, cx| s.set_connection(Connection::Connected, cx));
                 self.resync(cx);
+                // A reconnect ends attach requests; the selected session's
+                // browser tools come back with a fresh one.
+                self.attach_browser(cx);
                 // Watches may have fired while we were away.
                 self.files_changed(None, None, false, cx);
             }
+            Event::BrowserControl(data) => self.browser.control(data),
             Event::FileChanged { file, removed } => {
                 self.files_changed(env.directory, Some(file), removed, cx)
             }
@@ -1854,12 +1864,28 @@ impl Controller {
         }
     }
 
+    /// Be the selected session's desktop browser, so its agent gets the
+    /// browser tools (attachments stay until the server drops them).
+    fn attach_browser(&mut self, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else { return };
+        let s = self.store.read(cx);
+        let Some(session) = s.selected.as_ref().and_then(|id| s.session(id)) else {
+            return;
+        };
+        if session.parent_id.is_some() {
+            return;
+        }
+        self.browser
+            .ensure_attached(api, session.id.clone(), session.directory.clone());
+    }
+
     pub fn select_session(&mut self, id: Option<String>, cx: &mut Context<Self>) {
         self.restore_session = None;
         self.store.update(cx, |s, cx| s.select(id.clone(), cx));
         let last = id.clone();
         self.update_settings(cx, |s| s.last_session = last);
         self.mark_selected_read(cx);
+        self.attach_browser(cx);
         if let Some(id) = id {
             // Cheap, and no event reports a change made elsewhere.
             self.refresh_session_mode(id.clone(), cx);
@@ -2102,6 +2128,7 @@ impl Controller {
             }
             cx.notify();
         });
+        let browser = self.browser.clone();
         self.run_on(
             cx,
             self.issued(RequestScope::Server),
@@ -2113,6 +2140,11 @@ impl Controller {
                         if let Some(mode) = permission_mode {
                             api.set_session_mode(&s.id, mode).await?;
                         }
+                        // After the mode (attaching adds permission rules for
+                        // the browser tools), before the first prompt.
+                        browser
+                            .attach_and_wait(api.clone(), s.id.clone(), folder.clone(), BROWSER_ATTACH_WAIT)
+                            .await;
                         if let Some(m) = &draft_model {
                             api.switch_model(&s.id, m).await?;
                             s.model = Some(m.clone());
