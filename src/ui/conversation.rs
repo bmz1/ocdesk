@@ -1162,10 +1162,14 @@ impl Render for ConversationView {
                     .into_any_element(),
             };
             div()
+                .id("right-panel")
                 .relative()
                 .w(self.panel_width)
                 .h_full()
                 .flex_none()
+                // The panel can float over the conversation: keep wheel and
+                // mouse events from reaching the message list behind it.
+                .occlude()
                 .border_l_1()
                 .border_color(theme.border)
                 .bg(theme.background)
