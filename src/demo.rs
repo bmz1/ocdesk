@@ -333,11 +333,17 @@ fn seed_showcase_state(s: &mut Store, cx: &mut gpui_kit::Context<Store>) {
             ..Default::default()
         },
     );
+    let patch = "diff --git a/src/stream.ts b/src/stream.ts\nindex 1..2 100644\n--- a/src/stream.ts\n+++ b/src/stream.ts\n@@ -10,4 +10,8 @@ export function open() {\n   const es = new EventSource(url)\n-  es.onerror = reconnect\n+  const QUIET_MS = 25_000\n+  let timer = setTimeout(reconnect, QUIET_MS)\n+  es.onmessage = () => {\n+    clearTimeout(timer)\n+    timer = setTimeout(reconnect, QUIET_MS)\n+  }\n   return es\n }\n";
+    let dir = s
+        .session(SESSION_ID)
+        .map(|x| x.directory.clone())
+        .unwrap_or_default();
     s.diffs.insert(
-        SESSION_ID.into(),
+        dir,
         vec![FileDiff {
             file: "src/stream.ts".into(),
-            patch: "diff --git a/src/stream.ts b/src/stream.ts\nindex 1..2 100644\n--- a/src/stream.ts\n+++ b/src/stream.ts\n@@ -10,4 +10,8 @@ export function open() {\n   const es = new EventSource(url)\n-  es.onerror = reconnect\n+  const QUIET_MS = 25_000\n+  let timer = setTimeout(reconnect, QUIET_MS)\n+  es.onmessage = () => {\n+    clearTimeout(timer)\n+    timer = setTimeout(reconnect, QUIET_MS)\n+  }\n   return es\n }\n".into(),
+            fingerprint: crate::api::features::patch_fingerprint(patch),
+            patch: patch.into(),
             status: "modified".into(),
             additions: 5,
             deletions: 1,

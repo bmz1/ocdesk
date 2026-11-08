@@ -52,6 +52,8 @@ pub struct RowCtx<'a> {
     pub idle: bool,
     pub density: Density,
     pub on_action: OnRowAction,
+    /// For values computed on demand (Copy reads the turn when clicked).
+    pub store: &'a Entity<crate::store::Store>,
 }
 
 /// Render row content. Every prose block of `msg` must have been synced into
@@ -109,7 +111,7 @@ pub fn render_message(
                 .w_full()
                 .items_end()
                 .gap_1()
-                .group(group.clone())
+                .group(group)
                 .child(
                     v_flex()
                         .gap_1()
@@ -488,7 +490,27 @@ fn turn_footer(a: &AssistantMessage, row: &RowCtx, cx: &App) -> AnyElement {
         .text_color(theme.muted_foreground)
         .child(
             Clipboard::new(SharedString::from(format!("copy-turn-{}", a.id)))
-                .value(turn_text(row.turn))
+                // Joined on click, not per frame for every visible turn.
+                .value_fn({
+                    let store = row.store.clone();
+                    let ids: Vec<String> = row
+                        .turn
+                        .iter()
+                        .filter(|m| matches!(m, Message::Assistant(_)))
+                        .map(|m| m.id().to_string())
+                        .collect();
+                    move |_, cx| {
+                        let s = store.read(cx);
+                        let Some(c) = s.selected_conversation() else {
+                            return SharedString::default();
+                        };
+                        let turn: Vec<Message> = ids
+                            .iter()
+                            .filter_map(|id| c.index_of(id).ok().map(|i| c.messages[i].clone()))
+                            .collect();
+                        turn_text(&turn).into()
+                    }
+                })
                 .tooltip("Copy reply"),
         )
         .child(
@@ -496,7 +518,7 @@ fn turn_footer(a: &AssistantMessage, row: &RowCtx, cx: &App) -> AnyElement {
                 .gap_1()
                 .items_center()
                 .opacity(0.)
-                .group_hover(group.clone(), |s| s.opacity(1.))
+                .group_hover(group, |s| s.opacity(1.))
                 .child(div().child(facts.join(" · ")))
                 .child(
                     Button::new(SharedString::from(format!("fork-{}", a.id)))

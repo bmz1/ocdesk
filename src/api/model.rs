@@ -99,6 +99,8 @@ pub struct ModelInfo {
     pub name: String,
     /// Variant ids (`low`, `high`, …), in server order.
     pub variants: Vec<String>,
+    /// Context window in tokens (`limit.context`), when the server knows it.
+    pub context_limit: Option<u64>,
 }
 
 impl ModelInfo {
@@ -116,6 +118,7 @@ impl ModelInfo {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|x| str_at(x, "/id")).collect())
                 .unwrap_or_default(),
+            context_limit: v.pointer("/limit/context").and_then(Value::as_u64),
         })
     }
 
@@ -673,7 +676,10 @@ impl PermissionDecision {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileDiff {
     pub file: String,
-    pub patch: String,
+    /// Shared: views hand it to click handlers every frame.
+    pub patch: std::sync::Arc<str>,
+    /// [`crate::api::features::patch_fingerprint`] of `patch`, computed once.
+    pub fingerprint: u64,
     pub status: String,
     pub additions: u64,
     pub deletions: u64,
@@ -682,9 +688,11 @@ pub struct FileDiff {
 
 impl FileDiff {
     pub fn from_json(v: &Value) -> Option<Self> {
+        let patch = str_at(v, "/patch").unwrap_or_default();
         Some(Self {
             file: str_at(v, "/file")?,
-            patch: str_at(v, "/patch").unwrap_or_default(),
+            fingerprint: crate::api::features::patch_fingerprint(&patch),
+            patch: patch.into(),
             status: str_at(v, "/status").unwrap_or_default(),
             additions: u64_at(v, "/additions").unwrap_or_default(),
             deletions: u64_at(v, "/deletions").unwrap_or_default(),

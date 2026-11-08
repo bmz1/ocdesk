@@ -44,6 +44,8 @@ impl Runtime {
 /// The server sends a `: heartbeat` comment every ~10 s; silence for this
 /// long means the connection is dead even if TCP hasn't noticed.
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Waiting for the event stream's response head; then we retry with backoff.
+const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const SSE_BACKOFF_MIN: Duration = Duration::from_millis(250);
 const SSE_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const PAGE: usize = 200;
@@ -59,7 +61,10 @@ pub struct Api {
 impl Api {
     pub fn new(sidecar: &Sidecar) -> Result<Self> {
         Ok(Self {
-            http: reqwest::Client::builder().build()?,
+            // Loopback: a connect that takes this long means the server is wedged.
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .build()?,
             base: sidecar.base_url.clone(),
             password: sidecar.password.clone(),
         })
@@ -142,6 +147,25 @@ impl Api {
             .json(&input.to_json()),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Configured default agent, respecting the server's source precedence.
+    pub async fn configured_agent(&self, directory: &Path) -> Result<Option<String>> {
+        let entries = self.get_in("/api/config", directory).await?;
+        let entries = entries
+            .as_array()
+            .ok_or_else(|| anyhow!("invalid config sources"))?;
+        Ok(entries.iter().rev().find_map(|e| {
+            e.pointer("/info/default_agent")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }))
+    }
+
+    pub async fn reload_configuration(&self) -> Result<()> {
+        self.send(self.req(Method::POST, "/api/location/reload"))
+            .await?;
         Ok(())
     }
 
@@ -245,7 +269,7 @@ impl Api {
 
     /// Full history in transcript order (`GET /api/session/{id}/message`).
     pub async fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
-        let mut raw = Vec::new();
+        let mut messages = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
             // The API rejects `cursor` combined with `order`, so `order` is
@@ -257,10 +281,19 @@ impl Api {
                 q.push(("cursor", cursor.clone().unwrap()));
             }
             let path = format!("/api/session/{}/message", id(session_id));
-            let v = self.send(self.req(Method::GET, &path).query(&q)).await?;
-            let page = v["data"].as_array().cloned().unwrap_or_default();
+            let mut v = self.send(self.req(Method::GET, &path).query(&q)).await?;
+            // Decode each page as it arrives (moved out, not cloned): pages
+            // can carry large tool outputs and attachment data.
+            let page = v
+                .get_mut("data")
+                .and_then(Value::as_array_mut)
+                .map(std::mem::take)
+                .unwrap_or_default();
             let n = page.len();
-            raw.extend(page);
+            // Keep the server's order: it is delivery order, which differs from
+            // id order once prompts are queued/steered (a queued prompt gets its
+            // id when sent but lands after a later steer).
+            messages.extend(page.iter().filter_map(Message::from_v2_json));
             cursor = v
                 .pointer("/cursor/next")
                 .and_then(Value::as_str)
@@ -269,15 +302,30 @@ impl Api {
                 break;
             }
         }
-        // Keep the server's order: it is delivery order, which differs from
-        // id order once prompts are queued/steered (a queued prompt gets its
-        // id when sent but lands after a later steer).
-        Ok(raw.iter().filter_map(Message::from_v2_json).collect())
+        Ok(messages)
     }
 
     pub async fn permissions(&self, session_id: &str) -> Result<Vec<model::PermissionRequest>> {
         let path = format!("/api/session/{}/permission", id(session_id));
         let v = self.send(self.req(Method::GET, &path)).await?;
+        let data = v["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("invalid permissions response"))?;
+        data.iter()
+            .map(|v| {
+                model::PermissionRequest::from_json(v)
+                    .ok_or_else(|| anyhow!("invalid permission request"))
+            })
+            .collect()
+    }
+
+    /// Every pending permission request in a folder (one request for all
+    /// of its sessions, subagents included).
+    pub async fn folder_permissions(
+        &self,
+        directory: &Path,
+    ) -> Result<Vec<model::PermissionRequest>> {
+        let v = self.get_in("/api/permission/request", directory).await?;
         let data = v["data"]
             .as_array()
             .ok_or_else(|| anyhow!("invalid permissions response"))?;
@@ -313,6 +361,18 @@ impl Api {
     pub async fn forms(&self, session_id: &str) -> Result<Vec<model::FormRequest>> {
         let path = format!("/api/session/{}/form", id(session_id));
         let v = self.send(self.req(Method::GET, &path)).await?;
+        let data = v["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("invalid forms response"))?;
+        Ok(data
+            .iter()
+            .filter_map(model::FormRequest::from_json)
+            .collect())
+    }
+
+    /// Every pending question form in a folder, all sessions included.
+    pub async fn folder_forms(&self, directory: &Path) -> Result<Vec<model::FormRequest>> {
+        let v = self.get_in("/api/form", directory).await?;
         let data = v["data"]
             .as_array()
             .ok_or_else(|| anyhow!("invalid forms response"))?;
@@ -535,9 +595,13 @@ impl Api {
         connect: bool,
     ) -> Result<()> {
         let verb = if connect { "connect" } else { "disconnect" };
-        let path = format!("/api/experimental/mcp/{}/{verb}", id(server));
+        let mut url = reqwest::Url::parse(&self.base)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("invalid MCP server URL"))?
+            .clear()
+            .extend(["api", "experimental", "mcp", server, verb]);
         self.send(
-            self.req(Method::POST, &path)
+            self.req(Method::POST, url.path())
                 .query(&[("location[directory]", directory)]),
         )
         .await?;
@@ -701,11 +765,16 @@ impl Api {
     }
 
     async fn stream_once(&self, tx: &mut Sender<Envelope>) -> Result<StreamEnd> {
-        let resp = self
+        // Only the response head is bounded; the body streams indefinitely.
+        // Without this, a server that accepts but never answers would leave
+        // us "Connecting" with no retry.
+        let send = self
             .req(Method::GET, "/api/event")
             .header("accept", "text/event-stream")
-            .send()
-            .await?;
+            .send();
+        let resp = tokio::time::timeout(SSE_CONNECT_TIMEOUT, send)
+            .await
+            .map_err(|_| anyhow!("GET /api/event: no response in {SSE_CONNECT_TIMEOUT:?}"))??;
         if !resp.status().is_success() {
             bail!("GET /api/event returned {}", resp.status());
         }
@@ -765,17 +834,23 @@ fn id(s: &str) -> String {
 #[derive(Default)]
 struct SseParser {
     buf: Vec<u8>,
+    /// Bytes of `buf` already searched for a newline (an incomplete line).
+    scanned: usize,
     data: String,
 }
 
 impl SseParser {
+    /// Frames completed by `chunk`. Each byte is scanned once and the
+    /// buffer is compacted once per chunk, not once per line.
     fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=nl).collect();
-            let line = String::from_utf8_lossy(&line);
-            let line = line.trim_end_matches(['\n', '\r']);
+        let mut start = 0;
+        let mut from = self.scanned;
+        while let Some(off) = self.buf[from..].iter().position(|&b| b == b'\n') {
+            let end = from + off;
+            let line = String::from_utf8_lossy(&self.buf[start..end]);
+            let line = line.trim_end_matches('\r');
             if line.is_empty() {
                 if !self.data.is_empty() {
                     out.push(std::mem::take(&mut self.data));
@@ -787,7 +862,11 @@ impl SseParser {
                 self.data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
             }
             // `event:`, `id:`, `retry:` and comments are not used by opencode.
+            start = end + 1;
+            from = start;
         }
+        self.buf.drain(..start);
+        self.scanned = self.buf.len();
         out
     }
 }
@@ -935,6 +1014,140 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// Saved approvals must be scoped to each added project, not the sidecar's cwd.
+    #[tokio::test]
+    async fn saved_grants_http_contract() {
+        let (api, server) = scripted_server(vec![
+            (
+                "GET /api/location?location%5Bdirectory%5D=%2Frepo ",
+                "",
+                r#"{"project":{"id":"project_a"}}"#,
+                "200 OK",
+            ),
+            (
+                "GET /api/location?location%5Bdirectory%5D=%2Fworktree ",
+                "",
+                r#"{"project":{"id":"project_a"}}"#,
+                "200 OK",
+            ),
+            (
+                "GET /api/location?location%5Bdirectory%5D=%2Fother ",
+                "",
+                r#"{"project":{"id":"project_b"}}"#,
+                "200 OK",
+            ),
+            (
+                "GET /api/permission/saved?projectID=project_a ",
+                "",
+                r#"{"data":[{"id":"grant_a","projectID":"project_a","action":"shell","resource":"git status *"}]}"#,
+                "200 OK",
+            ),
+            (
+                "GET /api/permission/saved?projectID=project_b ",
+                "",
+                r#"{"data":[{"id":"grant_b","projectID":"project_b","action":"edit","resource":"*"}]}"#,
+                "200 OK",
+            ),
+            (
+                "DELETE /api/permission/saved/grant_a ",
+                "",
+                "",
+                "204 No Content",
+            ),
+        ]);
+        assert!(api.saved_grants(&[]).await.unwrap().is_empty());
+        let folders = ["/repo", "/worktree", "/other"].map(std::path::PathBuf::from);
+        let grants = api.saved_grants(&folders).await.unwrap();
+        assert_eq!(
+            grants.len(),
+            2,
+            "shared project grants must not be duplicated"
+        );
+        assert_eq!(grants[0].id, "grant_a");
+        assert_eq!(grants[0].project_id, "project_a");
+        assert_eq!(grants[0].action, "shell");
+        assert_eq!(grants[0].resource, "git status *");
+        assert_eq!(grants[1].id, "grant_b");
+        api.revoke_grant(&grants[0].id).await.unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_grants_does_not_report_failed_reads_as_empty() {
+        let (api, server) = scripted_server(vec![
+            (
+                "GET /api/location?location%5Bdirectory%5D=%2Frepo ",
+                "",
+                r#"{"project":{"id":"project_a"}}"#,
+                "200 OK",
+            ),
+            (
+                "GET /api/permission/saved?projectID=project_a ",
+                "",
+                "unavailable",
+                "500 Internal Server Error",
+            ),
+        ]);
+        assert!(api.saved_grants(&["/repo".into()]).await.is_err());
+        server.join().unwrap();
+    }
+
+    /// Models, agents, file search, switching and prompt attachments.
+    #[tokio::test]
+    async fn configuration_sources_and_reload_http_contract() {
+        let (api, server) = scripted_server(vec![
+            (
+                "GET /api/config?location%5Bdirectory%5D=%2Frepo ",
+                "",
+                r#"[{"type":"document","info":{"default_agent":"build"}},{"type":"directory","path":"/repo/.opencode"},{"type":"document","info":{"default_agent":"plan"}}]"#,
+                "200 OK",
+            ),
+            ("POST /api/location/reload ", "", "", "204 No Content"),
+        ]);
+        assert_eq!(
+            api.configured_agent(std::path::Path::new("/repo"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("plan")
+        );
+        api.reload_configuration().await.unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_connections_are_scoped_to_the_explicit_project() {
+        let (api, server) = scripted_server(vec![
+            (
+                "GET /api/mcp?location%5Bdirectory%5D=%2Fother ",
+                "",
+                r#"{"data":[{"name":"my server","status":{"status":"connected"}},{"name":"auth","status":{"status":"needs_auth"}}]}"#,
+                "200 OK",
+            ),
+            (
+                "POST /api/experimental/mcp/my%20server/disconnect?location%5Bdirectory%5D=%2Fother ",
+                "",
+                "",
+                "204 No Content",
+            ),
+            (
+                "POST /api/experimental/mcp/my%20server/connect?location%5Bdirectory%5D=%2Fother ",
+                "",
+                "",
+                "204 No Content",
+            ),
+        ]);
+        let dir = std::path::Path::new("/other");
+        let servers = api.mcp_servers(dir).await.unwrap();
+        assert!(servers[0].connected());
+        assert_eq!(servers[1].status, "needs_auth");
+        api.mcp_set_connected(dir, "my server", false)
+            .await
+            .unwrap();
+        api.mcp_set_connected(dir, "my server", true).await.unwrap();
+        server.join().unwrap();
+    }
+
     /// Models, agents, file search, switching and prompt attachments.
     #[tokio::test]
     async fn models_agents_and_mentions_http_contract() {
@@ -1033,5 +1246,15 @@ mod tests {
         );
         assert!(p.push(b"data: x\n").is_empty());
         assert_eq!(p.push(b"data: y\n\n"), ["x\ny"]);
+        // A line split over several chunks (each partially scanned), then
+        // many frames in one chunk; nothing is left buffered.
+        assert!(p.push(b"data: ab").is_empty());
+        assert!(p.push(b"cd").is_empty());
+        let many: String = (0..100).map(|i| format!("data: {i}\r\n\r\n")).collect();
+        let frames = p.push(format!("ef\n\n{many}").as_bytes());
+        assert_eq!(frames.len(), 101);
+        assert_eq!(frames[0], "abcdef");
+        assert_eq!(frames[100], "99");
+        assert!(p.buf.is_empty() && p.scanned == 0);
     }
 }

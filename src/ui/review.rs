@@ -39,39 +39,7 @@ pub struct ChangesPanel {
     comments: Vec<ReviewComment>,
     editing: Option<Editing>,
     collapsed: HashSet<String>,
-    /// [`fingerprint`] of the store state last drawn.
-    seen: u64,
     _subs: Vec<Subscription>,
-}
-
-/// What the Changes tab depends on in the store, hashed.
-fn fingerprint(store: &Store) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    let sid = store.selected.as_deref().unwrap_or_default();
-    sid.hash(&mut h);
-    if let Some(files) = store.diffs.get(sid) {
-        for f in files {
-            (
-                &f.file,
-                &f.status,
-                &f.patch,
-                f.additions,
-                f.deletions,
-                f.more,
-            )
-                .hash(&mut h);
-        }
-    } else {
-        u64::MAX.hash(&mut h);
-    }
-    store.diff_loading.contains(sid).hash(&mut h);
-    store.diff_errors.get(sid).hash(&mut h);
-    store.preferences.viewed.len().hash(&mut h);
-    let mut viewed: Vec<_> = store.preferences.viewed.iter().collect();
-    viewed.sort_unstable_by_key(|(key, _)| *key);
-    viewed.hash(&mut h);
-    h.finish()
 }
 
 /// The prompt a batch of review comments becomes.
@@ -94,22 +62,22 @@ impl ChangesPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let subs = vec![
-            cx.subscribe(&store, |this, _, ev: &StoreEvent, cx| {
-                if matches!(ev, StoreEvent::SelectionChanged) {
+            cx.subscribe(&store, |this, _, ev: &StoreEvent, cx| match ev {
+                StoreEvent::SelectionChanged => {
                     this.comments.clear();
                     this.editing = None;
                     this.collapsed.clear();
                     cx.notify();
                 }
-            }),
-            // The store notifies on every streamed delta; redraw only when
-            // what this panel shows changed.
-            cx.observe(&store, |this, store, cx| {
-                let f = fingerprint(store.read(cx));
-                if f != this.seen {
-                    this.seen = f;
-                    cx.notify();
+                // Expensive to render for large branches, and streamed deltas
+                // never affect it: the store emits these only on real changes.
+                StoreEvent::DiffsChanged { dir }
+                    if this.store.read(cx).selected_diff_dir().as_ref() == Some(dir) =>
+                {
+                    cx.notify()
                 }
+                StoreEvent::ViewedChanged => cx.notify(),
+                _ => {}
             }),
         ];
         Self {
@@ -118,7 +86,6 @@ impl ChangesPanel {
             comments: Vec::new(),
             editing: None,
             collapsed: HashSet::new(),
-            seen: 0,
             _subs: subs,
         }
     }
@@ -352,36 +319,6 @@ impl Render for ChangesPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[::core::prelude::v1::test]
-    fn fingerprint_tracks_content_and_viewed_file_identity_without_overflow() {
-        let mut store = Store {
-            selected: Some("session".into()),
-            ..Default::default()
-        };
-        let file = crate::api::model::FileDiff {
-            file: "a.rs".into(),
-            status: "modified".into(),
-            patch: "-a\n+b".into(),
-            additions: 1,
-            deletions: 1,
-            more: false,
-        };
-        store.diffs.insert("session".into(), vec![file]);
-        let before = fingerprint(&store);
-        store.diffs.get_mut("session").unwrap()[0].patch = "-c\n+d".into();
-        assert_ne!(before, fingerprint(&store));
-        for i in 0..5 {
-            store
-                .preferences
-                .viewed
-                .insert(format!("file-{i}"), u64::MAX);
-        }
-        let before = fingerprint(&store);
-        store.preferences.viewed.remove("file-0");
-        store.preferences.viewed.insert("other".into(), u64::MAX);
-        assert_ne!(before, fingerprint(&store));
-    }
 
     #[::core::prelude::v1::test]
     fn comments_become_one_prompt_with_locations() {

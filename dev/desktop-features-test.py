@@ -9,9 +9,56 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.error
 from harness import Harness
+
+
+def check_saved_approvals_in_another_project(h, supervised):
+    # The desktop sidecar starts in HOME, not in the session's project.
+    project = h.work / 'other-project'
+    project.mkdir()
+    git = ['git', '-C', str(project)]
+    subprocess.run(git + ['init', '-q'], check=True)
+    (project / 'README.md').write_text('A distinct project for saved approvals\n')
+    subprocess.run(git + ['add', '.'], check=True)
+    subprocess.run(git + ['-c', 'user.name=QA', '-c', 'user.email=qa@example.com',
+                          'commit', '-qm', 'other project'], check=True)
+    sid = h.new_session(project)
+    root = f'/api/session/{sid}'
+    h.request(root, {'permissions': supervised}, 'PATCH')
+    h.request(root + '/prompt', {'text': 'tool:bash please'})
+    asked = h.wait_event('permission.asked', sid)['data']
+    assert asked['save'], 'the real shell tool must propose saved patterns'
+    h.request(root + f"/permission/{asked['id']}/reply", {'decision': 'always'})
+    assert h.wait_event('terminal', sid)['type'] == 'session.execution.succeeded'
+
+    project_id = h.request('/api/location?' + urllib.parse.urlencode({
+        'location[directory]': str(project)}))['project']['id']
+    query = urllib.parse.urlencode({'projectID': project_id})
+    grants = h.request('/api/permission/saved?' + query)['data']
+    assert {g['resource'] for g in grants} == set(asked['save'])
+    assert all(g['projectID'] == project_id and g['action'] == asked['action'] for g in grants)
+    assert h.request('/api/permission/saved')['data'] == [], 'unscoped reads miss the session project'
+
+    # Saved rules apply to later real tool calls and to new sessions in that project.
+    h.request(root + '/prompt', {'text': 'tool:bash again'})
+    assert h.wait_event('terminal', sid)['type'] == 'session.execution.succeeded'
+    next_root = f'/api/session/{h.new_session(project)}'
+    h.request(next_root, {'permissions': supervised}, 'PATCH')
+    for resource in asked['resources']:
+        decision = h.request(next_root + '/permission', {
+            'action': asked['action'], 'resources': [resource]})['data']
+        assert decision['effect'] == 'allow', (resource, decision)
+    for grant in grants:
+        h.request('/api/permission/saved/' + grant['id'], method='DELETE')
+    assert h.request('/api/permission/saved?' + query)['data'] == []
+    pending = h.request(next_root + '/permission', {
+        'action': asked['action'], 'resources': asked['resources']})['data']
+    assert pending['effect'] == 'ask', 'revocation must restore approval prompts'
+    h.request(next_root + f"/permission/{pending['id']}/reply", {'decision': 'reject'})
+    print('PASS: real Always allow saves project grants outside the sidecar directory; reuse and revoke')
 
 
 def main():
@@ -33,6 +80,7 @@ def main():
         assert decide('shell','echo saved')['effect']=='allow','saved project grants precede session ask rules'
         h.request('/api/permission/saved/'+grants[0]['id'],method='DELETE')
         v=decide('shell','echo saved');assert v['effect']=='ask';reject(v)
+        check_saved_approvals_in_another_project(h, supervised)
         h.request(root,{'permissions':auto},'PATCH')
         assert decide('edit',str(h.project/'note.txt'))['effect']=='allow'
         v=decide('shell','echo other');assert v['effect']=='ask';reject(v)
@@ -86,6 +134,44 @@ def main():
         updates=[e for e in h.seen if e['type']=='session.usage.updated' and e['data']['sessionID']==sid]
         assert updates and updates[-1]['data']['tokens']==info['tokens']
         assert 'data' in h.request('/api/experimental/usage/limits?'+q)
+        # Settings edits the real JSONC file; a plain new session must inherit it.
+        config_file = h.project / 'opencode.jsonc'
+        config_file.write_text('''{
+  // Preserve this comment when editing in Settings.
+  "default_agent": "plan",
+  "permissions": [{"action": "shell", "resource": "*", "effect": "ask"}],
+}
+''')
+        h.request('/api/location/reload', {}, 'POST')
+        sources = h.request('/api/config?' + q)
+        assert any(entry.get('info', {}).get('default_agent') == 'plan' for entry in sources)
+        inherited_root = f'/api/session/{h.new_session()}'
+        assert not h.request(inherited_root)['data'].get('permissions'), 'new sessions must not need an ocdesk permission preset'
+        h.request(inherited_root + '/prompt', {'text': 'tool:bash config inheritance'})
+        pending = h.wait_event('permission.asked', inherited_root.rsplit('/', 1)[-1])['data']
+        assert pending['action'] == 'shell', pending
+        h.request(inherited_root + f"/permission/{pending['id']}/reply", {'decision': 'reject'})
+        h.wait_event('terminal', inherited_root.rsplit('/', 1)[-1])
+        print('PASS: real JSONC config discovery, reload, default agent and inherited permissions')
+        config_file.write_text(json.dumps({'mcp': {'servers': {'settings-probe': {
+            'type': 'local', 'command': [sys.executable, str(Path(__file__).with_name('mock_mcp.py').resolve())],
+        }}}}))
+        h.request('/api/location/reload', {}, 'POST')
+        def mcp_status(expected):
+            until = time.monotonic() + 10
+            while time.monotonic() < until:
+                servers = h.request('/api/mcp?' + q)['data']
+                server = next((s for s in servers if s['name'] == 'settings-probe'), None)
+                if server and (server['status']['status'] == 'connected') == expected:
+                    return server
+                time.sleep(.1)
+            raise AssertionError(f'MCP connection did not settle: {servers}')
+        mcp_status(True)
+        h.request('/api/experimental/mcp/settings-probe/disconnect?' + q, {}, 'POST')
+        mcp_status(False)
+        h.request('/api/experimental/mcp/settings-probe/connect?' + q, {}, 'POST')
+        mcp_status(True)
+        print('PASS: real MCP server discovery, connect and disconnect in the selected project')
         print('PASS: attachment-only, encoded URI, 100 files, permissions, saved grants/revoke, working/branch/committed diffs, usage/context/limits')
 
 if __name__=='__main__':main()

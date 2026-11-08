@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{
     Enter, Escape, IndentInline, InlineToken, InputEvent, MoveDown, MoveLeft, MoveRight, MoveUp,
@@ -161,6 +161,7 @@ fn draft_scope(store: &Store) -> Option<String> {
     })
 }
 mod attachments;
+pub use attachments::prune_old_pastes;
 
 impl Composer {
     pub fn new(
@@ -267,6 +268,9 @@ impl Composer {
     /// Send the box. While the session runs, `secondary` (Ctrl/Cmd+Enter)
     /// queues the prompt for after the turn; plain Enter steers it.
     fn submit(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.store.read(cx).is_submitting() && !self.busy(cx) {
+            return;
+        }
         let delivery = self.busy(cx).then_some(if secondary {
             Delivery::Queue
         } else {
@@ -473,7 +477,7 @@ impl Composer {
                     )
                     .child(div().flex_1().min_w_0().truncate().child(
                         if item.attachments.is_empty() {
-                            item.text.clone()
+                            item.text
                         } else {
                             format!("{} · {} attachments", item.text, item.attachments.len())
                         },
@@ -919,7 +923,8 @@ impl Composer {
 
     fn render_pickers(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let store = self.store.read(cx);
-        let catalog = store.target_catalog().cloned().unwrap_or_default();
+        let empty = crate::store::Catalog::default();
+        let catalog = store.target_catalog().unwrap_or(&empty);
         let model = store.effective_model();
         let agent = store.effective_agent();
         let controller = self.controller.clone();
@@ -940,17 +945,15 @@ impl Composer {
         } else {
             store
                 .draft_permission
-                .unwrap_or_else(|| {
-                    store
-                        .target_folder()
-                        .map(|f| store.preferences.permission_for(&f))
-                        .unwrap_or_default()
-                })
-                .label()
+                .map(|m| m.label())
+                .unwrap_or("OpenCode permissions")
         };
         // Permission mode: a quiet icon on the default (Supervised), the
         // mode's name otherwise, so a risky mode is always visible.
-        let non_default = !matches!(label, "Supervised" | "Permissions…" | "Saving permissions…");
+        let non_default = !matches!(
+            label,
+            "OpenCode permissions" | "Supervised" | "Permissions…" | "Saving permissions…"
+        );
         let full = label == crate::settings::PermissionMode::FullAccess.label();
         let theme = cx.theme().clone();
         let c = controller.clone();
@@ -980,6 +983,16 @@ impl Composer {
                     || store.connection() != Connection::Connected,
             )
             .dropdown_menu(move |mut menu, _, _| {
+                if selected.is_none() {
+                    let c = c.clone();
+                    menu = menu
+                        .item(PopupMenuItem::new("Use OpenCode configuration").on_click(
+                            move |_, _, cx| {
+                                c.update(cx, |c, cx| c.inherit_draft_permissions(cx));
+                            },
+                        ))
+                        .separator();
+                }
                 for mode in crate::settings::PermissionMode::ALL {
                     let c = c.clone();
                     menu = menu.item(PopupMenuItem::new(mode.label()).on_click(move |_, _, cx| {
@@ -1004,7 +1017,7 @@ impl Composer {
                 .or_else(|| agent.clone())
                 .unwrap_or_else(|| "Agent".into());
             let c = controller.clone();
-            let current = agent.clone();
+            let current = agent;
             row = row.child(
                 crate::ui::kit::quiet_select("agent-picker", label)
                     .tooltip("Agent")
@@ -1033,38 +1046,6 @@ impl Composer {
                 .map(|m| m.name.clone())
                 .or_else(|| model.as_ref().map(|m| m.id.clone()))
                 .unwrap_or_else(|| "Model".into());
-            // The server lists models in no provider order; group each
-            // provider's models together (first-appearance order, stable).
-            let mut models = catalog.models.clone();
-            let mut providers: Vec<String> = Vec::new();
-            for m in &models {
-                if !providers.contains(&m.provider_id) {
-                    providers.push(m.provider_id.clone());
-                }
-            }
-            models.sort_by_key(|m| providers.iter().position(|p| *p == m.provider_id));
-            // One group per provider; `picks[section][row]` is the model.
-            let mut groups: Vec<CommandGroup> = Vec::new();
-            let mut picks: Vec<Vec<ModelRef>> = Vec::new();
-            for provider in &providers {
-                let mut group = CommandGroup::new().label(provider.clone());
-                let mut refs = Vec::new();
-                for m in models.iter().filter(|m| &m.provider_id == provider) {
-                    let r = m.as_ref();
-                    let checked = model.as_ref().is_some_and(|cur| cur.same_model(&r));
-                    group = group.item(
-                        CommandItem::new()
-                            .label(m.name.clone())
-                            .keywords([m.id.clone(), m.provider_id.clone()])
-                            .checked(checked),
-                    );
-                    refs.push(r);
-                }
-                groups.push(group);
-                picks.push(refs);
-            }
-            let groups = std::rc::Rc::new(groups);
-            let picks = std::rc::Rc::new(picks);
             let search = self.model_search.clone();
             let weak = cx.weak_entity();
             let close = {
@@ -1077,12 +1058,14 @@ impl Composer {
                 }
             };
             let c = controller.clone();
+            let store_handle = self.store.clone();
+            let current = model.clone();
             row = row.child(
                 Popover::new("model-picker-popover")
                     .anchor(Anchor::BottomLeft)
                     .open(self.model_open)
                     .on_open_change({
-                        let weak = weak.clone();
+                        let weak = weak;
                         let search = search.clone();
                         move |open, window, cx| {
                             let open = *open;
@@ -1101,8 +1084,12 @@ impl Composer {
                     .trigger(crate::ui::kit::quiet_select("model-picker", label).tooltip("Model"))
                     .p_0()
                     .w(px(320.))
-                    .content(move |_, _, _| {
-                        let picks = picks.clone();
+                    // Built only while open: the catalog can be large, and the
+                    // composer redraws far more often than the picker opens.
+                    .content(move |_, _, cx| {
+                        let (groups, picks) =
+                            model_groups(store_handle.read(cx).target_catalog(), current.as_ref());
+                        let picks = std::rc::Rc::new(picks);
                         let c = c.clone();
                         let close_confirm = close.clone();
                         let close_cancel = close.clone();
@@ -1110,8 +1097,8 @@ impl Composer {
                             .placeholder("Search models…")
                             .max_h(px(380.))
                             .bordered(false);
-                        for g in groups.iter() {
-                            command = command.group(g.clone());
+                        for g in groups {
+                            command = command.group(g);
                         }
                         command
                             .on_confirm(move |ix, _, cx| {
@@ -1139,7 +1126,7 @@ impl Composer {
                             .unwrap_or_default()
                     })
                     .unwrap_or_else(|| "Default effort".into());
-                let c = controller.clone();
+                let c = controller;
                 row = row.child(
                     crate::ui::kit::quiet_select("variant-picker", label)
                         .tooltip("Reasoning effort")
@@ -1174,9 +1161,52 @@ impl Composer {
     }
 }
 
+/// The model picker's rows, one group per provider (first-appearance
+/// order, since the server lists models in no provider order), and the
+/// model behind each row: `picks[section][row]`.
+fn model_groups(
+    catalog: Option<&crate::store::Catalog>,
+    current: Option<&ModelRef>,
+) -> (Vec<CommandGroup>, Vec<Vec<ModelRef>>) {
+    let models = catalog.map(|c| c.models.as_slice()).unwrap_or_default();
+    let mut providers: Vec<&str> = Vec::new();
+    for m in models {
+        if !providers.contains(&m.provider_id.as_str()) {
+            providers.push(&m.provider_id);
+        }
+    }
+    let mut groups = Vec::with_capacity(providers.len());
+    let mut picks = Vec::with_capacity(providers.len());
+    for provider in providers {
+        let mut group = CommandGroup::new().label(provider.to_string());
+        let mut refs = Vec::new();
+        for m in models.iter().filter(|m| m.provider_id == provider) {
+            let r = m.as_ref();
+            let checked = current.is_some_and(|cur| cur.same_model(&r));
+            group = group.item(
+                CommandItem::new()
+                    .label(m.name.clone())
+                    .keywords([m.id.clone(), m.provider_id.clone()])
+                    .checked(checked),
+            );
+            refs.push(r);
+        }
+        groups.push(group);
+        picks.push(refs);
+    }
+    (groups, picks)
+}
+
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.busy(cx);
+        let sending = self.store.read(cx).is_submitting();
+        let stopping = self
+            .store
+            .read(cx)
+            .selected
+            .as_ref()
+            .is_some_and(|sid| self.store.read(cx).interrupting.contains(sid));
         if busy != self.placeholder_busy {
             self.placeholder_busy = busy;
             let text = if busy {
@@ -1198,6 +1228,7 @@ impl Render for Composer {
         let send = Button::new("send")
             .icon(IconName::ArrowUp)
             .small()
+            .size(px(30.))
             .rounded(px(999.))
             .primary()
             .tooltip(if busy {
@@ -1205,24 +1236,40 @@ impl Render for Composer {
             } else {
                 "Send (Enter)"
             })
-            .disabled(empty || !connected || self.attachment_writes > 0)
+            .disabled(empty || !connected || self.attachment_writes > 0 || (sending && !busy))
             .on_click(cx.listener(|this, _, window, cx| this.submit(false, window, cx)));
         let stop = busy.then(|| {
             Button::new("stop")
-                .icon(IconName::Square)
                 .small()
+                .size(px(30.))
                 .rounded(px(999.))
-                .when(empty, |b| b.primary())
-                .when(!empty, |b| b.outline())
-                .tooltip("Stop (Esc Esc)")
+                .custom(
+                    ButtonCustomVariant::new(cx)
+                        .color(theme.secondary_active)
+                        .foreground(theme.foreground)
+                        .hover(theme.secondary_hover)
+                        .active(theme.secondary),
+                )
+                .child(
+                    div()
+                        .size(px(9.))
+                        .rounded(px(1.5))
+                        .bg(theme.foreground.opacity(if stopping { 0.45 } else { 0.9 })),
+                )
+                .disabled(stopping || !connected)
+                .tooltip(if stopping {
+                    "Stopping…"
+                } else {
+                    "Stop (Esc Esc)"
+                })
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.controller.update(cx, |c, cx| c.abort(cx));
                 }))
         });
         let status = if esc_armed {
             Some(("Press Esc again to stop", theme.warning))
-        } else if busy {
-            Some(("Working…", theme.muted_foreground))
+        } else if sending && !busy {
+            Some(("Sending…", theme.muted_foreground))
         } else {
             None
         };
@@ -1362,7 +1409,17 @@ impl Render for Composer {
                             .gap_2()
                             .items_center()
                             .when_some(status, |d, (text, color)| {
-                                d.child(div().text_xs().text_color(color).child(text))
+                                d.child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .when(sending && !esc_armed, |d| {
+                                            d.child(super::kit::spinner().xsmall().color(color))
+                                        })
+                                        .text_xs()
+                                        .text_color(color)
+                                        .child(text),
+                                )
                             })
                             .children(stop)
                             .when(!busy || !empty, |d| d.child(send)),

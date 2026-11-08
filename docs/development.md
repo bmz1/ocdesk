@@ -118,6 +118,14 @@ In CI, add the repository secrets `MACOS_CERT_P12` (base64 .p12),
 `APPLE_APP_PASSWORD`; without them builds are ad-hoc signed. The app id is
 `io.github.bmz1.ocdesk` (bundle id, Linux window class, desktop file).
 
+**App icons.** `src/app_icon.rs` embeds `packaging/icon.png`: GPUI receives a
+128 px window icon for X11, and AppKit sets the Dock image even for a bare macOS
+executable. Finder uses the `.icns` in the packaged `.app`. For a Linux source
+build, run `python3 dev/install-desktop.py target/debug/ocdesk` to register the
+same desktop identity in `$XDG_DATA_HOME` (default `~/.local/share`); Wayland
+resolves application icons through that desktop entry. Pass `--data-dir` to
+verify registration in an isolated directory.
+
 ## Architecture
 
 ```
@@ -125,7 +133,8 @@ src/
   main.rs            bootstrap: logging, tokio runtime thread, signals, window
   shell_env.rs       login-shell PATH for apps started outside a terminal
   sidecar.rs         spawn / health-check / kill `opencode serve`
-  settings.rs        folders, theme, window/sidebar, last session, draft model/agent (JSON)
+  settings.rs        app preferences, folders, theme, window/sidebar, last session (JSON)
+  opencode_config.rs real JSONC discovery, syntax validation and conflict-checked saves
   api/mod.rs         thin HTTP client + SSE reader (the only place that does HTTP)
   api/model.rs       our view of sessions/messages/blocks (lenient JSON parsing)
   api/events.rs      server events → our normalized Event enum

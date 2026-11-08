@@ -1,9 +1,5 @@
 //! Editable settings, with staged changes and explicit save/cancel.
-use crate::{
-    api::model::ModelRef,
-    controller::Controller,
-    settings::{PermissionMode, ProjectDefaults, Settings},
-};
+use crate::{controller::Controller, settings::Settings};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -15,38 +11,41 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::PathBuf;
 
-struct DefaultsEditor {
-    folder: Option<PathBuf>,
-    model: Entity<InputState>,
-    agent: Entity<InputState>,
-    permission: Option<PermissionMode>,
-}
+mod config;
+mod mcp;
+use config::ConfigEditor;
+use mcp::McpPanel;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     General,
-    Defaults,
+    OpenCode,
+    Mcp,
     Permissions,
     Keybindings,
 }
 impl Section {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::General,
-        Self::Defaults,
+        Self::OpenCode,
+        Self::Mcp,
         Self::Permissions,
         Self::Keybindings,
     ];
     fn label(self) -> &'static str {
         match self {
             Self::General => "General",
-            Self::Defaults => "Defaults",
-            Self::Permissions => "Permissions",
+            Self::OpenCode => "OpenCode",
+            Self::Mcp => "MCP servers",
+            Self::Permissions => "Saved approvals",
             Self::Keybindings => "Keybindings",
         }
     }
     fn blurb(self) -> &'static str {
         match self {
             Self::General => "Appearance, notifications and your editor.",
-            Self::Defaults => "Model, agent and permission mode for new threads.",
+            Self::OpenCode => "Edit OpenCode configuration for all projects or a specific project.",
+            Self::Mcp => "Connections and setup for Model Context Protocol servers.",
             Self::Permissions => "Grants you saved with \"Always allow\".",
             Self::Keybindings => "secondary = Cmd on macOS, Ctrl on Linux. Leave empty to unbind.",
         }
@@ -55,11 +54,12 @@ impl Section {
 pub struct SettingsView {
     section: Section,
     store: Entity<crate::store::Store>,
-    _sub: Subscription,
+    _subs: Vec<Subscription>,
     controller: Entity<Controller>,
     prefs: Settings,
     editor: Entity<InputState>,
-    defaults: Vec<DefaultsEditor>,
+    config: Entity<ConfigEditor>,
+    mcp: Entity<McpPanel>,
     keys: Vec<(String, &'static str, Entity<InputState>)>,
     error: Option<String>,
 }
@@ -67,11 +67,17 @@ pub fn open(controller: Entity<Controller>, window: &mut Window, cx: &mut App) {
     controller.update(cx, |c, cx| c.refresh_saved_grants(cx));
     let prefs = controller.read(cx).preferences();
     let view = cx.new(|cx| SettingsView::new(controller, prefs, window, cx));
-    window.open_dialog(cx, move |dialog, _, _| {
+    let guard = view.clone();
+    window.open_dialog(cx, move |dialog, window, _| {
         dialog
             .entrance(gpui_kit::component::dialog::DialogEntrance::Fade)
             .title("Settings")
-            .w(px(780.))
+            .on_ok(|_, _, _| false)
+            .on_cancel({
+                let guard = guard.clone();
+                move |_, _, cx| guard.update(cx, |view, cx| view.can_close(cx))
+            })
+            .w((window.viewport_size().width - px(48.)).min(px(960.)))
             .child(view.clone())
     });
 }
@@ -87,29 +93,6 @@ fn input(
             .placeholder(placeholder.to_string())
     })
 }
-fn model_text(model: &Option<ModelRef>) -> String {
-    model
-        .as_ref()
-        .map(|m| format!("{}/{}", m.provider_id, m.id))
-        .unwrap_or_default()
-}
-fn parse_model(value: &str) -> anyhow::Result<Option<ModelRef>> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    let (provider, id) = value
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("Model must be provider/model"))?;
-    if provider.is_empty() || id.is_empty() {
-        anyhow::bail!("Model must be provider/model");
-    }
-    Ok(Some(ModelRef {
-        provider_id: provider.into(),
-        id: id.into(),
-        variant: None,
-    }))
-}
 impl SettingsView {
     fn new(
         controller: Entity<Controller>,
@@ -123,35 +106,18 @@ impl SettingsView {
             window,
             cx,
         );
-        let mut defaults = vec![DefaultsEditor {
-            folder: None,
-            model: input(model_text(&prefs.draft_model), "Server default", window, cx),
-            agent: input(
-                prefs.draft_agent.clone().unwrap_or_default(),
-                "Server default",
-                window,
-                cx,
-            ),
-            permission: Some(prefs.permission_mode),
-        }];
-        for folder in &prefs.folders {
-            let p = prefs
-                .project_defaults
-                .get(folder)
-                .cloned()
-                .unwrap_or_default();
-            defaults.push(DefaultsEditor {
-                folder: Some(folder.clone()),
-                model: input(model_text(&p.model), "Inherit default model", window, cx),
-                agent: input(
-                    p.agent.unwrap_or_default(),
-                    "Inherit default agent",
-                    window,
-                    cx,
-                ),
-                permission: p.permission,
+        let config = cx.new(|cx| ConfigEditor::new(controller.clone(), &prefs, window, cx));
+        config.update(cx, |c, cx| c.load(window, cx));
+        let parent = cx.weak_entity();
+        let configure = std::rc::Rc::new(move |project, window: &mut Window, cx: &mut App| {
+            let _ = parent.update(cx, |this: &mut Self, cx| {
+                this.section = Section::OpenCode;
+                this.config
+                    .update(cx, |c, cx| c.show_project(project, window, cx));
+                cx.notify();
             });
-        }
+        });
+        let mcp = cx.new(|cx| McpPanel::new(controller.clone(), &prefs, configure, cx));
         let keys = super::keys::editable()
             .into_iter()
             .map(|(name, default, label)| {
@@ -161,19 +127,41 @@ impl SettingsView {
             .collect();
         let store = controller.read(cx).view_store();
         let sub = cx.observe(&store, |_, _, cx| cx.notify());
+        let config_sub = cx.observe(&config, |this, config, cx| {
+            if !config.read(cx).has_unsaved_changes() {
+                this.error = None;
+            }
+            cx.notify();
+        });
         Self {
             section: Section::General,
             store,
-            _sub: sub,
+            _subs: vec![sub, config_sub],
             controller,
             prefs,
             editor,
-            defaults,
+            config,
+            mcp,
             keys,
             error: None,
         }
     }
+    fn can_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.config.read(cx).has_unsaved_changes() {
+            self.section = Section::OpenCode;
+            self.error = Some(
+                "Save or discard your OpenCode configuration edits before closing Settings.".into(),
+            );
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_close(cx) {
+            return;
+        }
         let mut prefs = self.prefs.clone();
         prefs.editor =
             Some(self.editor.read(cx).value().trim().to_string()).filter(|s| !s.is_empty());
@@ -186,53 +174,6 @@ impl SettingsView {
             self.error = Some(format!("{e:#}"));
             cx.notify();
             return;
-        }
-        for d in &self.defaults {
-            let mut model = match parse_model(&d.model.read(cx).value()) {
-                Ok(m) => m,
-                Err(e) => {
-                    self.error = Some(format!("{e:#}"));
-                    cx.notify();
-                    return;
-                }
-            };
-            let previous = d
-                .folder
-                .as_ref()
-                .and_then(|f| {
-                    self.prefs
-                        .project_defaults
-                        .get(f)
-                        .and_then(|p| p.model.as_ref())
-                })
-                .or_else(|| {
-                    if d.folder.is_none() {
-                        self.prefs.draft_model.as_ref()
-                    } else {
-                        None
-                    }
-                });
-            if let (Some(model), Some(previous)) = (&mut model, previous)
-                && model.provider_id == previous.provider_id
-                && model.id == previous.id
-            {
-                model.variant = previous.variant.clone();
-            }
-            let agent = Some(d.agent.read(cx).value().trim().to_string()).filter(|s| !s.is_empty());
-            if let Some(folder) = &d.folder {
-                prefs.project_defaults.insert(
-                    folder.clone(),
-                    ProjectDefaults {
-                        model,
-                        agent,
-                        permission: d.permission,
-                    },
-                );
-            } else {
-                prefs.draft_model = model;
-                prefs.draft_agent = agent;
-                prefs.permission_mode = d.permission.unwrap_or_default();
-            }
         }
         if let Err(e) = super::keys::apply(&prefs.keybindings, cx) {
             self.error = Some(format!("{e:#}"));
@@ -287,130 +228,6 @@ impl SettingsView {
                 true,
             ))
             .into_any_element()
-    }
-
-    fn defaults_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let mut col = v_flex().gap_4();
-        for (i, d) in self.defaults.iter().enumerate() {
-            let weak = cx.weak_entity();
-            let inherit = d.folder.is_some();
-            let (title, sub) = match &d.folder {
-                Some(f) => (
-                    f.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| f.display().to_string()),
-                    Some(f.display().to_string()),
-                ),
-                None => ("All new threads".to_string(), None),
-            };
-            let permission = Button::new(SharedString::from(format!("settings-permission-{i}")))
-                .label(d.permission.map(|m| m.label()).unwrap_or("Inherit"))
-                .dropdown_caret(true)
-                .outline()
-                .small()
-                .dropdown_menu(move |mut menu, _, _| {
-                    let modes = if inherit {
-                        std::iter::once(None)
-                            .chain(PermissionMode::ALL.into_iter().map(Some))
-                            .collect::<Vec<_>>()
-                    } else {
-                        PermissionMode::ALL.into_iter().map(Some).collect()
-                    };
-                    for mode in modes {
-                        let weak = weak.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(mode.map(|m| m.label()).unwrap_or("Inherit"))
-                                .on_click(move |_, _, cx| {
-                                    let _ = weak.update(cx, |this, cx| {
-                                        this.defaults[i].permission = mode;
-                                        cx.notify();
-                                    });
-                                }),
-                        );
-                    }
-                    menu
-                });
-            col = col.child(
-                v_flex()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_baseline()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(title),
-                            )
-                            .when_some(sub, |el, sub| {
-                                el.child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(sub),
-                                )
-                            }),
-                    )
-                    .child(
-                        card(&theme)
-                            .child(row(
-                                "Model",
-                                Some("provider/model"),
-                                div().w(px(260.)).child(Input::new(&d.model).small()),
-                                &theme,
-                                false,
-                            ))
-                            .child(row(
-                                "Agent",
-                                None,
-                                div().w(px(260.)).child(Input::new(&d.agent).small()),
-                                &theme,
-                                true,
-                            ))
-                            .child(row("Permission mode", None, permission, &theme, true)),
-                    ),
-            );
-        }
-        let modes = [
-            (
-                "Supervised",
-                "Asks before writes and shell commands without a saved grant.",
-            ),
-            (
-                "Auto-accept edits",
-                "Allows file edits; shell commands still ask.",
-            ),
-            ("Full access", "Allows everything the server supports."),
-        ];
-        let mut legend = v_flex()
-            .gap_1()
-            .p_3()
-            .rounded_lg()
-            .bg(theme.secondary.opacity(0.5))
-            .text_xs();
-        for (name, desc) in modes {
-            legend = legend.child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(110.))
-                            .flex_none()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(name),
-                    )
-                    .child(div().text_color(theme.muted_foreground).child(desc)),
-            );
-        }
-        legend =
-            legend.child(div().pt_1().text_color(theme.muted_foreground).child(
-                "Saved grants apply in every mode. Pending approvals always stay explicit.",
-            ));
-        col.child(legend).into_any_element()
     }
 
     fn permissions_section(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -594,41 +411,57 @@ fn row(
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let mut nav = v_flex().w(px(160.)).flex_none().gap_0p5().pr_3();
+        let mut nav = v_flex().w(px(168.)).flex_none().gap_1().pr_3();
         for section in Section::ALL {
             let selected = self.section == section;
             nav = nav.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "settings-nav-{}",
-                        section.label()
-                    )))
-                    .px_2()
-                    .py_1p5()
-                    .rounded_md()
-                    .text_sm()
-                    .cursor_pointer()
-                    .when(selected, |el| {
-                        el.bg(theme.secondary).font_weight(FontWeight::MEDIUM)
-                    })
-                    .when(!selected, |el| {
-                        el.text_color(theme.muted_foreground).hover(|s| {
-                            s.bg(theme.secondary.opacity(0.5))
-                                .text_color(theme.foreground)
-                        })
-                    })
-                    .child(section.label())
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                Button::new(SharedString::from(format!(
+                    "settings-nav-{}",
+                    section.label()
+                )))
+                .ghost()
+                .small()
+                .w_full()
+                .justify_start()
+                .h(px(36.))
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .when(selected, |el| {
+                    el.bg(theme.secondary).font_weight(FontWeight::MEDIUM)
+                })
+                .when(!selected, |el| el.text_color(theme.muted_foreground))
+                .accessibility_label(section.label())
+                .child(div().w_full().text_left().child(section.label()))
+                .on_action(cx.listener(
+                    move |this, _: &gpui_kit::component::dialog::Confirm, _, cx| {
                         this.section = section;
+                        if section == Section::Mcp {
+                            this.mcp.update(cx, |m, cx| m.refresh(cx));
+                        }
+                        this.error = None;
+                        cx.stop_propagation();
                         cx.notify();
-                    })),
+                    },
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.section = section;
+                    if section == Section::Mcp {
+                        this.mcp.update(cx, |m, cx| m.refresh(cx));
+                    }
+                    this.error = None;
+                    cx.notify();
+                })),
             );
         }
         let body = match self.section {
             Section::General => self.general(cx),
-            Section::Defaults => self.defaults_section(cx),
+            Section::OpenCode => self.config.clone().into_any_element(),
+            Section::Mcp => self.mcp.clone().into_any_element(),
             Section::Permissions => self.permissions_section(cx),
             Section::Keybindings => self.keybindings(cx),
         };
@@ -667,7 +500,7 @@ impl Render for SettingsView {
             .gap_3()
             .child(
                 h_flex()
-                    .h(px(500.))
+                    .h((window.viewport_size().height - px(220.)).clamp(px(200.), px(530.)))
                     .items_start()
                     .child(nav)
                     .child(div().w(px(1.)).h_full().bg(theme.border).mr_4())
@@ -691,11 +524,15 @@ impl Render for SettingsView {
                         Button::new("cancel-settings")
                             .label("Cancel")
                             .ghost()
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.can_close(cx) {
+                                    window.close_dialog(cx);
+                                }
+                            })),
                     )
                     .child(
                         Button::new("save-settings")
-                            .label("Save")
+                            .label("Save app settings")
                             .primary()
                             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                     ),

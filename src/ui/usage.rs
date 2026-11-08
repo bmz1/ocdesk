@@ -1,6 +1,9 @@
 use crate::ui::kit::section_label;
 use crate::ui::message::format_tokens;
-use crate::{controller::Controller, store::Store};
+use crate::{
+    controller::Controller,
+    store::{Store, StoreEvent},
+};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _, Theme, WindowExt as _, h_flex, v_flex,
@@ -12,17 +15,30 @@ struct UsageDetails {
     sid: String,
     controller: Entity<Controller>,
     store: Entity<Store>,
-    _sub: Subscription,
+    _subs: Vec<Subscription>,
 }
 pub fn open(sid: String, controller: Entity<Controller>, window: &mut Window, cx: &mut App) {
     let store = controller.read(cx).view_store();
+    controller.update(cx, |c, cx| c.refresh_usage_details(sid.clone(), cx));
     let view = cx.new(|cx| {
-        let sub = cx.observe(&store, |_, _, cx| cx.notify());
+        // Usage arrives as events (no store-wide notify); the rest of what
+        // it shows (catalog, transcript) changes with ordinary notifies.
+        let subs = vec![
+            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.subscribe(&store, |this: &mut UsageDetails, _, ev: &StoreEvent, cx| {
+                if let StoreEvent::UsageChanged { session_id }
+                | StoreEvent::MessageChanged { session_id, .. } = ev
+                    && *session_id == this.sid
+                {
+                    cx.notify();
+                }
+            }),
+        ];
         UsageDetails {
             sid,
             controller,
             store,
-            _sub: sub,
+            _subs: subs,
         }
     });
     window.open_dialog(cx, move |dialog, _, _| {
@@ -37,7 +53,7 @@ impl Render for UsageDetails {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let s = self.store.read(cx);
-        let report = s.usage.get(&self.sid).cloned();
+        let report = s.usage_view(&self.sid);
         let error = s.usage_errors.get(&self.sid).cloned();
         let loading = s.usage_loading.contains(&self.sid);
         let mut col = v_flex().gap_5();
@@ -236,7 +252,7 @@ impl Render for UsageDetails {
                         .ghost()
                         .small()
                         .on_click(move |_, _, cx| {
-                            c.update(cx, |c, cx| c.refresh_usage(id.clone(), cx));
+                            c.update(cx, |c, cx| c.refresh_usage_details(id.clone(), cx));
                         }),
                 ),
         );

@@ -152,6 +152,16 @@ cargo run --release              # or: cargo run --release -- ~/code/my-project
 `rustup` picks up the pinned toolchain automatically. On Linux, first install
 the [build dependencies](docs/development.md#build-dependencies).
 
+The icon is embedded for macOS Dock and X11 launches. For Linux source builds,
+register the launcher and icon so Wayland and application menus can find them:
+
+```sh
+python3 dev/install-desktop.py target/release/ocdesk
+```
+
+Use `target/debug/ocdesk` for debug builds. Tarball `install.sh` already installs
+the desktop entry and icons.
+
 ## Usage
 
 Add a folder with **+** next to *Folders* (or `Mod+O`), or pass one on the
@@ -204,7 +214,11 @@ are found the same way as in your terminal.
 
 Settings live in `~/.config/ocdesk/settings.json` (Linux) or
 `~/Library/Application Support/ocdesk/settings.json` (macOS) and are edited
-from **Settings** (`Mod+,`). Logs go to `~/.local/share/ocdesk/logs/`
+from **Settings** (`Mod+,`). Its **OpenCode** tab edits global and project
+`opencode.json(c)` files directly; model, agent and permission defaults are
+inherited from OpenCode. **Saved approvals** lists and revokes project grants.
+**MCP servers** shows connections, connect/disconnect controls and setup instructions.
+Logs go to `~/.local/share/ocdesk/logs/`
 (Linux) or `~/Library/Application Support/ocdesk/logs/` (macOS).
 
 | Variable | Effect |

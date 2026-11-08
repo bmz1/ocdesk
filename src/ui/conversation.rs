@@ -54,10 +54,15 @@ pub struct FindState {
     current: usize,
 }
 
+/// (session, conversation revision) and the todo list derived from it.
+type TodosMemo = ((String, u64), Vec<super::todos::Todo>);
+
 pub struct ConversationView {
     find: Option<FindState>,
     /// The todo pill shows its checklist.
     todos_open: bool,
+    /// The selected session's todo list by (session, conversation revision).
+    todos_memo: std::cell::RefCell<Option<TodosMemo>>,
     expanded_tools: std::collections::HashSet<String>,
     tool_scrolls: super::tool_card::ScrollHandles,
     /// Open right-panel tab.
@@ -100,7 +105,17 @@ impl ConversationView {
         let prose = cx.new(|_| ProseCache::new(store.clone(), scroller.clone()));
         let subs = vec![
             cx.subscribe_in(&store, window, Self::on_store_event),
-            cx.observe(&store, |_, _, cx| cx.notify()),
+            // Any store change may show here; density changes every row's height.
+            cx.observe(&store, |this: &mut Self, store, cx| {
+                let d = store.read(cx).preferences.density;
+                if d != this.density {
+                    this.density = d;
+                    let n = this.row_count(cx);
+                    this.scroller
+                        .update(cx, |s, cx| s.remeasure_items(0..n, cx));
+                }
+                cx.notify();
+            }),
         ];
         Composer::focus(&composer, window, cx);
         let tasks =
@@ -123,19 +138,10 @@ impl ConversationView {
         let mut subs = subs;
         subs.push(cx.observe(&files, |_, _, cx| cx.notify()));
         let prefs = store.read(cx).preferences.clone();
-        // Density changes every row's height.
-        subs.push(cx.observe(&store, |this: &mut Self, store, cx| {
-            let d = store.read(cx).preferences.density;
-            if d != this.density {
-                this.density = d;
-                let n = this.row_count(cx);
-                this.scroller
-                    .update(cx, |s, cx| s.remeasure_items(0..n, cx));
-            }
-        }));
         Self {
             find: None,
             todos_open: false,
+            todos_memo: Default::default(),
             tasks,
             panel: prefs.panel,
             panel_width: px(prefs
@@ -541,7 +547,7 @@ impl ConversationView {
         self.panel_width = w;
         let saved: f32 = w.into();
         self.controller.update(cx, |c, cx| {
-            c.update_settings(cx, |s| s.panel_width = Some(saved))
+            c.update_layout(cx, |s| s.panel_width = Some(saved))
         });
         cx.notify();
     }
@@ -599,6 +605,7 @@ impl ConversationView {
                         let i = *index;
                         self.scroller.update(cx, |s, cx| {
                             s.splice(i..i, 1, cx);
+                            s.remeasure_items(i.saturating_sub(1)..i + 1, cx);
                         });
                     }
                     _ => self.scroller.update(cx, |s, cx| s.reset(n, cx)),
@@ -642,7 +649,17 @@ impl ConversationView {
                 let i = *index;
                 self.scroller.update(cx, |s, cx| {
                     s.splice(i..i, 1, cx);
+                    // Activity moved from the previous last row to this one.
+                    s.remeasure_items(i.saturating_sub(1)..i + 1, cx);
                 });
+            }
+            StoreEvent::StatusChanged { session_id } if is_selected(session_id) => {
+                let n = self.row_count(cx);
+                if n > 0 {
+                    self.scroller.update(cx, |s, cx| {
+                        s.remeasure_items(n - 1..n, cx);
+                    });
+                }
             }
             StoreEvent::MessageChanged { session_id, index } if is_selected(session_id) => {
                 // Only the streaming row is re-measured.
@@ -651,6 +668,13 @@ impl ConversationView {
                     s.remeasure_items(i..i + 1, cx);
                 });
             }
+            // Rows of sessions not shown (background subagents) don't
+            // affect this view.
+            StoreEvent::MessagesReset { .. }
+            | StoreEvent::MessageInserted { .. }
+            | StoreEvent::MessageChanged { .. } => return,
+            // The header meter shows only the selected session's usage.
+            StoreEvent::UsageChanged { session_id } if !is_selected(session_id) => return,
             _ => {}
         }
         cx.notify();
@@ -997,7 +1021,7 @@ impl Render for ConversationView {
                 .as_ref()
                 .and_then(|f| f.hits.get(f.current).copied());
             let list = MessageScroller::new("messages", self.scroller.clone(), move |ix, _, cx| {
-                prose::sync_row(&store, &cache, ix, cx);
+                prose::sync_row(&store, &cache, ix, store.read(cx).preferences.density, cx);
                 let s = store.read(cx);
                 let density = s.preferences.density;
                 let idle = s.selected.as_ref().is_none_or(|id| !s.is_busy(id));
@@ -1038,8 +1062,32 @@ impl Render for ConversationView {
                             idle,
                             density,
                             on_action: on_action.clone(),
+                            store: &store,
                         };
-                        render_message(m, &cache, &tools, &row_ctx, cx)
+                        v_flex()
+                            .w_full()
+                            .child(render_message(m, &cache, &tools, &row_ctx, cx))
+                            .when(next.is_none(), |el| {
+                                el.when_some(s.response_activity(), |el, label| {
+                                    el.child(
+                                        h_flex()
+                                            .id("response-activity")
+                                            .items_center()
+                                            .gap_2()
+                                            .pt_4()
+                                            .pb_2()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                super::kit::spinner()
+                                                    .small()
+                                                    .color(cx.theme().muted_foreground),
+                                            )
+                                            .child(label),
+                                    )
+                                })
+                            })
+                            .into_any_element()
                     })
                     .unwrap_or_else(|| div().into_any_element());
                 let hit = find_hits.binary_search(&ix).is_ok();
@@ -1151,14 +1199,10 @@ impl Render for ConversationView {
         };
         let changes = {
             let s = self.store.read(cx);
-            s.selected
-                .as_ref()
-                .and_then(|sid| s.diffs.get(sid))
-                .filter(|d| !d.is_empty())
-                .map(|d| {
-                    d.iter()
-                        .fold((0, 0), |(a, r), f| (a + f.additions, r + f.deletions))
-                })
+            s.selected_diff().filter(|d| !d.is_empty()).map(|d| {
+                d.iter()
+                    .fold((0, 0), |(a, r), f| (a + f.additions, r + f.deletions))
+            })
         };
         let sidebar_hidden = self.store.read(cx).preferences.sidebar_hidden;
         let header = h_flex()
@@ -1191,7 +1235,7 @@ impl Render for ConversationView {
                         window.dispatch_action(Box::new(super::keys::ToggleSidebar), cx)
                     }),
             )
-            .when_some(folder.clone(), |el, f| {
+            .when_some(folder, |el, f| {
                 el.child(super::kit::monogram(&f, 18., cx))
                     .child(div().text_color(theme.muted_foreground).child(f))
                     .child(div().text_color(theme.muted_foreground).child("/"))
@@ -1417,7 +1461,15 @@ impl ConversationView {
     fn render_todos(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let store = self.store.read(cx);
         let busy = store.selected.as_ref().is_some_and(|id| store.is_busy(id));
-        let todos = super::todos::session_todos(&store.selected_conversation()?.messages);
+        let conv = store.selected_conversation()?;
+        let key = (store.selected.clone().unwrap_or_default(), conv.revision);
+        let todos = {
+            let mut memo = self.todos_memo.borrow_mut();
+            if memo.as_ref().is_none_or(|(k, _)| *k != key) {
+                *memo = Some((key, super::todos::session_todos(&conv.messages)));
+            }
+            memo.as_ref().map(|(_, t)| t.clone()).unwrap_or_default()
+        };
         let view = cx.entity().downgrade();
         super::todos::pill(
             &todos,
@@ -1444,10 +1496,11 @@ impl ConversationView {
             return div().into_any_element();
         };
         let report = Some(report);
-        let fraction = report.and_then(|r| match (r.context, r.context_limit) {
+        let (context, context_limit) = store.usage_context(&sid);
+        let fraction = match (context, context_limit) {
             (Some(n), Some(l)) if l > 0 => Some(n as f32 / l as f32),
             _ => None,
-        });
+        };
         let label = match report {
             Some(r) => format!(
                 "{}  ${:.2}",
@@ -1460,7 +1513,7 @@ impl ConversationView {
             (Some(r), Some(f)) => format!(
                 "Context ~{:.0}% of {} · {} tokens · ${:.4}. Click for details.",
                 f * 100.,
-                super::message::format_tokens(r.context_limit.unwrap_or(0)),
+                super::message::format_tokens(context_limit.unwrap_or(0)),
                 r.tokens.total(),
                 r.cost
             ),

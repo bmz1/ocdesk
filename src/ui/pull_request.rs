@@ -16,7 +16,7 @@ use gpui_kit::*;
 
 use crate::controller::Controller;
 use crate::github::{Check, CheckState, Comment, PullRequest, Thread};
-use crate::store::{CheckLog, Store};
+use crate::store::{CheckLog, Store, StoreEvent};
 use crate::ui::icons;
 use crate::ui::kit::section_label;
 
@@ -44,7 +44,20 @@ impl PullRequestPanel {
         controller: Entity<Controller>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let sub = cx.observe(&store, |_, _, cx| cx.notify());
+        // Everything it shows: the PR state, the folder (selection) and
+        // its branch. Not every store change, which includes streaming.
+        let sub = cx.subscribe(&store, |_, _, ev: &StoreEvent, cx| {
+            if matches!(
+                ev,
+                StoreEvent::PullRequestChanged
+                    | StoreEvent::SelectionChanged
+                    | StoreEvent::FoldersChanged
+                    | StoreEvent::SessionsChanged
+                    | StoreEvent::FolderInfoChanged
+            ) {
+                cx.notify();
+            }
+        });
         Self {
             store,
             controller,

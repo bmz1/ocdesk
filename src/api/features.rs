@@ -1,7 +1,7 @@
 //! Session preferences, review scopes, and usage. All I/O runs on Tokio.
 use super::*;
 use crate::settings::PermissionMode;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Default)]
 pub struct Tokens {
@@ -51,6 +51,12 @@ pub struct UsageReport {
     pub limits_error: Option<String>,
 }
 impl UsageReport {
+    /// Add one assistant message's usage to the per-model breakdown.
+    pub fn add_model_usage(&mut self, model: &str, tokens: &Tokens, cost: f64) {
+        let entry = self.models.entry(model.to_string()).or_default();
+        entry.tokens.add(tokens);
+        entry.cost += cost;
+    }
     fn include_message(&mut self, v: &Value) {
         if v["type"] != "assistant" {
             return;
@@ -65,9 +71,7 @@ impl UsageReport {
             model["providerID"].as_str().unwrap_or("unknown"),
             model["id"].as_str().unwrap_or("unknown")
         );
-        let entry = self.models.entry(key).or_default();
-        entry.tokens.add(&tokens);
-        entry.cost += v["cost"].as_f64().unwrap_or(0.);
+        self.add_model_usage(&key, &tokens, v["cost"].as_f64().unwrap_or(0.));
     }
 }
 impl Api {
@@ -101,7 +105,18 @@ impl Api {
             .map(|v| model::FileDiff::from_json(v).ok_or_else(|| anyhow!("invalid file diff")))
             .collect()
     }
-    pub async fn usage_report(&self, sid: &str, directory: &Path) -> Result<UsageReport> {
+    /// Session totals (one request). With `details`, also the account's
+    /// usage limits and, when `history` is set, the per-model breakdown,
+    /// context and model limit from the server. Callers leave `history`
+    /// off when the conversation is loaded: those are derived from memory
+    /// ([`crate::store::Store::usage_view`]) instead of re-downloading it.
+    pub async fn usage_report(
+        &self,
+        sid: &str,
+        directory: &Path,
+        details: bool,
+        history: bool,
+    ) -> Result<UsageReport> {
         let root = format!("/api/session/{}", id(sid));
         let v = self.send(self.req(Method::GET, &root)).await?;
         let session = &v["data"];
@@ -110,81 +125,86 @@ impl Api {
             cost: session["cost"].as_f64().unwrap_or(0.),
             ..Default::default()
         };
-        let mut cursor = None::<String>;
-        loop {
-            let mut q = vec![("limit", PAGE.to_string())];
-            if let Some(c) = &cursor {
-                q.push(("cursor", c.clone()));
-            } else {
-                q.push(("order", "asc".into()));
+        if !details {
+            return Ok(report);
+        }
+        let location = [(
+            "location[directory]",
+            directory.to_string_lossy().into_owned(),
+        )];
+        if history {
+            let mut cursor = None::<String>;
+            loop {
+                let mut q = vec![("limit", PAGE.to_string())];
+                if let Some(c) = &cursor {
+                    q.push(("cursor", c.clone()));
+                } else {
+                    q.push(("order", "asc".into()));
+                }
+                let v = self
+                    .send(self.req(Method::GET, &format!("{root}/message")).query(&q))
+                    .await?;
+                let page = v["data"]
+                    .as_array()
+                    .ok_or_else(|| anyhow!("invalid usage history"))?;
+                for m in page {
+                    report.include_message(m);
+                }
+                let next = v
+                    .pointer("/cursor/next")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if page.len() < PAGE || next.is_none() {
+                    break;
+                }
+                if next == cursor {
+                    bail!("repeated usage history cursor");
+                }
+                cursor = next;
             }
-            let v = self
-                .send(self.req(Method::GET, &format!("{root}/message")).query(&q))
+            let context = self
+                .send(self.req(Method::GET, &format!("{root}/context")))
                 .await?;
-            let page = v["data"]
-                .as_array()
-                .ok_or_else(|| anyhow!("invalid usage history"))?;
-            for m in page {
-                report.include_message(m);
-            }
-            let next = v
-                .pointer("/cursor/next")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if page.len() < PAGE || next.is_none() {
-                break;
-            }
-            if next == cursor {
-                bail!("repeated usage history cursor");
-            }
-            cursor = next;
-        }
-        let context = self
-            .send(self.req(Method::GET, &format!("{root}/context")))
-            .await?;
-        if let Some(messages) = context["data"].as_array() {
-            report.context = messages
-                .iter()
-                .rev()
-                .find(|v| v["type"] == "assistant" && v["tokens"].is_object())
-                .map(|v| Tokens::parse(&v["tokens"]).context());
-        }
-        let current_model = session
-            .get("model")
-            .filter(|v| v.is_object())
-            .cloned()
-            .or_else(|| {
-                context["data"].as_array().and_then(|messages| {
-                    messages
-                        .iter()
-                        .rev()
-                        .find_map(|v| v.get("model").filter(|m| m.is_object()).cloned())
-                })
+            let messages = context["data"].as_array();
+            report.context = messages.and_then(|ms| {
+                ms.iter()
+                    .rev()
+                    .find(|v| v["type"] == "assistant" && v["tokens"].is_object())
+                    .map(|v| Tokens::parse(&v["tokens"]).context())
             });
-        if let Ok(models) = self
-            .send(
-                self.req(Method::GET, "/api/model")
-                    .query(&[("location[directory]", directory.to_string_lossy().as_ref())]),
-            )
-            .await
-        {
-            // The model catalogue is a flat array in opencode 2.x.
-            report.context_limit = models["data"]
-                .as_array()
-                .and_then(|ms| {
-                    ms.iter().find(|m| {
-                        current_model.as_ref().is_some_and(|model| {
-                            m["id"] == model["id"] && m["providerID"] == model["providerID"]
+            let current_model = session
+                .get("model")
+                .filter(|v| v.is_object())
+                .cloned()
+                .or_else(|| {
+                    messages.and_then(|ms| {
+                        ms.iter()
+                            .rev()
+                            .find_map(|v| v.get("model").filter(|m| m.is_object()).cloned())
+                    })
+                });
+            if let Ok(models) = self
+                .send(self.req(Method::GET, "/api/model").query(&location))
+                .await
+            {
+                // The model catalogue is a flat array in opencode 2.x.
+                report.context_limit = models["data"]
+                    .as_array()
+                    .and_then(|ms| {
+                        ms.iter().find(|m| {
+                            current_model.as_ref().is_some_and(|model| {
+                                m["id"] == model["id"] && m["providerID"] == model["providerID"]
+                            })
                         })
                     })
-                })
-                .and_then(|m| m.pointer("/limit/context"))
-                .and_then(Value::as_u64);
+                    .and_then(|m| m.pointer("/limit/context"))
+                    .and_then(Value::as_u64);
+            }
         }
         match self
             .send(
                 self.req(Method::GET, "/api/experimental/usage/limits")
-                    .query(&[("location[directory]", directory.to_string_lossy().as_ref())]),
+                    .query(&location),
             )
             .await
         {
@@ -221,9 +241,26 @@ pub struct SavedGrant {
     pub resource: String,
 }
 impl Api {
-    pub async fn saved_grants(&self) -> Result<Vec<SavedGrant>> {
+    /// Without projectID, opencode lists only its startup directory's grants.
+    /// Resolve every added folder explicitly; worktrees can share a project.
+    pub async fn saved_grants(&self, folders: &[PathBuf]) -> Result<Vec<SavedGrant>> {
+        let mut projects = BTreeSet::new();
+        for folder in folders {
+            projects.insert(self.project_id(folder).await?);
+        }
+        let mut grants = Vec::new();
+        for project in projects {
+            grants.extend(self.project_saved_grants(&project).await?);
+        }
+        Ok(grants)
+    }
+
+    async fn project_saved_grants(&self, project_id: &str) -> Result<Vec<SavedGrant>> {
         let v = self
-            .send(self.req(Method::GET, "/api/permission/saved"))
+            .send(
+                self.req(Method::GET, "/api/permission/saved")
+                    .query(&[("projectID", project_id)]),
+            )
             .await?;
         v["data"]
             .as_array()

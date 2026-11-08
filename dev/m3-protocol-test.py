@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import base64
 
@@ -95,6 +96,9 @@ def main():
                 asked = wait_event("permission.asked", sid)
                 pending = request(f"/api/session/{sid}/permission")["data"]
                 assert any(p["id"] == asked["id"] for p in pending), "pending request must be recoverable without its SSE event"
+                # ocdesk recovers every session's requests with one read per folder.
+                folder = request("/api/permission/request?" + urllib.parse.urlencode({"location[directory]": str(project)}))["data"]
+                assert any(p["id"] == asked["id"] and p["sessionID"] == sid for p in folder), folder
                 assert request(f"/api/session/{sid}/permission/{asked['id']}/reply", {"decision": decision}) is None
                 replied = wait_event("permission.replied", sid)
                 assert replied["requestID"] == asked["id"] and replied["reply"] == decision
@@ -109,6 +113,13 @@ def main():
                     diffs = request(f"/api/session/{sid}/diff?context=3")["data"]
                     assert any(f["file"].endswith("mock_note.txt") and f["additions"] == 2 and "+line one" in f["patch"] for f in diffs), diffs
                 print(f"PASS {decision}: permission event, pending recovery, 204 reply, tool {status}" + (", file diff" if decision == "always" else ""), flush=True)
+            # Question forms are also recovered with one read per folder.
+            sid = request("/api/session", {"location": {"directory": str(project)}})["data"]["id"]
+            created = request(f"/api/session/{sid}/form", {"title": "Proceed?", "fields": [{"key": "ok", "type": "boolean"}]})
+            form_id = (created.get("data") or created)["id"]
+            folder = request("/api/form?" + urllib.parse.urlencode({"location[directory]": str(project)}))["data"]
+            assert any(f["id"] == form_id and f["sessionID"] == sid for f in folder), folder
+            print("PASS folder forms: pending form listed per folder", flush=True)
             print("M3 protocol smoke test passed", flush=True)
         finally:
             for child in (server, mock):

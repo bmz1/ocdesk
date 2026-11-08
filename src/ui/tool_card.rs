@@ -705,6 +705,42 @@ fn tool_details(t: &ToolCall, key: &str, ctx: &ToolCtx, cx: &App) -> AnyElement 
     card.into_any_element()
 }
 
+/// An output panel's preview text, whether it was clipped, and its
+/// highlight spans (`None`: plain).
+type PreparedOutput = std::rc::Rc<(
+    SharedString,
+    bool,
+    Option<Vec<(std::ops::Range<usize>, &'static str)>>,
+)>;
+
+thread_local! {
+    static OUTPUTS: std::cell::RefCell<super::lru::Lru<PreparedOutput>> =
+        std::cell::RefCell::new(super::lru::Lru::new(128));
+}
+
+/// Clip and highlight once per output, not per frame. Output only grows
+/// while a tool runs and is fixed after, so the call, length, both ends and
+/// language key it.
+fn prepare_output(id: &str, text: &str, language: Option<&str>) -> PreparedOutput {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let b = text.as_bytes();
+    let (head, tail) = (&b[..b.len().min(64)], &b[b.len().saturating_sub(64)..]);
+    (id, text.len(), head, tail, language).hash(&mut h);
+    let key = h.finish();
+    if let Some(hit) = OUTPUTS.with(|c| c.borrow_mut().get(key)) {
+        return hit;
+    }
+    let preview: String = text.chars().take(PREVIEW_CHARS).collect();
+    let clipped = preview.len() < text.len();
+    let spans = language
+        .filter(|l| super::syntax::supported(l))
+        .map(|lang| super::syntax::highlight_gutter(lang, &preview));
+    let prepared: PreparedOutput = std::rc::Rc::new((preview.into(), clipped, spans));
+    OUTPUTS.with(|c| c.borrow_mut().insert(key, prepared.clone()));
+    prepared
+}
+
 /// Mono output, bounded in height. Scrolling inside it doesn't drag the
 /// conversation along; at either end the wheel goes back to the list.
 fn output_panel(
@@ -716,14 +752,12 @@ fn output_panel(
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
-    let preview: String = text.chars().take(PREVIEW_CHARS).collect();
-    let clipped = preview.len() < text.len();
-    let body: AnyElement = match language {
-        Some(lang) if super::syntax::supported(lang) => {
-            let spans = super::syntax::highlight_gutter(lang, &preview);
-            super::syntax::styled(preview, &spans, cx).into_any_element()
-        }
-        _ => preview.into_any_element(),
+    let prepared = prepare_output(id, text, language);
+    let (preview, clipped, spans) = &*prepared;
+    let clipped = *clipped;
+    let body: AnyElement = match spans {
+        Some(spans) => super::syntax::styled(preview.clone(), spans, cx).into_any_element(),
+        None => preview.clone().into_any_element(),
     };
     let handle = ctx
         .scrolls

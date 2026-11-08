@@ -160,6 +160,7 @@ impl ProseCache {
             .read(cx)
             .selected_conversation()
             .and_then(|c| c.index_of(&key.message_id).ok());
+        // Collapsed reasoning is parsed lazily by the next `sync_row`.
         if !self.expanded.remove(&key) {
             self.expanded.insert(key);
         }
@@ -196,9 +197,19 @@ impl ProseCache {
     }
 }
 
+fn is_reasoning(key: &BlockKey) -> bool {
+    matches!(key.slot, Slot::Prose(BlockKind::Reasoning, _))
+}
+
 /// Make sure every prose block of row `ix` has an up-to-date state. Only
 /// blocks whose text changed are cloned out of the store.
-pub fn sync_row(store: &Entity<Store>, cache: &Entity<ProseCache>, ix: usize, cx: &mut App) {
+pub fn sync_row(
+    store: &Entity<Store>,
+    cache: &Entity<ProseCache>,
+    ix: usize,
+    density: crate::settings::Density,
+    cx: &mut App,
+) {
     let stale: Vec<(BlockKey, String)> = {
         let Some(msg) = store
             .read(cx)
@@ -208,8 +219,15 @@ pub fn sync_row(store: &Entity<Store>, cache: &Entity<ProseCache>, ix: usize, cx
             return;
         };
         let c = cache.read(cx);
+        // Collapsed reasoning shows only a one-line preview read from the
+        // store, so skip parsing it. Adjacent reasoning blocks toggle as one
+        // group keyed by its first block, so any expanded key opens them all.
+        let reasoning_open = density == crate::settings::Density::Verbose
+            || prose_blocks(msg).any(|(k, _)| is_reasoning(&k) && c.is_expanded(&k));
         prose_blocks(msg)
-            .filter(|(k, t)| !t.is_empty() && c.is_stale(k, t.len()))
+            .filter(|(k, t)| {
+                (reasoning_open || !is_reasoning(k)) && !t.is_empty() && c.is_stale(k, t.len())
+            })
             .map(|(k, t)| (k, t.to_string()))
             .collect()
     };
