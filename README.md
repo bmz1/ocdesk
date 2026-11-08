@@ -18,7 +18,7 @@ Rust + [GPUI](https://www.gpui.rs) (the UI framework behind Zed). No Electron, n
 
 <br>
 
-<img src="docs/screenshots/ux-transcript-approval.png" alt="ocdesk: a plan with Implement plan, a failed step with Retry, and a command approval above the prompt">
+<img src="docs/screenshots/ux-transcript-approval.png" alt="ocdesk: a subagent fan-out, a failed step with Retry, a todo progress pill and a command approval above the prompt">
 
 </div>
 
