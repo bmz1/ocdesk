@@ -7,6 +7,7 @@
 //! to the GPUI thread through channels awaited in `cx.spawn` tasks.
 
 mod features;
+mod files;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -388,6 +389,11 @@ impl Controller {
                 self.store
                     .update(cx, |s, cx| s.set_connection(Connection::Connected, cx));
                 self.resync(cx);
+                // Watches may have fired while we were away.
+                self.files_changed(None, None, false, cx);
+            }
+            Event::FileChanged { file, removed } => {
+                self.files_changed(env.directory, Some(file), removed, cx)
             }
             Event::Disconnected => {
                 self.connection_epoch += 1;
@@ -410,7 +416,14 @@ impl Controller {
                     Event::ExecutionEnded { session_id, .. } => Some(session_id.clone()),
                     _ => None,
                 };
+                // A tool may have edited files: revalidate open tabs (cheap
+                // 304s), whether or not a watch reports it.
+                let touched =
+                    matches!(env.event, Event::ToolSucceeded { .. }).then(|| env.directory.clone());
                 self.store.update(cx, |s, cx| s.apply(env, cx));
+                if let Some(dir) = touched {
+                    self.files_changed(dir, None, false, cx);
+                }
                 if let Some(session_id) = turn_over {
                     self.on_turn_over(session_id, cx);
                 }
@@ -993,11 +1006,21 @@ impl Controller {
         folder: PathBuf,
         query: String,
     ) -> Option<oneshot::Receiver<Result<Vec<FsEntry>>>> {
-        let api = self.api.clone()?;
         let (tx, rx) = oneshot::channel();
-        self.rt.spawn(async move {
-            let _ = tx.send(api.find_files(&folder, &query, 20).await);
-        });
+        match (self.api.clone(), self.demo) {
+            (Some(api), _) => {
+                self.rt.spawn(async move {
+                    let _ = tx.send(api.find_files(&folder, &query, 20).await);
+                });
+            }
+            // Offline demo: walk the local folder instead.
+            (None, true) => {
+                self.rt.spawn_blocking(move || {
+                    let _ = tx.send(Ok(files::find_local(&folder, &query, 20)));
+                });
+            }
+            (None, false) => return None,
+        }
         Some(rx)
     }
 

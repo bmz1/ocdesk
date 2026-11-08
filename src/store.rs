@@ -128,6 +128,13 @@ pub enum StoreEvent {
     TasksChanged,
     /// Branches, worktrees or `/` menu sources of a folder changed.
     FolderInfoChanged,
+    /// Files in a folder may have changed on disk: open editor tabs should
+    /// revalidate. `dir: None` means any folder, `file: None` any file.
+    FilesChanged {
+        dir: Option<std::path::PathBuf>,
+        file: Option<String>,
+        removed: bool,
+    },
 }
 
 /// Result of [`Store::apply_m7`].

@@ -3,9 +3,44 @@
 State of ocdesk for whoever picks it up next. Read this first, then
 [README.md](README.md) and [docs/protocol-notes.md](docs/protocol-notes.md).
 
-_Last updated: 2026-11-07, UX batch on `claude/amazing-brahmagupta-qb6r76` (from master @ `13e9c59`)._
+_Last updated: 2026-11-08, file explorer + editor tabs on `claude/file-viewer-editor-tabs-531vxs` (from master @ `85630cf`)._
 
-## Current work: UX research batch
+## Current work: file explorer + editor tabs
+
+Branch `claude/file-viewer-editor-tabs-531vxs`. Plan and research:
+[docs/file-editor-plan.md](docs/file-editor-plan.md) (Orca reference, API,
+widgets). Implemented phases 1–2 of it:
+
+- `src/files.rs`: pure helpers (path confinement, binary/large detection,
+  CRLF round trip, language from extension).
+- `src/api/fs.rs`: `list_dir`, `read_file` (ETag / `If-None-Match` / Range),
+  `write_file` (`experimental/fs/write`, **not confined server-side**, so
+  every path goes through `files::rel_path`), `watch_file`.
+  `filesystem.changed` → `Event::FileChanged`.
+- `src/controller/files.rs`: fs calls; the offline demo uses the local disk
+  (and a local `find` for Go to file / `@` mentions).
+  `StoreEvent::FilesChanged` on watch events, every `ToolSucceeded`, and
+  reconnects. Tabs also re-check on tab show and window focus.
+- `src/ui/editor_tabs.rs` (`FileTabs`): per-folder tabs, gpui-component
+  `EditorState` (syntect highlighting), dirty dot, `Mod+S` save with a disk
+  precheck, conflict banner (Reload / Keep mine), close/quit prompts,
+  tabs persisted in `settings.open_files`.
+- `src/ui/explorer.rs` (Files panel, lazy tree), `src/ui/goto_file.rs`
+  (`Mod+P`), "open in a tab" buttons on read/edit tool rows and in Changes.
+
+Validation: fmt, clippy `-D warnings`, `cargo test` (**89 passed**, incl. an
+HTTP contract test for the fs endpoints). Driven under Xvfb in demo mode:
+explorer, open/edit/save, external change on a clean tab (reload) and a
+dirty tab (banner; `Mod+S` refuses; Keep mine then save overwrites), CRLF
+round trip, binary and >2 MB files, close/quit prompts, tab restore,
+tool-row open. **Not run against a real opencode** (global npm install was
+blocked in that session): live-check `fs/read` ETag and Range behavior,
+`experimental/fs/write`, and whether `filesystem.changed` fires for watched
+files; record the answers in `docs/protocol-notes.md`. Not done: Compare view
+in the conflict banner, "Add selection to chat", git colors in the tree,
+autosave (see the plan's phase 3).
+
+## Previous work: UX research batch
 
 The owner asked for a UX study of Codex, Claude desktop, T3 Code and Rune
 ([docs/ux-research-2026-11.md](docs/ux-research-2026-11.md)) and then to

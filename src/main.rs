@@ -1,6 +1,7 @@
 mod api;
 mod controller;
 mod demo;
+mod files;
 mod notifications;
 mod settings;
 mod shell_env;
