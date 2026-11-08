@@ -181,10 +181,8 @@ impl ConversationView {
         let wanted_fields: Vec<(String, crate::api::model::FormField)> = {
             let store = self.store.read(cx);
             let mut out = Vec::new();
-            if let Some(sid) = store.selected.clone()
-                && let Some(forms) = store.forms.get(&sid)
-            {
-                for form in forms {
+            if let Some(sid) = store.selected.clone() {
+                for form in store.forms.of_session(&sid) {
                     for field in form.fields.iter() {
                         if super::form_view::field_needs_input(field) {
                             out.push((form.id.clone(), field.clone()));

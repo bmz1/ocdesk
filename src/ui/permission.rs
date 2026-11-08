@@ -21,9 +21,8 @@ const PREVIEW_MAX_H: f32 = 320.;
 pub fn pending<'a>(store: &'a Store, sid: &str) -> Vec<(&'a PermissionRequest, Option<String>)> {
     let mut out: Vec<(&PermissionRequest, Option<String>)> = store
         .permissions
-        .get(sid)
-        .into_iter()
-        .flatten()
+        .of_session(sid)
+        .iter()
         .map(|r| (r, None))
         .collect();
     for child in store.children_of(sid) {
@@ -32,7 +31,7 @@ pub fn pending<'a>(store: &'a Store, sid: &str) -> Vec<(&'a PermissionRequest, O
             .clone()
             .map(|a| format!("@{a}"))
             .unwrap_or_else(|| child.display_title());
-        for r in store.permissions.get(&child.id).into_iter().flatten() {
+        for r in store.permissions.of_session(&child.id) {
             out.push((r, Some(label.clone())));
         }
     }
@@ -85,8 +84,8 @@ pub fn render_permissions(store: &Store, controller: Entity<Controller>, cx: &Ap
     let mut col = v_flex().w_full().gap_2();
     for (n, (request, from)) in requests.iter().enumerate() {
         let request = *request;
-        let key = (request.session_id.clone(), request.id.clone());
-        let sending = store.permission_sending.contains(&key);
+        let (sid, rid) = (request.session_id.as_str(), request.id.as_str());
+        let sending = store.permissions.is_sending(sid, rid);
         let disabled = sending || store.connection() != Connection::Connected;
         let command = command_of(store, request);
         let mut card = v_flex()
@@ -284,8 +283,8 @@ pub fn render_permissions(store: &Store, controller: Entity<Controller>, cx: &Ap
         } else if disabled {
             card = card.child(div().text_xs().child("Waiting for opencode to reconnect…"));
         }
-        if let Some(error) = store.permission_errors.get(&key) {
-            card = card.child(div().text_color(theme.danger).child(error.clone()));
+        if let Some(error) = store.permissions.reply_error(sid, rid) {
+            card = card.child(div().text_color(theme.danger).child(error.to_owned()));
         }
         // The one thing the agent is blocked on: arrive with a short fade and
         // a 4 px rise so it catches the eye; leave instantly once answered.

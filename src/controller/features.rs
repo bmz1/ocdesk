@@ -30,8 +30,8 @@ impl Controller {
         let store = self.store.read(cx);
         if !store.busy.is_empty()
             || !store.submitting.is_empty()
-            || store.permissions.values().any(|r| !r.is_empty())
-            || store.forms.values().any(|r| !r.is_empty())
+            || store.permissions.any_pending()
+            || store.forms.any_pending()
         {
             anyhow::bail!(
                 "Finish running turns and pending approvals before reloading configuration."

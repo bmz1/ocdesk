@@ -21,6 +21,13 @@ use crate::api::{Envelope, Event};
 use crate::domain::fetch::{FetchStatus, FetchStatuses};
 use crate::domain::history::{HistoryLoad, HistoryRequests, LoadTicket};
 
+mod forms;
+mod permissions;
+
+use crate::domain::requests::Revisions;
+pub(crate) use forms::Forms;
+pub(crate) use permissions::Permissions;
+
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -167,6 +174,15 @@ pub enum StoreEvent {
     },
 }
 
+/// The user's reply to a pending permission request or question form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyState {
+    /// In flight; a second reply is refused.
+    Sending,
+    /// Failed; the request stays visible and can be answered again.
+    Failed(String),
+}
+
 /// Completion effects stay separate from the pure history transition.
 enum HistoryChange {
     Ignored,
@@ -252,7 +268,7 @@ pub struct Store {
     pub snapshot_revision: u64,
     /// Per-session inbox events, so a read of one inbox isn't invalidated
     /// by activity in every other session.
-    pub inbox_revision: HashMap<String, u64>,
+    pub(crate) inbox_revision: Revisions<String>,
     pub tasks_revision: u64,
     pub(crate) shell_snapshots: HashMap<PathBuf, HashSet<String>>,
     /// The `gh` CLI is installed: the Pull request tab and chip show.
@@ -311,19 +327,11 @@ pub struct Store {
     pub opencode_version: Option<String>,
     /// A transient, app-level problem shown as a dismissible banner.
     pub notice: Option<String>,
-    pub permissions: HashMap<String, Vec<PermissionRequest>>,
-    /// Changed by both live events and snapshots, to reject stale in-flight reads.
-    pub permission_revision: HashMap<String, u64>,
-    pub permission_sending: HashSet<(String, String)>,
-    pub permission_errors: HashMap<(String, String), String>,
-    /// Pending question forms, session-owned like permissions.
-    pub forms: HashMap<String, Vec<FormRequest>>,
-    pub form_revision: HashMap<String, u64>,
-    pub form_sending: HashSet<(String, String)>,
-    pub form_errors: HashMap<(String, String), String>,
-    /// In-progress answers per pending form (`answer[key] = value`), seeded
-    /// from the fields' defaults and edited as the user picks or types.
-    pub form_drafts: HashMap<String, Value>,
+    /// Pending permission requests per session, their revisions (changed by
+    /// live events and snapshots alike) and the user's replies in flight.
+    pub(crate) permissions: Permissions,
+    /// Pending question forms and their draft answers.
+    pub(crate) forms: Forms,
     pub diffs: HashMap<PathBuf, Vec<FileDiff>>,
     pub(crate) diff_status: FetchStatuses<PathBuf>,
     /// Folders whose diff may be outdated (a turn ended while not shown).
@@ -351,115 +359,38 @@ impl Store {
         }
     }
 
-    pub fn permission_revision(&self, sid: &str) -> u64 {
-        self.permission_revision
-            .get(sid)
-            .copied()
-            .unwrap_or_default()
-    }
-
+    /// Replace a session's pending permission requests (snapshot read).
     pub fn set_permissions(
         &mut self,
         sid: &str,
         requests: Vec<PermissionRequest>,
         cx: &mut Context<Self>,
     ) {
-        self.permissions.insert(
-            sid.to_string(),
-            requests
-                .into_iter()
-                .filter(|r| r.session_id == sid)
-                .collect(),
-        );
-        let requests = &self.permissions[sid];
-        self.permission_sending.retain(|(session, request)| {
-            session != sid || requests.iter().any(|r| &r.id == request)
-        });
-        self.permission_errors.retain(|(session, request), _| {
-            session != sid || requests.iter().any(|r| &r.id == request)
-        });
-        if self.permissions[sid].is_empty() {
-            // No entry for "none": keys are the sessions with something pending.
-            self.permissions.remove(sid);
-        }
-        *self.permission_revision.entry(sid.to_string()).or_default() += 1;
+        self.permissions.replace(sid, requests);
         cx.emit(StoreEvent::StatusChanged {
             session_id: sid.to_string(),
         });
         cx.notify();
-    }
-
-    fn remove_permission(&mut self, sid: &str, rid: &str) {
-        if let Some(requests) = self.permissions.get_mut(sid) {
-            requests.retain(|r| r.id != rid);
-        }
-        let key = (sid.to_string(), rid.to_string());
-        self.permission_sending.remove(&key);
-        self.permission_errors.remove(&key);
-        *self.permission_revision.entry(sid.to_string()).or_default() += 1;
-    }
-
-    pub fn form_revision(&self, sid: &str) -> u64 {
-        self.form_revision.get(sid).copied().unwrap_or_default()
     }
 
     /// Replace the pending forms of a session (snapshot read). Drafts survive
     /// as long as the form stays pending.
     pub fn set_forms(&mut self, sid: &str, forms: Vec<FormRequest>, cx: &mut Context<Self>) {
-        let forms: Vec<FormRequest> = forms.into_iter().filter(|f| f.session_id == sid).collect();
-        for f in &forms {
-            self.seed_form_draft(f);
-        }
-        self.forms.insert(sid.to_string(), forms.clone());
-        let pending: HashSet<&str> = forms.iter().map(|f| f.id.as_str()).collect();
-        self.form_sending
-            .retain(|(session, form)| session != sid || pending.contains(form.as_str()));
-        self.form_errors
-            .retain(|(session, form), _| session != sid || pending.contains(form.as_str()));
-        // Drafts of other sessions' forms are still pending; keep them.
-        let all: HashSet<&str> = self
-            .forms
-            .values()
-            .flatten()
-            .map(|f| f.id.as_str())
-            .collect();
-        self.form_drafts
-            .retain(|form, _| all.contains(form.as_str()));
-        if forms.is_empty() {
-            // No entry for "none": keys are the sessions with something pending.
-            self.forms.remove(sid);
-        }
-        *self.form_revision.entry(sid.to_string()).or_default() += 1;
+        self.forms.replace(sid, forms);
         cx.emit(StoreEvent::StatusChanged {
             session_id: sid.to_string(),
         });
         cx.notify();
     }
 
-    fn remove_form(&mut self, sid: &str, fid: &str) {
-        if let Some(forms) = self.forms.get_mut(sid) {
-            forms.retain(|f| f.id != fid);
+    /// Stop showing replies whose outcome will never arrive (the stream or
+    /// the server they were sent on is gone). Failed replies stay visible.
+    pub(crate) fn abandon_replies(&mut self, cx: &mut Context<Self>) {
+        let permissions = self.permissions.abandon_replies();
+        let forms = self.forms.abandon_replies();
+        if permissions || forms {
+            cx.notify();
         }
-        let key = (sid.to_string(), fid.to_string());
-        self.form_sending.remove(&key);
-        self.form_errors.remove(&key);
-        self.form_drafts.remove(fid);
-        *self.form_revision.entry(sid.to_string()).or_default() += 1;
-    }
-
-    /// Fill a new form's draft with its fields' default answers.
-    fn seed_form_draft(&mut self, form: &FormRequest) {
-        if self.form_drafts.contains_key(&form.id) {
-            return;
-        }
-        let mut draft = serde_json::Map::new();
-        for field in &form.fields {
-            if let Some(d) = &field.default {
-                draft.insert(field.key.clone(), d.clone());
-            }
-        }
-        self.form_drafts
-            .insert(form.id.clone(), Value::Object(draft));
     }
 
     /// One answer inside a form's draft; keyed by form so drafts survive
@@ -471,27 +402,9 @@ impl Store {
         value: Value,
         cx: &mut Context<Self>,
     ) {
-        let entry = self
-            .form_drafts
-            .entry(form_id.to_string())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        if !entry.is_object() {
-            *entry = Value::Object(serde_json::Map::new());
+        if self.forms.set_answer(form_id, key, value) {
+            cx.notify();
         }
-        let map = entry.as_object_mut().expect("draft object");
-        if map.get(key) == Some(&value) {
-            return;
-        }
-        map.insert(key.to_string(), value);
-        cx.notify();
-    }
-
-    /// The current draft answers of a form (empty object if none yet).
-    pub fn form_draft(&self, form_id: &str) -> Value {
-        self.form_drafts
-            .get(form_id)
-            .cloned()
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
     }
 
     pub fn set_catalog(&mut self, folder: PathBuf, catalog: Catalog, cx: &mut Context<Self>) {
@@ -592,10 +505,7 @@ impl Store {
         // The approval/question cards already explain what the user must do.
         if std::iter::once(sid.as_str())
             .chain(self.children_of(sid).iter().map(|s| s.id.as_str()))
-            .any(|id| {
-                self.permissions.get(id).is_some_and(|r| !r.is_empty())
-                    || self.forms.get(id).is_some_and(|r| !r.is_empty())
-            })
+            .any(|id| self.permissions.has_pending(id) || self.forms.has_pending(id))
         {
             return None;
         }
@@ -873,23 +783,10 @@ impl Store {
         self.interrupting.remove(sid);
         self.submitting
             .retain(|_, target| *target != SubmissionTarget::Session(sid.to_string()));
-        let forms: Vec<String> = self
-            .forms
-            .remove(sid)
-            .into_iter()
-            .flatten()
-            .map(|f| f.id)
-            .collect();
-        self.form_drafts.retain(|id, _| !forms.contains(id));
-        self.permissions.remove(sid);
-        self.permission_revision.remove(sid);
-        self.permission_sending.retain(|(s, _)| s != sid);
-        self.permission_errors.retain(|(s, _), _| s != sid);
-        self.form_revision.remove(sid);
-        self.form_sending.retain(|(s, _)| s != sid);
-        self.form_errors.retain(|(s, _), _| s != sid);
+        self.forms.forget_session(sid);
+        self.permissions.forget_session(sid);
         self.inbox.remove(sid);
-        self.inbox_revision.remove(sid);
+        self.inbox_revision.forget(&sid.to_string());
         self.session_modes.remove(sid);
         self.mode_sending.remove(sid);
         self.usage.remove(sid);
@@ -1152,8 +1049,8 @@ impl Store {
                     || keep_children.contains(id.as_str())
                     || conv.load.fetching()
                     || self.busy.contains(*id)
-                    || self.permissions.get(*id).is_some_and(|r| !r.is_empty())
-                    || self.forms.get(*id).is_some_and(|r| !r.is_empty())
+                    || self.permissions.has_pending(id)
+                    || self.forms.has_pending(id)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1391,7 +1288,7 @@ impl Store {
         | Event::InboxCancelled { session_id, .. }
         | Event::InboxDeliveryChanged { session_id, .. } = &env.event
         {
-            *self.inbox_revision.entry(session_id.clone()).or_default() += 1;
+            self.inbox_revision.bump(session_id.clone());
         }
         // Inbox, background tasks and folder info are session-/folder-level.
         let mut out = match self.apply_m7(&mut env) {
@@ -1475,32 +1372,21 @@ impl Store {
             }
             Event::PermissionAsked(request) => {
                 let sid = request.session_id.clone();
-                let requests = self.permissions.entry(sid.clone()).or_default();
-                requests.retain(|r| r.id != request.id);
-                requests.push(request.clone());
-                *self.permission_revision.entry(sid.clone()).or_default() += 1;
+                self.permissions.asked(request.clone());
                 return vec![StoreEvent::StatusChanged { session_id: sid }];
             }
             Event::PermissionReplied {
                 session_id,
                 request_id,
             } => {
-                self.remove_permission(session_id, request_id);
+                self.permissions.replied(session_id, request_id);
                 return vec![StoreEvent::StatusChanged {
                     session_id: session_id.clone(),
                 }];
             }
             Event::FormAsked(form) => {
                 let sid = form.session_id.clone();
-                let fid = form.id.clone();
-                self.seed_form_draft(form);
-                if let Some(forms) = self.forms.get_mut(&sid) {
-                    forms.retain(|f| f.id != fid);
-                    forms.push(form.clone());
-                } else {
-                    self.forms.insert(sid.clone(), vec![form.clone()]);
-                }
-                *self.form_revision.entry(sid.clone()).or_default() += 1;
+                self.forms.asked(form.clone());
                 return vec![StoreEvent::StatusChanged { session_id: sid }];
             }
             Event::FormReplied {
@@ -1511,7 +1397,7 @@ impl Store {
                 session_id,
                 form_id,
             } => {
-                self.remove_form(session_id, form_id);
+                self.forms.closed(session_id, form_id);
                 return vec![StoreEvent::StatusChanged {
                     session_id: session_id.clone(),
                 }];
@@ -2116,16 +2002,24 @@ mod tests {
             s.needs_reload.insert(id.into());
             s.usage.insert(id.into(), Default::default());
             s.session_modes.insert(id.into(), None);
-            s.inbox_revision.insert(id.into(), 1);
             s.unread.insert(id.into());
         }
+        let inbox_reads: Vec<_> = ["ses_a", "ses_kid"]
+            .map(|id| (id, s.inbox_revision.current(id.into())))
+            .into();
         s.apply_inner(Envelope::bare(Event::SessionRemoved {
             session_id: "ses_a".into(),
         }));
         assert!(s.conversations.is_empty() && s.children.is_empty());
         assert!(s.busy.is_empty() && s.retry.is_empty() && s.errors.is_empty());
         assert!(s.needs_reload.is_empty() && s.usage.is_empty() && s.session_modes.is_empty());
-        assert!(s.inbox_revision.is_empty() && s.unread.is_empty());
+        assert!(s.unread.is_empty());
+        for (id, revision) in inbox_reads {
+            assert!(
+                !s.inbox_revision.is_current(&id.to_string(), revision),
+                "an inbox read in flight for {id} is stale"
+            );
+        }
     }
 
     #[test]
@@ -2746,23 +2640,23 @@ mod tests {
         s.apply_inner(Envelope::bare(Event::FormAsked(form())));
         s.apply_inner(Envelope::bare(Event::FormAsked(form())));
         assert_eq!(
-            s.forms["ses_a"].len(),
+            s.forms.of_session("ses_a").len(),
             1,
             "duplicate ask frames must not duplicate cards"
         );
-        assert_eq!(s.form_draft("frm_1"), serde_json::json!({}));
-        let before = s.form_revision("ses_a");
+        assert_eq!(s.forms.draft("frm_1"), serde_json::json!({}));
+        let before = s.forms.revision("ses_a");
         s.apply_inner(Envelope::bare(Event::FormReplied {
             session_id: "ses_a".into(),
             form_id: "frm_1".into(),
         }));
-        assert!(s.forms["ses_a"].is_empty());
+        assert!(s.forms.of_session("ses_a").is_empty());
         assert!(
-            s.form_revision("ses_a") > before,
+            s.forms.freshness("ses_a", before) != crate::domain::requests::Freshness::Current,
             "in-flight snapshots must be invalidated"
         );
         // The draft and scratch of the closed form go away with it.
-        assert_eq!(s.form_draft("frm_1"), serde_json::json!({}));
+        assert_eq!(s.forms.draft("frm_1"), serde_json::json!({}));
     }
 
     #[test]
@@ -2776,22 +2670,22 @@ mod tests {
             s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(sid, rid))));
         }
         assert_eq!(
-            s.permissions["ses_a"].len(),
+            s.permissions.of_session("ses_a").len(),
             1,
             "duplicate frames must not duplicate cards"
         );
-        assert_eq!(s.permissions["ses_b"].len(), 1);
-        let before = s.permission_revision("ses_a");
+        assert_eq!(s.permissions.of_session("ses_b").len(), 1);
+        let before = s.permissions.revision("ses_a");
         s.apply_inner(Envelope::bare(Event::PermissionReplied {
             session_id: "ses_a".into(),
             request_id: "perm_1".into(),
         }));
-        assert!(s.permissions["ses_a"].is_empty());
+        assert!(s.permissions.of_session("ses_a").is_empty());
         assert!(
-            s.permission_revision("ses_a") > before,
+            s.permissions.freshness("ses_a", before) != crate::domain::requests::Freshness::Current,
             "in-flight snapshots must be invalidated"
         );
-        assert_eq!(s.permissions["ses_b"].len(), 1);
+        assert_eq!(s.permissions.of_session("ses_b").len(), 1);
         assert!(s.conversations.is_empty());
     }
 
@@ -2801,13 +2695,80 @@ mod tests {
         s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(
             "ses_a", "perm_1",
         ))));
-        s.permission_sending
-            .insert(("ses_a".into(), "perm_1".into()));
+        assert!(s.permissions.begin_reply("ses_a", "perm_1"));
         s.apply_inner(Envelope::bare(Event::SessionRemoved {
             session_id: "ses_a".into(),
         }));
-        assert!(!s.permissions.contains_key("ses_a"));
-        assert!(s.permission_sending.is_empty());
+        assert!(!s.permissions.has_pending("ses_a"));
+        assert!(!s.permissions.is_sending("ses_a", "perm_1"));
+    }
+
+    #[test]
+    fn deleting_a_parent_cleans_its_subagents_approvals_and_strands_their_reads() {
+        let mut s = Store::default();
+        let kid = SessionInfo::from_json(
+            &serde_json::json!({"id":"ses_kid","parentID":"ses_a","location":{"directory":"/r"}}),
+        )
+        .unwrap();
+        s.children.insert("ses_a".into(), vec![kid]);
+        let form = FormRequest::from_json(&serde_json::json!({
+            "id": "frm_k", "sessionID": "ses_kid", "title": "Q",
+            "fields": [{"key": "q0", "type": "string", "default": "y"}]
+        }))
+        .unwrap();
+        s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(
+            "ses_kid", "perm_k",
+        ))));
+        s.apply_inner(Envelope::bare(Event::FormAsked(form)));
+        assert!(s.permissions.begin_reply("ses_kid", "perm_k"));
+        let (p_read, f_read) = (
+            s.permissions.revision("ses_kid"),
+            s.forms.revision("ses_kid"),
+        );
+        s.apply_inner(Envelope::bare(Event::SessionRemoved {
+            session_id: "ses_a".into(),
+        }));
+        assert!(!s.permissions.is_tracked("ses_kid") && !s.forms.is_tracked("ses_kid"));
+        assert!(!s.permissions.is_sending("ses_kid", "perm_k"));
+        assert_eq!(s.forms.draft("frm_k"), serde_json::json!({}));
+        use crate::domain::requests::Freshness::Forgotten;
+        assert_eq!(s.permissions.freshness("ses_kid", p_read), Forgotten);
+        assert_eq!(s.forms.freshness("ses_kid", f_read), Forgotten);
+    }
+
+    #[test]
+    fn approval_events_report_only_their_sessions_status() {
+        let mut s = Store::default();
+        let status = |sid: &str| {
+            vec![StoreEvent::StatusChanged {
+                session_id: sid.into(),
+            }]
+        };
+        assert_eq!(
+            s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(
+                "ses_a", "p1"
+            )))),
+            status("ses_a")
+        );
+        assert_eq!(
+            s.apply_inner(Envelope::bare(Event::PermissionReplied {
+                session_id: "ses_a".into(),
+                request_id: "p1".into(),
+            })),
+            status("ses_a")
+        );
+        assert!(
+            s.permissions.is_tracked("ses_a") && !s.permissions.has_pending("ses_a"),
+            "replied-out session stays eligible for the turn-end re-read"
+        );
+        assert_eq!(
+            s.apply_inner(Envelope::bare(Event::FormCancelled {
+                session_id: "ses_b".into(),
+                form_id: "missing".into(),
+            })),
+            status("ses_b")
+        );
+        assert!(s.conversations.is_empty(), "no transcript side effects");
     }
 
     #[test]

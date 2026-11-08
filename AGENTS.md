@@ -15,6 +15,14 @@ docs/gpui-notes.md before changing orchestration or rendering.
 - Per-resource latest-wins reads use domain::requests::Revisions (one
   counter for all keys; forget on removal). Do not reintroduce per-key
   counters that restart at zero: they alias stale responses after re-adding.
+- Permission requests and question forms are owned by store::Permissions and
+  store::Forms (private collections; Store emits events/notifications, the
+  Controller owns HTTP and connection policy). One ReplyState per pending
+  request, Sending or Failed, never both. Disconnect/restart abandon Sending
+  only. A read whose session was removed meanwhile is Freshness::Forgotten:
+  drop it and do not re-read. Never reply or approve on the user's behalf.
+- Sidecar auto-restart policy is domain::supervisor::RestartBudget (pass the
+  time in); the delayed restart is the owned restart_timer task.
 - Optimistic model/agent changes go through domain::choice (show_model /
   show_agent, settle_*). Only the newest choice may roll back; never capture
   "previous" per request and restore it unconditionally.
