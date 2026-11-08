@@ -182,7 +182,9 @@ mod tests {
     fn fixture() -> PathBuf {
         let p = std::env::temp_dir().join(format!("ocdesk-config-test-{}", rand::random::<u64>()));
         fs::create_dir_all(&p).unwrap();
-        p
+        // `discover` canonicalizes, and macOS's temp dir is a symlink
+        // (/var -> /private/var): compare against the resolved path.
+        fs::canonicalize(p).unwrap()
     }
     #[test]
     fn jsonc_validation_accepts_comments_but_rejects_json5_and_non_objects() {
