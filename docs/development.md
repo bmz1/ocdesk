@@ -143,8 +143,21 @@ src/
   api/model.rs       our view of sessions/messages/blocks (lenient JSON parsing)
   api/events.rs      server events → our normalized Event enum
   api/pty.rs         session terminals: persistent PTYs over a WebSocket
-  store.rs           Entity<Store>: folders, sessions, conversations, busy; folds events
-  controller.rs      intents → API calls; folders, sidecar lifecycle, auto-restart, SSE pump
+  store.rs           Entity<Store>: state, StoreEvent, shared types; one central entity
+  store/events.rs    folds normalized events into the store, emits row-level StoreEvents
+  store/history.rs   history snapshot loads (tickets, buffered events) and reconciliation
+  store/sessions.rs  session list, selection/retention, status, removal, usage
+  store/workspace.rs folders, catalogs, draft choices, branches, worktrees, diffs
+  store/tasks.rs     inboxes, subagent sessions, shells
+  store/permissions.rs, store/forms.rs  approval and question-form aggregates
+  store/tests.rs     store tests incl. captured-event replay
+  controller.rs      Controller struct, request helpers (run, run_on), notices
+  controller/lifecycle.rs  sidecar start/crash/auto-restart, SSE pump, resync
+  controller/sessions.rs   session list, history loads, selection, session operations
+  controller/prompts.rs    prompt/command admission, inbox, interrupt
+  controller/approvals.rs  permission/form reads, replies and dismissals
+  controller/{catalog,choices,folders,tasks,diffs,persistence}.rs  per-feature intents
+  controller/{features,files,github,reads}.rs  desktop features, files, PRs, cancellable reads
   ui/app_view.rs     root layout: sidebar | conversation; theme; window/sidebar persistence
   ui/keys.rs         app-wide shortcuts, menu bar and the shortcuts sheet
   ui/kit.rs          shared components (status slot, monogram, context ring, toast…)
