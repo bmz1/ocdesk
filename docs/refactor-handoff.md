@@ -39,6 +39,13 @@ it does not claim that every lifecycle in the application has been refactored.
 - A usage response for a session deleted mid-flight no longer recreates its
   usage entry.
 
+Continuation verification (this executor, Linux): `cargo fmt --all -- --check`,
+strict Clippy, `cargo test --locked` (**154 passed**), the standalone domain
+build (17 passed), shellcheck, both live protocol suites against OpenCode 2.2.6,
+and `dev/teardown-test.sh` under Xvfb with the mock model: all five exit paths
+passed (sigterm, sigint, sigkill, panic, quit-after-idle). Desktop smoke checks
+by hand (item 2 below) and macOS remain unverified.
+
 ## Verification completed
 
 Baseline: formatting, strict Clippy and all 125 existing Rust tests passed.
