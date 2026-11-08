@@ -3,6 +3,7 @@ mod api;
 mod controller;
 mod demo;
 mod files;
+mod github;
 mod notifications;
 mod settings;
 mod shell_env;

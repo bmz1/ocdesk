@@ -31,7 +31,11 @@ gpui_kit::assets::icon_assets!(
         Files,
         ChevronsDownUp,
         Bot,
-        FileDiff
+        FileDiff,
+        GitPullRequest,
+        CircleCheck,
+        CircleX,
+        CircleDashed
     ]
 );
 
@@ -120,4 +124,20 @@ pub fn bot() -> Icon {
 }
 pub fn file_diff() -> Icon {
     Icon::new(Lucide::FileDiff)
+}
+
+pub fn git_pull_request() -> Icon {
+    Icon::new(Lucide::GitPullRequest)
+}
+
+pub fn circle_check() -> Icon {
+    Icon::new(Lucide::CircleCheck)
+}
+
+pub fn circle_x() -> Icon {
+    Icon::new(Lucide::CircleX)
+}
+
+pub fn circle_dashed() -> Icon {
+    Icon::new(Lucide::CircleDashed)
 }

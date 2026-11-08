@@ -103,6 +103,24 @@ without a shell. Deleted/missing/outside-project paths report an error.
 Patch previews retain the 500-line / 2,000-character-per-line display limit;
 Copy patch includes the entire returned patch. Server truncation is labeled.
 
+## Pull request
+
+Shown only when the `gh` CLI is installed (it uses gh's login and hosts). The
+right panel's **Pull request** tab (`Mod+Shift+G`) and a header chip next to
+the branch (`#15` with a red/amber/green dot) show the current checkout's PR:
+state and review decision, checks (failed first, with durations), and
+unresolved review threads plus conversation comments.
+
+- A failed check expands to its failed-step log tail (`gh run view --job …
+  --log-failed`, last 80 lines), or GitHub's annotations when the job never
+  produced a log. **Send to agent** (per check, or all failures) prompts the
+  current session with the check, commit and excerpt.
+- Review threads and comments have checkboxes; **Send N comments to agent**
+  builds one prompt with `path:line`, the end of the diff hunk and each reply.
+- The PR is re-fetched every 20 s while checks run on an open PR, every 2 min
+  otherwise, only while the window is active. Read-only: nothing is resolved,
+  re-run or posted.
+
 ## Usage and context
 
 The composer meter shows session tokens/cost, and a context estimate/bar when

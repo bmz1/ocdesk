@@ -69,6 +69,7 @@ pub struct ConversationView {
     files: Entity<super::editor_tabs::FileTabs>,
     explorer: Entity<super::explorer::FileExplorer>,
     agents: Entity<super::agents::AgentsPanel>,
+    pull_request: Entity<super::pull_request::PullRequestPanel>,
     transcript_focus: FocusHandle,
     density: crate::settings::Density,
     /// Free-text inputs for pending question forms, keyed (form, field).
@@ -116,6 +117,9 @@ impl ConversationView {
         });
         let agents =
             cx.new(|cx| super::agents::AgentsPanel::new(store.clone(), controller.clone(), cx));
+        let pull_request = cx.new(|cx| {
+            super::pull_request::PullRequestPanel::new(store.clone(), controller.clone(), cx)
+        });
         let mut subs = subs;
         subs.push(cx.observe(&files, |_, _, cx| cx.notify()));
         let prefs = store.read(cx).preferences.clone();
@@ -143,6 +147,7 @@ impl ConversationView {
             files,
             explorer,
             agents,
+            pull_request,
             transcript_focus: cx.focus_handle(),
             density: prefs.density,
             expanded_tools: Default::default(),
@@ -412,6 +417,9 @@ impl ConversationView {
         let Some(sid) = self.store.read(cx).selected.clone() else {
             return;
         };
+        if tab == PanelTab::PullRequest && !self.store.read(cx).gh_available {
+            return;
+        }
         self.panel = if self.panel == Some(tab) {
             None
         } else {
@@ -431,6 +439,7 @@ impl ConversationView {
             }
             Some(PanelTab::Files) => {}
             Some(PanelTab::Agents) => self.agents.update(cx, |a, cx| a.reload(cx)),
+            Some(PanelTab::PullRequest) => self.pull_request.update(cx, |p, cx| p.refresh(cx)),
             None => self.focus_main(window, cx),
         }
         let saved = self.panel;
@@ -1093,7 +1102,11 @@ impl Render for ConversationView {
         };
 
         use crate::settings::PanelTab;
-        let panel_tab = self.panel.filter(|_| has_selection);
+        let gh = self.store.read(cx).gh_available;
+        let panel_tab = self
+            .panel
+            .filter(|_| has_selection)
+            .filter(|t| gh || *t != PanelTab::PullRequest);
         let weak = cx.entity().downgrade();
         // Icon-only tab buttons: what the label used to say (diff size,
         // running tasks) is in the tooltip, and a dot marks activity.
@@ -1179,6 +1192,28 @@ impl Render for ConversationView {
             })
             .child(div().min_w_0().truncate().child(title.unwrap_or_default()))
             .children(branch_pill)
+            .children(super::pull_request::chip(self.store.read(cx), cx).map(
+                |(label, color, tip)| {
+                    let weak = weak.clone();
+                    Button::new("pr-chip")
+                        .ghost()
+                        .small()
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .child(div().size(px(7.)).rounded_full().bg(color))
+                                .child(label),
+                        )
+                        .tooltip(tip)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                if this.panel != Some(PanelTab::PullRequest) {
+                                    this.toggle_panel(PanelTab::PullRequest, window, cx)
+                                }
+                            });
+                        })
+                },
+            ))
             .child(div().flex_1())
             .when(has_selection, |el| {
                 let running = store_running;
@@ -1206,6 +1241,16 @@ impl Render for ConversationView {
                         &super::keys::ToggleTasks,
                         running > 0,
                     ))
+                    .when(gh, |el| {
+                        el.child(tab_button(
+                            "toggle-pr",
+                            PanelTab::PullRequest,
+                            "Pull request: checks and review comments".into(),
+                            super::icons::git_pull_request(),
+                            &super::keys::TogglePullRequest,
+                            false,
+                        ))
+                    })
                     .child(tab_button(
                         "toggle-files",
                         PanelTab::Files,
@@ -1258,6 +1303,11 @@ impl Render for ConversationView {
                     .into_any_element(),
                 PanelTab::Agents => self
                     .agents
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                PanelTab::PullRequest => self
+                    .pull_request
                     .clone()
                     .cached(StyleRefinement::default().size_full())
                     .into_any_element(),
