@@ -1,4 +1,5 @@
-//! Turns user intents into API calls and API results into store updates.//!
+//! Turns user intents into API calls and API results into store updates.
+//!
 //! Owns the sidecar lifecycle (start, crash detection, auto-restart), the
 //! SSE pump, and the folder list. One sidecar serves every folder:
 //! sessions are pinned to a location (directory) and `/api/event` covers all

@@ -12,6 +12,12 @@ docs/gpui-notes.md before changing orchestration or rendering.
 - Store owns history tickets and cached conversations. Use begin_load and
   finish_load; do not install an async snapshot via reconcile directly. A
   refresh retains cached data; a stale/duplicate result must emit no effects.
+- Per-resource latest-wins reads use domain::requests::Revisions (one
+  counter for all keys; forget on removal). Do not reintroduce per-key
+  counters that restart at zero: they alias stale responses after re-adding.
+- Optimistic model/agent changes go through domain::choice (show_model /
+  show_agent, settle_*). Only the newest choice may roll back; never capture
+  "previous" per request and restore it unconditionally.
 - RequestScope::Connection fences stream-sensitive snapshots. RequestScope::Server
   allows an accepted mutation to finish across SSE reconnects on the same server.
   Per-resource revisions still protect newer state within either scope.

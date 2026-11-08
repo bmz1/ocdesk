@@ -229,6 +229,27 @@ server replacement. These scopes do not replace per-resource versions or live
 revision checks. Rejected callbacks are logged at debug level with their issue
 identity and current generation/epoch; they never mutate the new state.
 
+Per-resource "latest wins" guards use `Revisions<K>` from the same module
+(working diff and task reads per directory, permission mode and usage totals per
+session). Every revision comes from one counter, so `forget` on folder removal or
+session deletion can never let a pre-removal response alias a fresh request.
+Removing a folder also forgets its worktree checkouts' revisions
+(`Store::forget_folder` returns the directories it dropped). Scalar debounce
+tokens (notices, catalog bursts, settings saves, saved grants) are never
+forgotten and stay plain counters.
+
+`domain/choice.rs` orders optimistic model/agent choices. The display changes at
+once; only the newest outstanding choice of a session may roll it back, and only
+to the last value the server is known to hold: the value before the first
+outstanding choice, an older choice that succeeded meanwhile, or the latest
+`session.model.selected`/`session.agent.selected` the stream reported
+(`Controller::product_event` feeds those in; local optimistic applies bypass it).
+The stream overwrites the display directly, so it remains authoritative when a
+server applies overlapping requests out of order. An exhaustive test covers every
+completion order and outcome of three overlapping choices. Session removal and
+sidecar restart drop outstanding entries; those completions are discarded by
+`run_on(RequestScope::Server)`.
+
 Read demand belongs to its consumer. Mention search and the go-to-file dialog
 retain their GPUI task handles, cancelling obsolete debounces/replies on query
 replacement or owner drop. Read-only file/search/shell requests use

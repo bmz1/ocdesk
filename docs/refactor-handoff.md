@@ -24,6 +24,21 @@ it does not claim that every lifecycle in the application has been refactored.
 - Structured debug traces identify history tickets and obsolete completions.
   AGENTS.md and the development guide document the implemented contracts.
 
+## Continuation (branch `claude/beautiful-mccarthy-gttejj`, stacked on the above)
+
+- `domain::requests::Revisions<K>` replaces four per-key counter maps (diff,
+  tasks, permission mode, usage). Regression: per-key counters restarted at 0
+  after `remove`, so a re-added folder's first diff/task request aliased a stale
+  one. Folder removal now also invalidates its worktree checkouts' reads.
+- `domain::choice::OptimisticChoices` orders overlapping model/agent choices.
+  Regression: choosing A then B and A failing rolled the display back to the
+  original over B. Agent switches (and `implement_plan`) now roll back on
+  failure too; previously a failed agent switch left it displayed.
+- Catalog, folder-info, working-diff and saved-grant reads use
+  `run_on(RequestScope::Server)` instead of hand-compared generations.
+- A usage response for a session deleted mid-flight no longer recreates its
+  usage entry.
+
 ## Verification completed
 
 Baseline: formatting, strict Clippy and all 125 existing Rust tests passed.
@@ -68,8 +83,6 @@ were not optimized; no measured latency, frame-time or memory benefit is claimed
 
 ## Further implementation deliberately left out
 
-- Order overlapping optimistic model/agent mutations and reconcile failures;
-  inspect `Controller::choose_model` and `choose_agent` with HTTP/SSE interleavings.
 - Audit pending-state cleanup for other `run_on` callers. This change fixes
   history ownership, not every usage/grant/diff/form lifecycle.
 - Review remaining detached work and PTY/sidecar startup lifetimes using concrete
