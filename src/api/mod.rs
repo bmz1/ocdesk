@@ -341,20 +341,6 @@ impl Api {
         Ok(())
     }
 
-    /// Latest turn, with bounded context; the server marks truncated patches with `more`.
-    pub async fn diff(&self, session_id: &str) -> Result<Vec<model::FileDiff>> {
-        let path = format!("/api/session/{}/diff", id(session_id));
-        let v = self
-            .send(self.req(Method::GET, &path).query(&[("context", "3")]))
-            .await?;
-        let data = v["data"]
-            .as_array()
-            .ok_or_else(|| anyhow!("invalid diff response"))?;
-        data.iter()
-            .map(|v| model::FileDiff::from_json(v).ok_or_else(|| anyhow!("invalid file diff")))
-            .collect()
-    }
-
     /// `POST /api/session/{id}/interrupt`. The turn ends with
     /// `session.execution.interrupted {reason: "user"}`.
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {
@@ -909,12 +895,6 @@ mod tests {
                 "500 Internal Server Error",
             ),
             (
-                "GET /api/session/ses_a/diff?context=3 ",
-                "",
-                r#"{"data":[{"file":"a.rs","patch":"+new","status":"added","additions":1,"deletions":0}]}"#,
-                "200 OK",
-            ),
-            (
                 "GET /api/session/ses_a/form ",
                 "",
                 r#"{"data":[{"id":"frm_a","sessionID":"ses_a","title":"Questions","fields":[{"key":"q0","type":"string","description":"Pick one","options":[{"value":"y","label":"Yes"}],"custom":true}]}]}"#,
@@ -945,7 +925,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(api.diff("ses_a").await.unwrap()[0].file, "a.rs");
         let form = &api.forms("ses_a").await.unwrap()[0];
         assert_eq!(form.id, "frm_a");
         assert!(form.fields[0].custom);

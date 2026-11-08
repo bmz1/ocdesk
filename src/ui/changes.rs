@@ -1,13 +1,12 @@
-//! Read-only latest-turn diffs from opencode, never inferred from tool arguments.
+//! Read-only working-tree diff (HEAD to the working copy) from opencode.
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::api::features::{ReviewMode, patch_fingerprint};
+use crate::api::features::patch_fingerprint;
 use crate::controller::Controller;
 use crate::store::Store;
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 
 /// What the review panel adds to each file: collapse state, the comment
 /// hook and elements under commented lines.
@@ -30,7 +29,6 @@ pub fn render_changes(
         return div().into_any_element();
     };
     let theme = cx.theme();
-    let mode = store.review.get(&sid).cloned().unwrap_or_default();
     let loading = store.diff_loading.contains(&sid);
     let refresh_controller = controller.clone();
     let refresh_sid = sid.clone();
@@ -41,7 +39,7 @@ pub fn render_changes(
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(mode.label().to_string()),
+                    .child("Uncommitted changes"),
             )
             .child(
                 Button::new("refresh-diff")
@@ -54,89 +52,6 @@ pub fn render_changes(
                     }),
             ),
     );
-    let mut scopes = h_flex().gap_1().flex_wrap();
-    for scope in [
-        ReviewMode::Turn,
-        ReviewMode::Working,
-        ReviewMode::Branch,
-        ReviewMode::Committed,
-    ] {
-        let c = controller.clone();
-        let selected = std::mem::discriminant(&scope) == std::mem::discriminant(&mode);
-        scopes = scopes.child(
-            Button::new(SharedString::from(format!("scope-{}", scope.key())))
-                .label(scope.label().to_string())
-                .xsmall()
-                .when(selected, |b| b.outline())
-                .when(!selected, |b| b.ghost())
-                .on_click(move |_, _, cx| c.update(cx, |c, cx| c.set_review(scope.clone(), cx))),
-        );
-    }
-    col = col.child(
-        h_flex().gap_2().flex_wrap().child(scopes).child(
-            Button::new("load-commits")
-                .label("Pick a commit…")
-                .ghost()
-                .xsmall()
-                .on_click({
-                    let c = controller.clone();
-                    move |_, _, cx| c.update(cx, |c, cx| c.load_commits(cx))
-                }),
-        ),
-    );
-    if matches!(mode, ReviewMode::Branch | ReviewMode::Committed) {
-        let current = store.review_base.get(&sid).cloned().unwrap_or_default();
-        let label = if current.is_empty() {
-            "Compare against: repository default".into()
-        } else {
-            format!("Compare against: {current}")
-        };
-        let c = controller.clone();
-        let id = sid.clone();
-        col = col.child(
-            Button::new("review-base")
-                .label(label)
-                .outline()
-                .small()
-                .on_click(move |_, window, cx| {
-                    open_base(c.clone(), id.clone(), current.clone(), window, cx)
-                }),
-        );
-    }
-    if let Some(commits) = store.commits.get(&sid) {
-        let commits = commits.clone();
-        let c = controller.clone();
-        let label = if let ReviewMode::Commit(sha) = &mode {
-            commits
-                .iter()
-                .find(|c| &c.sha == sha)
-                .map(|c| format!("{} {}", &c.sha[..8], c.subject))
-                .unwrap_or_else(|| sha.clone())
-        } else {
-            "Choose a commit…".into()
-        };
-        col = col.child(
-            Button::new("review-commit")
-                .label(label)
-                .outline()
-                .small()
-                .dropdown_menu(move |mut menu, _, _| {
-                    for commit in &commits {
-                        let c = c.clone();
-                        let sha = commit.sha.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(format!("{} {}", &sha[..8], commit.subject))
-                                .on_click(move |_, _, cx| {
-                                    c.update(cx, |c, cx| {
-                                        c.set_review(ReviewMode::Commit(sha.clone()), cx)
-                                    })
-                                }),
-                        );
-                    }
-                    menu
-                }),
-        );
-    }
     let sid = store.selected.as_ref().unwrap();
     if let Some(error) = store.diff_errors.get(sid) {
         col = col.child(div().text_color(theme.danger).child(error.clone()));
@@ -146,7 +61,7 @@ pub fn render_changes(
             col = col.child(
                 div()
                     .text_color(theme.muted_foreground)
-                    .child("No file changes in this scope."),
+                    .child("No uncommitted changes."),
             );
         }
         let (adds, dels) = files
@@ -707,39 +622,6 @@ pub fn patch_view_with(id: &str, patch: &str, opts: PatchOpts, cx: &App) -> AnyE
             )
         })
         .into_any_element()
-}
-
-fn open_base(
-    controller: Entity<Controller>,
-    sid: String,
-    current: String,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    use gpui_kit::component::{
-        WindowExt as _,
-        input::{Input, InputState},
-    };
-    let input = cx.new(|cx| {
-        InputState::new(window, cx)
-            .default_value(current)
-            .placeholder("origin/main, master, or commit; empty = repository default")
-    });
-    window.open_alert_dialog(cx, move |alert, _, _| {
-        let c = controller.clone();
-        let id = sid.clone();
-        let i = input.clone();
-        alert
-            .title("Comparison base")
-            .description(Input::new(&input))
-            .confirm()
-            .ok_text("Compare")
-            .on_ok(move |_, _, cx| {
-                let base = i.read(cx).value().to_string();
-                c.update(cx, |c, cx| c.set_review_base(id.clone(), base, cx));
-                true
-            })
-    });
 }
 
 #[cfg(test)]

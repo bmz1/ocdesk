@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -43,6 +44,8 @@ pub struct TasksDrawer {
     /// Latest output per shell id.
     output: std::collections::HashMap<String, String>,
     poll: Option<Task<()>>,
+    /// Parsed markdown of the open subagent's result: (child id, text, state).
+    result_md: Option<(String, String, Entity<TextViewState>)>,
     _subs: Vec<Subscription>,
 }
 
@@ -75,6 +78,7 @@ impl TasksDrawer {
             show_full_prompt: false,
             output: Default::default(),
             poll: None,
+            result_md: None,
             _subs: subs,
         }
     }
@@ -281,7 +285,7 @@ impl TasksDrawer {
         col.into_any_element()
     }
 
-    fn render_subagent(&self, child: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn render_subagent(&mut self, child: &str, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let store = self.store.read(cx);
         let parent = store.selected.clone().unwrap_or_default();
@@ -316,6 +320,7 @@ impl TasksDrawer {
                     .and_then(|t| t.input.get("agent")?.as_str().map(str::to_string))
             })
             .unwrap_or_else(|| "subagent".into());
+        let result = result.map(|text| self.result_state(child, text, cx));
         let long_prompt = prompt.lines().count() > 4 || prompt.len() > 320;
         let show_full = self.show_full_prompt;
 
@@ -371,10 +376,37 @@ impl TasksDrawer {
             .when(running, |el| {
                 el.child(Spinner::new().small().color(theme.primary))
             })
-            .when_some(result, |el, text| {
-                el.child(div().text_sm().whitespace_normal().child(text))
+            .when_some(result, |el, state| {
+                el.child(
+                    div()
+                        .text_sm()
+                        .child(TextView::new(&state).w_full().selectable(true)),
+                )
             })
             .into_any_element()
+    }
+
+    /// The markdown state for `child`'s result, reparsed only when it changes.
+    fn result_state(
+        &mut self,
+        child: &str,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        match &mut self.result_md {
+            Some((id, cur, state)) if id == child => {
+                if *cur != text {
+                    state.update(cx, |s, cx| s.set_text(&text, cx));
+                    *cur = text;
+                }
+                state.clone()
+            }
+            _ => {
+                let state = cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
+                self.result_md = Some((child.to_string(), text, state.clone()));
+                state
+            }
+        }
     }
 
     fn render_shell(&self, id: &str, cx: &mut Context<Self>) -> AnyElement {
