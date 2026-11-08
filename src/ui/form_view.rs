@@ -81,7 +81,7 @@ fn render_card(
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
-    let draft = store.form_draft(&form.id);
+    let draft = store.forms.draft(&form.id);
     let sending = store.forms.is_sending(sid, &form.id);
     let connected = store.connection() == Connection::Connected;
     let disabled = sending || !connected;

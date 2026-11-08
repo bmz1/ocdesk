@@ -18,10 +18,15 @@ use crate::api::model::{
     SkillInfo, Timing, ToolCall, ToolStatus, UserMessage, VcsInfo,
 };
 use crate::api::{Envelope, Event};
-use crate::domain::approvals::{PendingRequest, PendingRequests};
 use crate::domain::fetch::{FetchStatus, FetchStatuses};
 use crate::domain::history::{HistoryLoad, HistoryRequests, LoadTicket};
+
+mod forms;
+mod permissions;
+
 use crate::domain::requests::Revisions;
+pub(crate) use forms::Forms;
+pub(crate) use permissions::Permissions;
 
 use serde_json::Value;
 
@@ -169,33 +174,13 @@ pub enum StoreEvent {
     },
 }
 
-/// A new form's draft: its fields' default answers.
-fn default_answers(form: &FormRequest) -> Value {
-    let mut draft = serde_json::Map::new();
-    for field in &form.fields {
-        if let Some(d) = &field.default {
-            draft.insert(field.key.clone(), d.clone());
-        }
-    }
-    Value::Object(draft)
-}
-
-impl PendingRequest for PermissionRequest {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn session_id(&self) -> &str {
-        &self.session_id
-    }
-}
-
-impl PendingRequest for FormRequest {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn session_id(&self) -> &str {
-        &self.session_id
-    }
+/// The user's reply to a pending permission request or question form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyState {
+    /// In flight; a second reply is refused.
+    Sending,
+    /// Failed; the request stays visible and can be answered again.
+    Failed(String),
 }
 
 /// Completion effects stay separate from the pure history transition.
@@ -344,12 +329,9 @@ pub struct Store {
     pub notice: Option<String>,
     /// Pending permission requests per session, their revisions (changed by
     /// live events and snapshots alike) and the user's replies in flight.
-    pub permissions: PendingRequests<PermissionRequest>,
-    /// Pending question forms, with the same lifecycle as permissions.
-    pub forms: PendingRequests<FormRequest>,
-    /// In-progress answers per pending form (`answer[key] = value`), seeded
-    /// from the fields' defaults and edited as the user picks or types.
-    pub form_drafts: HashMap<String, Value>,
+    pub(crate) permissions: Permissions,
+    /// Pending question forms and their draft answers.
+    pub(crate) forms: Forms,
     pub diffs: HashMap<PathBuf, Vec<FileDiff>>,
     pub(crate) diff_status: FetchStatuses<PathBuf>,
     /// Folders whose diff may be outdated (a turn ended while not shown).
@@ -395,15 +377,6 @@ impl Store {
     /// as long as the form stays pending.
     pub fn set_forms(&mut self, sid: &str, forms: Vec<FormRequest>, cx: &mut Context<Self>) {
         self.forms.replace(sid, forms);
-        for f in self.forms.of_session(sid) {
-            if !self.form_drafts.contains_key(&f.id) {
-                self.form_drafts.insert(f.id.clone(), default_answers(f));
-            }
-        }
-        // Drafts of other sessions' forms are still pending; keep them.
-        let pending: HashSet<&str> = self.forms.iter().map(|f| f.id.as_str()).collect();
-        self.form_drafts
-            .retain(|form, _| pending.contains(form.as_str()));
         cx.emit(StoreEvent::StatusChanged {
             session_id: sid.to_string(),
         });
@@ -429,27 +402,9 @@ impl Store {
         value: Value,
         cx: &mut Context<Self>,
     ) {
-        let entry = self
-            .form_drafts
-            .entry(form_id.to_string())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        if !entry.is_object() {
-            *entry = Value::Object(serde_json::Map::new());
+        if self.forms.set_answer(form_id, key, value) {
+            cx.notify();
         }
-        let map = entry.as_object_mut().expect("draft object");
-        if map.get(key) == Some(&value) {
-            return;
-        }
-        map.insert(key.to_string(), value);
-        cx.notify();
-    }
-
-    /// The current draft answers of a form (empty object if none yet).
-    pub fn form_draft(&self, form_id: &str) -> Value {
-        self.form_drafts
-            .get(form_id)
-            .cloned()
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
     }
 
     pub fn set_catalog(&mut self, folder: PathBuf, catalog: Catalog, cx: &mut Context<Self>) {
@@ -828,9 +783,7 @@ impl Store {
         self.interrupting.remove(sid);
         self.submitting
             .retain(|_, target| *target != SubmissionTarget::Session(sid.to_string()));
-        for form in self.forms.forget_session(sid) {
-            self.form_drafts.remove(&form.id);
-        }
+        self.forms.forget_session(sid);
         self.permissions.forget_session(sid);
         self.inbox.remove(sid);
         self.inbox_revision.forget(&sid.to_string());
@@ -1426,16 +1379,13 @@ impl Store {
                 session_id,
                 request_id,
             } => {
-                self.permissions.resolved(session_id, request_id);
+                self.permissions.replied(session_id, request_id);
                 return vec![StoreEvent::StatusChanged {
                     session_id: session_id.clone(),
                 }];
             }
             Event::FormAsked(form) => {
                 let sid = form.session_id.clone();
-                self.form_drafts
-                    .entry(form.id.clone())
-                    .or_insert_with(|| default_answers(form));
                 self.forms.asked(form.clone());
                 return vec![StoreEvent::StatusChanged { session_id: sid }];
             }
@@ -1447,8 +1397,7 @@ impl Store {
                 session_id,
                 form_id,
             } => {
-                self.forms.resolved(session_id, form_id);
-                self.form_drafts.remove(form_id);
+                self.forms.closed(session_id, form_id);
                 return vec![StoreEvent::StatusChanged {
                     session_id: session_id.clone(),
                 }];
@@ -2695,7 +2644,7 @@ mod tests {
             1,
             "duplicate ask frames must not duplicate cards"
         );
-        assert_eq!(s.form_draft("frm_1"), serde_json::json!({}));
+        assert_eq!(s.forms.draft("frm_1"), serde_json::json!({}));
         let before = s.forms.revision("ses_a");
         s.apply_inner(Envelope::bare(Event::FormReplied {
             session_id: "ses_a".into(),
@@ -2707,7 +2656,7 @@ mod tests {
             "in-flight snapshots must be invalidated"
         );
         // The draft and scratch of the closed form go away with it.
-        assert_eq!(s.form_draft("frm_1"), serde_json::json!({}));
+        assert_eq!(s.forms.draft("frm_1"), serde_json::json!({}));
     }
 
     #[test]
@@ -2752,6 +2701,74 @@ mod tests {
         }));
         assert!(!s.permissions.has_pending("ses_a"));
         assert!(!s.permissions.is_sending("ses_a", "perm_1"));
+    }
+
+    #[test]
+    fn deleting_a_parent_cleans_its_subagents_approvals_and_strands_their_reads() {
+        let mut s = Store::default();
+        let kid = SessionInfo::from_json(
+            &serde_json::json!({"id":"ses_kid","parentID":"ses_a","location":{"directory":"/r"}}),
+        )
+        .unwrap();
+        s.children.insert("ses_a".into(), vec![kid]);
+        let form = FormRequest::from_json(&serde_json::json!({
+            "id": "frm_k", "sessionID": "ses_kid", "title": "Q",
+            "fields": [{"key": "q0", "type": "string", "default": "y"}]
+        }))
+        .unwrap();
+        s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(
+            "ses_kid", "perm_k",
+        ))));
+        s.apply_inner(Envelope::bare(Event::FormAsked(form)));
+        assert!(s.permissions.begin_reply("ses_kid", "perm_k"));
+        let (p_read, f_read) = (
+            s.permissions.revision("ses_kid"),
+            s.forms.revision("ses_kid"),
+        );
+        s.apply_inner(Envelope::bare(Event::SessionRemoved {
+            session_id: "ses_a".into(),
+        }));
+        assert!(!s.permissions.is_tracked("ses_kid") && !s.forms.is_tracked("ses_kid"));
+        assert!(!s.permissions.is_sending("ses_kid", "perm_k"));
+        assert_eq!(s.forms.draft("frm_k"), serde_json::json!({}));
+        use crate::domain::requests::Freshness::Forgotten;
+        assert_eq!(s.permissions.freshness("ses_kid", p_read), Forgotten);
+        assert_eq!(s.forms.freshness("ses_kid", f_read), Forgotten);
+    }
+
+    #[test]
+    fn approval_events_report_only_their_sessions_status() {
+        let mut s = Store::default();
+        let status = |sid: &str| {
+            vec![StoreEvent::StatusChanged {
+                session_id: sid.into(),
+            }]
+        };
+        assert_eq!(
+            s.apply_inner(Envelope::bare(Event::PermissionAsked(permission(
+                "ses_a", "p1"
+            )))),
+            status("ses_a")
+        );
+        assert_eq!(
+            s.apply_inner(Envelope::bare(Event::PermissionReplied {
+                session_id: "ses_a".into(),
+                request_id: "p1".into(),
+            })),
+            status("ses_a")
+        );
+        assert!(
+            s.permissions.is_tracked("ses_a") && !s.permissions.has_pending("ses_a"),
+            "replied-out session stays eligible for the turn-end re-read"
+        );
+        assert_eq!(
+            s.apply_inner(Envelope::bare(Event::FormCancelled {
+                session_id: "ses_b".into(),
+                form_id: "missing".into(),
+            })),
+            status("ses_b")
+        );
+        assert!(s.conversations.is_empty(), "no transcript side effects");
     }
 
     #[test]

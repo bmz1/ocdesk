@@ -3,7 +3,6 @@
 //! with their existing owners. Nothing here imports GPUI or the rest of the
 //! crate, so these tests also run standalone (see AGENTS.md).
 
-pub(crate) mod approvals;
 pub(crate) mod choice;
 pub(crate) mod fetch;
 pub(crate) mod history;

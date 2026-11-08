@@ -55,16 +55,20 @@ by hand (item 2 below) and macOS remain unverified.
 
 ## Continuation (branch `claude/zen-cori-feoxou`): approvals and supervision
 
-- `domain::approvals::PendingRequests<R>` owns the shared lifecycle of
-  permission requests and question forms: pending set per session, snapshot
-  revisions, and one `ReplyState` (Sending | Failed) per pending request. It
-  replaces eight store fields (`permission_*`/`form_*` lists, revisions,
-  sending sets and error maps) whose consistency relied on every caller.
-  Regression: those per-session `u64` revisions were removed with the session
-  and restarted at zero (the aliasing AGENTS.md forbids); they are `Revisions`
-  now. The store's `inbox_revision` had the same defect and is fixed too.
-- `Controller::send_reply` replaces three near-identical reply/cancel paths.
-  Regression: dismissing a form did not require a connection, so a dismissal
+- `store::Permissions` (`src/store/permissions.rs`) and `store::Forms`
+  (`src/store/forms.rs`) own their requests, snapshot revisions, one
+  `ReplyState` (Sending | Failed) per pending request and, for forms, the
+  drafts. They replace store fields whose consistency relied on Store and
+  Controller mutating them in step; collections are private. Store keeps
+  notifications/StoreEvents, Controller keeps HTTP and connection policy.
+  (An intermediate generic `domain::approvals` was replaced by these two
+  concrete aggregates; no shared permission/form framework remains.)
+- Regression: per-session `u64` revisions for permissions, forms and inboxes
+  were removed with the session and restarted at zero. They are `Revisions`
+  now, and `Revisions::freshness` tells Superseded (re-read) from Forgotten:
+  a read overlapping session removal is dropped, success or failure, without
+  re-reading or reinstalling the session's pending state.
+- Regression: dismissing a form did not require a connection, so a dismissal
   sent while reconnecting was discarded on reconnect and the form stayed
   "sending" until the next disconnect. The Dismiss button is now disabled
   while disconnected, like Next and the permission buttons.
@@ -72,10 +76,11 @@ by hand (item 2 below) and macOS remain unverified.
   time as an input. The delayed auto-restart is an owned `restart_timer` task
   (cleared by every start) instead of a detached timer re-checking the
   generation; giving up is logged at error level with the crash count.
-- Tests: an exhaustive reference-model check of 100,000 five-command
-  approval sequences (pending set, orphan reply state, empty lists), targeted
-  ordering/regression tests, and restart-budget window tests. All run in the
-  standalone domain build.
+- Tests: window-free aggregate tests (duplicate asks, session isolation,
+  snapshot filtering/pruning, duplicate admission, stream closure before HTTP
+  completion, late failure after removal, disconnect cleanup, draft lifetime),
+  store tests for recursive child cleanup and unchanged StoreEvents,
+  `Revisions::freshness` and restart-budget tests in the standalone domain build.
 
 ## Verification completed
 

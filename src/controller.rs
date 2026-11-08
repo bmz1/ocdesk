@@ -22,7 +22,6 @@ use gpui_kit::{Context, Entity, Task};
 
 use crate::api::model::{FsEntry, ModelRef, PermissionDecision, PromptInput};
 use crate::api::{Api, Envelope, Event, HttpError};
-use crate::domain::approvals::{PendingRequest, PendingRequests};
 use crate::domain::choice::{ChoiceToken, OptimisticChoices};
 use crate::domain::requests::{
     ConnectionEpoch, Freshness, Issued, RequestClock, RequestScope, Revision, Revisions,
@@ -609,10 +608,10 @@ impl Controller {
         }
         // Events keep approvals current; re-read only what is still shown,
         // in case the turn ended without a replied/cancelled event.
-        if self.store.read(cx).permissions.has_pending(&session_id) {
+        if self.store.read(cx).permissions.is_tracked(&session_id) {
             self.refresh_permissions(session_id.clone(), cx);
         }
-        if self.store.read(cx).forms.has_pending(&session_id) {
+        if self.store.read(cx).forms.is_tracked(&session_id) {
             self.refresh_forms(session_id.clone(), cx);
         }
         self.diff_maybe_changed(&session_id, cx);
@@ -1494,7 +1493,7 @@ impl Controller {
                                     .cloned()
                                     .collect();
                                 // Untouched sessions are skipped: no 200 notifies per refresh.
-                                if !mine.is_empty() || s.permissions.has_pending(sid) {
+                                if !mine.is_empty() || s.permissions.is_tracked(sid) {
                                     s.set_permissions(sid, mine, cx);
                                 }
                             }
@@ -1508,7 +1507,7 @@ impl Controller {
                                     .filter(|f| &f.session_id == sid)
                                     .cloned()
                                     .collect();
-                                if !mine.is_empty() || s.forms.has_pending(sid) {
+                                if !mine.is_empty() || s.forms.is_tracked(sid) {
                                     s.set_forms(sid, mine, cx);
                                 }
                             }
@@ -1620,20 +1619,11 @@ impl Controller {
     ) {
         let Some(api) = self.api(cx) else { return };
         let (session, form) = (sid.clone(), fid.clone());
-        let to = Reply {
-            session_id: sid.clone(),
-            request_id: fid.clone(),
-            resolved: Event::FormReplied {
-                session_id: sid,
-                form_id: fid,
-            },
-            failure: "Could not reply",
-        };
-        self.send_reply(
-            |s| &mut s.forms,
-            to,
+        self.send_form_reply(
+            sid,
+            fid,
+            FormClose::Reply,
             async move { api.reply_form(&session, &form, &answer).await },
-            |this, sid, _ok, cx| this.refresh_forms(sid, cx),
             cx,
         );
     }
@@ -1654,27 +1644,70 @@ impl Controller {
 
     /// The committed draft answers of the selected form.
     pub fn form_draft(&self, form_id: String, cx: &Context<Self>) -> serde_json::Value {
-        self.store.read(cx).form_draft(&form_id)
+        self.store.read(cx).forms.draft(&form_id)
     }
 
     pub fn cancel_form(&mut self, sid: String, fid: String, cx: &mut Context<Self>) {
         let Some(api) = self.api(cx) else { return };
         let (session, form) = (sid.clone(), fid.clone());
-        let to = Reply {
-            session_id: sid.clone(),
-            request_id: fid.clone(),
-            resolved: Event::FormCancelled {
-                session_id: sid,
-                form_id: fid,
-            },
-            failure: "Could not cancel",
-        };
-        self.send_reply(
-            |s| &mut s.forms,
-            to,
+        self.send_form_reply(
+            sid,
+            fid,
+            FormClose::Cancel,
             async move { api.cancel_form(&session, &form).await },
-            |this, sid, _ok, cx| this.refresh_forms(sid, cx),
             cx,
+        );
+    }
+
+    /// Reply to or dismiss a form. Refused while disconnected (its outcome
+    /// could never report back: a disconnect abandons the "sending" state and
+    /// this connection-scoped completion is then discarded) or while another
+    /// reply to it is in flight. Success closes the form at once (the stream
+    /// confirms it too); failure keeps it, with the error, retryable.
+    fn send_form_reply(
+        &mut self,
+        sid: String,
+        fid: String,
+        close: FormClose,
+        request: impl Future<Output = Result<()>> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.store.read(cx).connection() != Connection::Connected {
+            return;
+        }
+        let admitted = self.store.update(cx, |s, cx| {
+            let admitted = s.forms.begin_reply(&sid, &fid);
+            if admitted {
+                cx.notify();
+            }
+            admitted
+        });
+        if !admitted {
+            return;
+        }
+        self.run_on(
+            cx,
+            self.issued(RequestScope::Connection),
+            request,
+            move |this, res, cx| {
+                this.store.update(cx, |s, cx| match res {
+                    Ok(()) => {
+                        let (session_id, form_id) = (sid.clone(), fid.clone());
+                        let event = match close {
+                            FormClose::Reply => Event::FormReplied { session_id, form_id },
+                            FormClose::Cancel => Event::FormCancelled { session_id, form_id },
+                        };
+                        s.apply(Envelope::bare(event), cx);
+                    }
+                    Err(e) => {
+                        let msg = format!("{}: {e:#}", close.failure());
+                        tracing::warn!(op = close.op(), session_id = %sid, form_id = %fid, error = %format!("{e:#}"), "form reply failed");
+                        s.forms.reply_failed(&sid, &fid, msg);
+                        cx.notify();
+                    }
+                });
+                this.refresh_forms(sid, cx);
+            },
         );
     }
 
@@ -1687,84 +1720,49 @@ impl Controller {
         cx: &mut Context<Self>,
     ) {
         let Some(api) = self.api(cx) else { return };
+        // Same admission as forms: connected, and one reply in flight.
+        if self.store.read(cx).connection() != Connection::Connected {
+            return;
+        }
+        let admitted = self.store.update(cx, |s, cx| {
+            let admitted = s.permissions.begin_reply(&sid, &rid);
+            if admitted {
+                cx.notify();
+            }
+            admitted
+        });
+        if !admitted {
+            return;
+        }
         let (session, request) = (sid.clone(), rid.clone());
-        let to = Reply {
-            session_id: sid.clone(),
-            request_id: rid.clone(),
-            resolved: Event::PermissionReplied {
-                session_id: sid,
-                request_id: rid,
-            },
-            failure: "Could not reply",
-        };
-        self.send_reply(
-            |s| &mut s.permissions,
-            to,
+        self.run_on(
+            cx,
+            self.issued(RequestScope::Connection),
             async move {
                 api.reply_permission(&session, &request, decision, message.as_deref())
                     .await
             },
-            move |this, sid, ok, cx| {
-                this.refresh_permissions(sid, cx);
-                if ok && decision == PermissionDecision::Always {
-                    this.refresh_saved_grants(cx);
-                }
-            },
-            cx,
-        );
-    }
-
-    /// Answer a pending permission request or question form (see
-    /// `domain::approvals`). Refused while disconnected or while a reply to
-    /// the same request is in flight. Success applies `resolved` at once (the
-    /// stream confirms it too); failure keeps the request visible with the
-    /// error, retryable. Either way the session's requests are re-read by
-    /// `then`, in case the server's view differs.
-    ///
-    /// Connection-scoped: a disconnect abandons the reply's "sending" state
-    /// (`Store::abandon_replies`), so its completion must not land later.
-    fn send_reply<R: PendingRequest + 'static>(
-        &mut self,
-        ledger: fn(&mut Store) -> &mut PendingRequests<R>,
-        to: Reply,
-        reply: impl Future<Output = Result<()>> + Send + 'static,
-        then: impl FnOnce(&mut Self, String, bool, &mut Context<Self>) + 'static,
-        cx: &mut Context<Self>,
-    ) {
-        let Reply {
-            session_id: sid,
-            request_id: rid,
-            resolved,
-            failure,
-        } = to;
-        if self.store.read(cx).connection() != Connection::Connected {
-            return;
-        }
-        let started = self.store.update(cx, |s, cx| {
-            let started = ledger(s).begin_reply(&sid, &rid);
-            if started {
-                cx.notify();
-            }
-            started
-        });
-        if !started {
-            return;
-        }
-        self.run_on(
-            cx,
-            self.issued(RequestScope::Connection),
-            reply,
             move |this, res, cx| {
-                let ok = res.is_ok();
+                let saved = res.is_ok() && decision == PermissionDecision::Always;
                 this.store.update(cx, |s, cx| match res {
-                    Ok(()) => s.apply(Envelope::bare(resolved), cx),
+                    Ok(()) => s.apply(
+                        Envelope::bare(Event::PermissionReplied {
+                            session_id: sid.clone(),
+                            request_id: rid,
+                        }),
+                        cx,
+                    ),
                     Err(e) => {
-                        tracing::warn!(op = failure, session_id = %sid, request_id = %rid, error = %format!("{e:#}"), "reply failed");
-                        ledger(s).reply_failed(&sid, &rid, format!("{failure}: {e:#}"));
+                        tracing::warn!(op = "reply_permission", session_id = %sid, request_id = %rid, error = %format!("{e:#}"), "permission reply failed");
+                        s.permissions
+                            .reply_failed(&sid, &rid, format!("Could not reply: {e:#}"));
                         cx.notify();
                     }
                 });
-                then(this, sid, ok, cx);
+                this.refresh_permissions(sid, cx);
+                if saved {
+                    this.refresh_saved_grants(cx);
+                }
             },
         );
     }
@@ -2305,14 +2303,27 @@ impl Drop for Controller {
     }
 }
 
-/// A reply to one pending request, for [`Controller::send_reply`].
-struct Reply {
-    session_id: String,
-    request_id: String,
-    /// Applied locally once the server accepted the reply.
-    resolved: Event,
-    /// Prefix of the error shown on the request when the reply fails.
-    failure: &'static str,
+/// How [`Controller::send_form_reply`] closes a form.
+#[derive(Clone, Copy)]
+enum FormClose {
+    Reply,
+    Cancel,
+}
+
+impl FormClose {
+    fn op(self) -> &'static str {
+        match self {
+            Self::Reply => "reply_form",
+            Self::Cancel => "cancel_form",
+        }
+    }
+
+    fn failure(self) -> &'static str {
+        match self {
+            Self::Reply => "Could not reply",
+            Self::Cancel => "Could not cancel",
+        }
+    }
 }
 
 /// What the composer sends: a prompt or a server command.
