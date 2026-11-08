@@ -29,6 +29,8 @@ pub struct ToolCtx<'a> {
     pub density: crate::settings::Density,
     /// Calls (ids) that match the find bar's query: they open up.
     pub found: Option<&'a HashSet<String>>,
+    /// The session's subagent sessions (model, timing for fan-out rows).
+    pub children: &'a [crate::api::model::SessionInfo],
 }
 
 impl ToolCtx<'_> {
@@ -229,7 +231,24 @@ pub fn render_tools(
         }
         run.clear();
     };
-    for t in tools {
+    let mut i = 0;
+    while i < tools.len() {
+        let t = tools[i];
+        i += 1;
+        // Two or more delegations in a row: the model fanned out (they run
+        // in parallel when started together). Draw them as one tree.
+        if t.name == "subagent" {
+            let n = tools[i - 1..]
+                .iter()
+                .take_while(|t| t.name == "subagent")
+                .count();
+            if n >= 2 {
+                flush(&mut run, &mut out);
+                out.push(render_fanout(&tools[i - 1..i - 1 + n], message_id, ctx, cx));
+                i += n - 1;
+                continue;
+            }
+        }
         if hidden_in(t, ctx.density) && t.name != "subagent" {
             continue;
         }
@@ -247,6 +266,148 @@ pub fn render_tools(
     }
     flush(&mut run, &mut out);
     out
+}
+
+/// Parallel subagents as a tree: a summary header, then one branch per
+/// delegation with its agent, task, model, status and (once done) the first
+/// line of its result. A branch opens the subagent in the Tasks panel.
+fn render_fanout(calls: &[&ToolCall], message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyElement {
+    use super::tasks::{TaskView, strip_subagent_wrapper, subagent_session};
+    let theme = cx.theme();
+    let count = |s: ToolStatus| calls.iter().filter(|t| t.status == s).count();
+    let done = count(ToolStatus::Completed);
+    let failed = count(ToolStatus::Error);
+    let running = calls.len() - done - failed;
+    let mut summary = format!("Delegated to {} subagents", calls.len());
+    for (n, label) in [(done, "done"), (running, "running"), (failed, "failed")] {
+        if n > 0 {
+            summary.push_str(&format!(" · {n} {label}"));
+        }
+    }
+    let header = h_flex()
+        .gap_1p5()
+        .items_center()
+        .text_sm()
+        .text_color(theme.muted_foreground)
+        .child(super::icons::workflow().small())
+        .child(div().min_w_0().truncate().child(summary))
+        .when(running > 0, |el| {
+            el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+        });
+    let last = calls.len() - 1;
+    let branches = calls.iter().enumerate().map(|(i, t)| {
+        let child_id = subagent_session(t);
+        let child = child_id
+            .as_ref()
+            .and_then(|id| ctx.children.iter().find(|c| &c.id == id));
+        let agent = str_input(t, "agent").unwrap_or("subagent").to_string();
+        let task = str_input(t, "description").unwrap_or("").to_string();
+        let (state, color) = match t.status {
+            ToolStatus::Pending | ToolStatus::Running => ("running", theme.muted_foreground),
+            ToolStatus::Completed => ("done", theme.success),
+            ToolStatus::Error => ("failed", theme.danger),
+        };
+        let mut meta: Vec<String> = Vec::new();
+        if let Some(m) = child.and_then(|c| c.model.as_ref()) {
+            meta.push(m.id.clone());
+        }
+        if t.status == ToolStatus::Completed
+            && let Some(c) = child
+            && c.updated > c.created
+        {
+            meta.push(super::message::format_duration_ms(c.updated - c.created));
+        }
+        let result = match t.status {
+            ToolStatus::Completed if !t.output.is_empty() => {
+                Some(first_line(&strip_subagent_wrapper(&t.output)))
+            }
+            ToolStatus::Error => t.error.as_deref().map(first_line),
+            _ => None,
+        }
+        .filter(|s| !s.is_empty());
+        let open = ctx.open_task.clone();
+        let target = child_id.map(TaskView::Subagent);
+        h_flex()
+            .id(SharedString::from(format!(
+                "fanout-{message_id}-{}",
+                t.call_id
+            )))
+            .items_start()
+            .gap_2()
+            .text_sm()
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(theme.muted_foreground.opacity(0.6))
+                    .child(if i == last { "└─" } else { "├─" }),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("@{agent}")),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.muted_foreground)
+                                    .child(task),
+                            )
+                            .child(div().flex_1())
+                            .when(!meta.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(meta.join(" · ")),
+                                )
+                            })
+                            .child(div().flex_none().text_xs().text_color(color).child(state))
+                            .when(state == "running", |el| {
+                                el.child(Spinner::new().xsmall().color(theme.muted_foreground))
+                            })
+                            .when(target.is_some(), |el| {
+                                el.child(
+                                    Icon::new(IconName::ChevronRight)
+                                        .xsmall()
+                                        .text_color(theme.muted_foreground),
+                                )
+                            }),
+                    )
+                    .when_some(result, |el, r| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .truncate()
+                                .text_color(theme.muted_foreground)
+                                .child(r),
+                        )
+                    }),
+            )
+            .when_some(target, |el, target| {
+                el.cursor_pointer()
+                    .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+                    .rounded_md()
+                    .on_click(move |_, _, cx| open(target.clone(), cx))
+            })
+    });
+    v_flex()
+        .w_full()
+        .gap_1()
+        .child(header)
+        .child(v_flex().w_full().pl_1().children(branches))
+        .into_any_element()
 }
 
 fn render_group(tools: &[&ToolCall], message_id: &str, ctx: &ToolCtx, cx: &App) -> AnyElement {

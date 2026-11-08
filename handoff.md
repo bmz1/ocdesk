@@ -5,7 +5,28 @@ State of ocdesk for whoever picks it up next. Read this first, then
 
 _Last updated: 2026-11-07, UX batch on `claude/amazing-brahmagupta-qb6r76` (from master @ `13e9c59`)._
 
-## Current work: UX research batch
+## Current work: Agents panel + subagent fan-out
+
+On `claude/jolly-noether-1nz80d`. The owner first asked for an n8n-style
+workflow builder, then settled on something smaller: multi-agent pipelines
+are plain opencode agents (a primary `lead` that delegates to subagents), so
+ocdesk edits the agent files and visualizes delegation instead of running
+its own engine. Details: [docs/desktop-features.md](docs/desktop-features.md#agents-and-subagents).
+
+- `src/agents.rs`: discover/parse/write opencode agent files (folder and
+  global roots, verified against the 2.2.6 sources), frontmatter edits that
+  keep unknown keys verbatim, the team template. Unit-tested.
+- `src/ui/agents.rs`: right-panel **Agents** tab (`Mod+Shift+A`).
+- `tool_card::render_fanout`: 2+ consecutive `subagent` calls draw as a tree.
+
+Validation: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test` (**89 passed**). Demo mode under Xvfb: fan-out tree, panel
+list, team template write, edit + save, and the changed-on-disk guard.
+**Not run against a real opencode**: check that saving triggers
+`agent.updated`, that the model picker lists real models, and that the
+`lead` template actually fans out in parallel.
+
+## Previous work: UX research batch
 
 The owner asked for a UX study of Codex, Claude desktop, T3 Code and Rune
 ([docs/ux-research-2026-11.md](docs/ux-research-2026-11.md)) and then to

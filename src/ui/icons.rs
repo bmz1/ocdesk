@@ -26,7 +26,8 @@ gpui_kit::assets::icon_assets!(
         PinOff,
         Archive,
         MessageSquare,
-        Shield
+        Shield,
+        Bot
     ]
 );
 
@@ -100,4 +101,7 @@ pub fn message_square() -> Icon {
 }
 pub fn shield() -> Icon {
     Icon::new(Lucide::Shield)
+}
+pub fn bot() -> Icon {
+    Icon::new(Lucide::Bot)
 }

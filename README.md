@@ -105,7 +105,7 @@ Drag the sidebar's right edge to resize it (double-click resets it).
 | `Enter` / `Esc` with an empty prompt | Allow once / deny a pending approval (typed text + Enter denies with feedback) |
 | `Ctrl+O` (macOS) / `Ctrl+Shift+O` | Transcript detail: normal → verbose → hide successful work |
 | `Mod+Shift+I` / `Mod+Shift+R` / `Mod+Shift+M` | Choose model / next reasoning effort / next permission mode |
-| `Mod+Shift+D` / `Mod+Shift+T` / `` Ctrl+` `` | Right panel: Changes / Tasks / Terminal |
+| `Mod+Shift+D` / `Mod+Shift+T` / `Mod+Shift+A` / `` Ctrl+` `` | Right panel: Changes / Tasks / Agents / Terminal |
 | `Mod+Shift+C` | Copy the last reply |
 | `Mod+Shift+V` | Paste large text inline instead of as a file |
 | `Mod+/` | Keyboard shortcuts |
@@ -129,7 +129,10 @@ transcript; click one to see it full size.
 **Right panel.** **Changes** reviews the latest turn, working tree, branch or
 commits file by file; hover a line and press `+` to comment, then **Send to
 agent** turns the comments into one prompt. **Tasks** lists subagents and
-background shells. **Terminal** opens the session's shell (opencode's
+background shells. **Agents** edits opencode's agent files (description,
+mode, model, prompt) and adds a starter team; see
+[desktop features](docs/desktop-features.md#agents-and-subagents).
+**Terminal** opens the session's shell (opencode's
 persistent PTY), which survives switching sessions and restarts.
 
 **Errors.** If opencode is missing, too old or crashes, the sidebar footer

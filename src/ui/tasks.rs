@@ -591,7 +591,7 @@ fn last_text(messages: &[Message]) -> Option<String> {
 }
 
 /// The tool result wraps the answer in `<subagent …>…</subagent>`.
-fn strip_subagent_wrapper(text: &str) -> String {
+pub fn strip_subagent_wrapper(text: &str) -> String {
     let inner = text
         .split_once('>')
         .filter(|(head, _)| head.trim_start().starts_with("<subagent"))

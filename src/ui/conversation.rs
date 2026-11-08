@@ -66,6 +66,7 @@ pub struct ConversationView {
     panel_width: Pixels,
     changes: Entity<super::review::ChangesPanel>,
     terminal: Entity<super::terminal::TerminalView>,
+    agents: Entity<super::agents::AgentsPanel>,
     transcript_focus: FocusHandle,
     density: crate::settings::Density,
     /// Free-text inputs for pending question forms, keyed (form, field).
@@ -105,6 +106,8 @@ impl ConversationView {
             cx.new(|cx| super::review::ChangesPanel::new(store.clone(), controller.clone(), cx));
         let terminal =
             cx.new(|cx| super::terminal::TerminalView::new(store.clone(), controller.clone(), cx));
+        let agents =
+            cx.new(|cx| super::agents::AgentsPanel::new(store.clone(), controller.clone(), cx));
         let prefs = store.read(cx).preferences.clone();
         let mut subs = subs;
         // Density changes every row's height.
@@ -128,6 +131,7 @@ impl ConversationView {
                 .clamp(PANEL_MIN_W, PANEL_MAX_W)),
             changes,
             terminal,
+            agents,
             transcript_focus: cx.focus_handle(),
             density: prefs.density,
             expanded_tools: Default::default(),
@@ -414,6 +418,7 @@ impl ConversationView {
                 let focus = self.terminal.read(cx).focus_handle().clone();
                 focus.focus(window, cx);
             }
+            Some(PanelTab::Agents) => self.agents.update(cx, |a, cx| a.reload(cx)),
             None => Composer::focus(&self.composer, window, cx),
         }
         let saved = self.panel;
@@ -940,6 +945,7 @@ impl Render for ConversationView {
                             scrolls: &scrolls,
                             density,
                             found: find_calls.as_deref(),
+                            children: s.selected.as_ref().map_or(&[][..], |id| s.children_of(id)),
                         };
                         let next = c.messages.get(ix + 1);
                         let start = c.messages[..ix]
@@ -1050,6 +1056,7 @@ impl Render for ConversationView {
                             PanelTab::Changes => "Changes: review diffs and comment",
                             PanelTab::Tasks => "Background tasks: subagents and shells",
                             PanelTab::Terminal => "Terminal for this session",
+                            PanelTab::Agents => "Agents: opencode agent files for this folder",
                         },
                         action,
                         None,
@@ -1133,6 +1140,13 @@ impl Render for ConversationView {
                         &super::keys::ToggleTasks,
                     ))
                     .child(tab_button(
+                        "toggle-agents",
+                        PanelTab::Agents,
+                        "Agents".into(),
+                        super::icons::bot(),
+                        &super::keys::ToggleAgents,
+                    ))
+                    .child(tab_button(
                         "toggle-terminal",
                         PanelTab::Terminal,
                         "Terminal".into(),
@@ -1157,6 +1171,11 @@ impl Render for ConversationView {
                     .into_any_element(),
                 PanelTab::Terminal => self
                     .terminal
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                PanelTab::Agents => self
+                    .agents
                     .clone()
                     .cached(StyleRefinement::default().size_full())
                     .into_any_element(),

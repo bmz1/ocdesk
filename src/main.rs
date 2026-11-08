@@ -1,3 +1,4 @@
+mod agents;
 mod api;
 mod controller;
 mod demo;
