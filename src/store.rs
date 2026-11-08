@@ -191,9 +191,6 @@ pub struct Store {
     pub usage: HashMap<String, crate::api::features::UsageReport>,
     pub usage_loading: HashSet<String>,
     pub usage_errors: HashMap<String, String>,
-    pub review_base: HashMap<String, String>,
-    pub review: HashMap<String, crate::api::features::ReviewMode>,
-    pub commits: HashMap<String, Vec<crate::api::features::CommitSummary>>,
     /// The user's folders, in sidebar order. Each is an opencode location.
     pub folders: Vec<PathBuf>,
     pub collapsed: HashSet<PathBuf>,

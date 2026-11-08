@@ -67,9 +67,6 @@ fn fingerprint(store: &Store) -> u64 {
     }
     store.diff_loading.contains(sid).hash(&mut h);
     store.diff_errors.get(sid).hash(&mut h);
-    store.review.get(sid).map(|m| m.key()).hash(&mut h);
-    store.review_base.get(sid).hash(&mut h);
-    store.commits.get(sid).map(Vec::len).hash(&mut h);
     store.preferences.viewed.len().hash(&mut h);
     store.preferences.viewed.values().sum::<u64>().hash(&mut h);
     h.finish()

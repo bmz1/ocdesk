@@ -1,5 +1,5 @@
 use super::*;
-use crate::api::features::{ReviewMode, patch_fingerprint};
+use crate::api::features::patch_fingerprint;
 use crate::settings::PermissionMode;
 use gpui_kit::App;
 
@@ -159,59 +159,14 @@ impl Controller {
             },
         );
     }
-    pub fn set_review(&mut self, mode: ReviewMode, cx: &mut Context<Self>) {
-        let Some(sid) = self.store.read(cx).selected.clone() else {
-            return;
-        };
-        self.store.update(cx, |s, cx| {
-            s.review.insert(sid.clone(), mode);
-            s.diffs.remove(&sid);
-            cx.notify();
-        });
-        self.refresh_diff(sid, cx);
-    }
-    pub fn load_commits(&mut self, cx: &mut Context<Self>) {
-        let Some(sid) = self.store.read(cx).selected.clone() else {
-            return;
-        };
-        let Some(dir) = self.store.read(cx).target_folder() else {
-            return;
-        };
-        let generation = self.generation;
-        self.run(
-            cx,
-            async move { crate::api::features::commits(&dir).await },
-            move |this, res, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                match res {
-                    Ok(commits) => this.store.update(cx, |s, cx| {
-                        s.commits.insert(sid, commits);
-                        cx.notify();
-                    }),
-                    Err(e) => this.notice(format!("Could not load commits: {e:#}"), cx),
-                }
-            },
-        );
-    }
     pub fn viewed_key(&self, sid: &str, file: &str, cx: &App) -> String {
         let s = self.store.read(cx);
         let dir = s
             .session(sid)
             .map(|s| s.directory.display().to_string())
             .unwrap_or_default();
-        let mode = s.review.get(sid).cloned().unwrap_or_default();
-        let base = s.review_base.get(sid).cloned().unwrap_or_default();
-        // Turn views are session-specific; branch/commit views can survive reopening threads.
-        format!(
-            "{dir}\n{}\n{file}",
-            if mode == ReviewMode::Turn {
-                format!("turn:{sid}")
-            } else {
-                format!("{}:{base}", mode.key())
-            }
-        )
+        // Same shape as before the scope picker went away, so marks survive.
+        format!("{dir}\nWorking tree:\n{file}")
     }
     pub fn mark_viewed(
         &mut self,
@@ -335,7 +290,6 @@ impl Controller {
                 s.unread.remove(session_id);
                 s.usage.remove(session_id);
                 s.session_modes.remove(session_id);
-                s.commits.remove(session_id);
                 cx.notify();
             });
             self.update_settings(cx, |s| {
@@ -455,21 +409,6 @@ impl Controller {
                 this.refresh_saved_grants(cx);
             },
         );
-    }
-}
-
-impl Controller {
-    pub fn set_review_base(&mut self, sid: String, base: String, cx: &mut Context<Self>) {
-        self.store.update(cx, |s, cx| {
-            if base.trim().is_empty() {
-                s.review_base.remove(&sid);
-            } else {
-                s.review_base.insert(sid.clone(), base.trim().to_string());
-            }
-            s.diffs.remove(&sid);
-            cx.notify();
-        });
-        self.refresh_diff(sid, cx);
     }
 }
 

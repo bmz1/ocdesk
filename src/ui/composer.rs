@@ -1131,11 +1131,6 @@ impl Render for Composer {
         }
         let connected = self.store.read(cx).connection() == Connection::Connected;
         let empty = self.input.read(cx).value().trim().is_empty() && self.attachments.is_empty();
-        let focused = self
-            .input
-            .read(cx)
-            .focus_handle(cx)
-            .contains_focused(window, cx);
         let esc_armed = self.esc_armed.is_some_and(|t| t.elapsed() < ESC_WINDOW);
         let popup = self.render_mention(cx);
         let pending = self.render_pending(cx);
@@ -1184,11 +1179,7 @@ impl Render for Composer {
             .w_full()
             .rounded_3xl()
             .border_1()
-            .border_color(if focused {
-                theme.ring.opacity(0.6)
-            } else {
-                theme.border
-            })
+            .border_color(theme.border)
             // A raised surface, so the box stands out from the page.
             .bg(theme.secondary.opacity(0.35))
             .shadow_sm()

@@ -1456,15 +1456,6 @@ impl Controller {
             s.diff_errors.remove(&sid);
             cx.notify();
         });
-        let id = sid.clone();
-        let mode = self
-            .store
-            .read(cx)
-            .review
-            .get(&sid)
-            .cloned()
-            .unwrap_or_default();
-        let base = self.store.read(cx).review_base.get(&sid).cloned();
         let Some(dir) = self
             .store
             .read(cx)
@@ -1475,7 +1466,7 @@ impl Controller {
         };
         self.run(
             cx,
-            async move { api.review_diff(&id, &dir, &mode, base.as_deref()).await },
+            async move { api.working_diff(&dir).await },
             move |this, res, cx| {
                 if this.generation != generation || this.diff_requests.get(&sid) != Some(&request) {
                     return;

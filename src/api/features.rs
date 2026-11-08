@@ -3,37 +3,6 @@ use super::*;
 use crate::settings::PermissionMode;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum ReviewMode {
-    #[default]
-    Turn,
-    Working,
-    Branch,
-    Committed,
-    Commit(String),
-}
-impl ReviewMode {
-    pub fn label(&self) -> &str {
-        match self {
-            Self::Turn => "Latest turn",
-            Self::Working => "Working tree",
-            Self::Branch => "Whole branch",
-            Self::Committed => "Committed changes",
-            Self::Commit(_) => "Single commit",
-        }
-    }
-    pub fn key(&self) -> String {
-        match self {
-            Self::Commit(sha) => format!("commit:{sha}"),
-            _ => self.label().into(),
-        }
-    }
-}
-#[derive(Clone, Debug)]
-pub struct CommitSummary {
-    pub sha: String,
-    pub subject: String,
-}
 #[derive(Clone, Debug, Default)]
 pub struct Tokens {
     pub input: u64,
@@ -116,29 +85,14 @@ impl Api {
         .await?;
         Ok(())
     }
-    pub async fn review_diff(
-        &self,
-        sid: &str,
-        directory: &Path,
-        mode: &ReviewMode,
-        base: Option<&str>,
-    ) -> Result<Vec<model::FileDiff>> {
-        let mode = match mode {
-            ReviewMode::Turn => return self.diff(sid).await,
-            ReviewMode::Commit(sha) => return commit_diff(directory, sha).await,
-            ReviewMode::Working => "working",
-            ReviewMode::Branch => "branch",
-            ReviewMode::Committed => "committed",
-        };
-        let mut req = self.req(Method::GET, "/api/vcs/diff").query(&[
+    /// Uncommitted changes (HEAD to the working copy, untracked files included).
+    pub async fn working_diff(&self, directory: &Path) -> Result<Vec<model::FileDiff>> {
+        let req = self.req(Method::GET, "/api/vcs/diff").query(&[
             ("location[directory]", directory.to_string_lossy().as_ref()),
-            ("mode", mode),
+            ("mode", "working"),
             ("context", "3"),
             ("untracked", "files"),
         ]);
-        if let Some(base) = base.filter(|s| !s.is_empty()) {
-            req = req.query(&[("base", base)]);
-        }
         let v = self.send(req).await?;
         v["data"]
             .as_array()
@@ -240,94 +194,6 @@ impl Api {
         Ok(report)
     }
 }
-async fn git(directory: &Path, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>> {
-    let out = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .arg("--no-pager")
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .await?;
-    if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(out.stdout)
-}
-pub async fn commits(directory: &Path) -> Result<Vec<CommitSummary>> {
-    let bytes = git(
-        directory,
-        &["log".as_ref(), "-50".as_ref(), "--format=%H%x09%s".as_ref()],
-    )
-    .await?;
-    Ok(String::from_utf8_lossy(&bytes)
-        .lines()
-        .filter_map(|l| l.split_once('\t'))
-        .map(|(sha, subject)| CommitSummary {
-            sha: sha.into(),
-            subject: subject.into(),
-        })
-        .collect())
-}
-async fn commit_diff(directory: &Path, sha: &str) -> Result<Vec<model::FileDiff>> {
-    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("invalid commit id");
-    }
-    let bytes = git(
-        directory,
-        &[
-            "diff-tree".as_ref(),
-            "--root".as_ref(),
-            "--no-commit-id".as_ref(),
-            "--diff-merges=first-parent".as_ref(),
-            "--no-renames".as_ref(),
-            "--name-only".as_ref(),
-            "-r".as_ref(),
-            "-z".as_ref(),
-            sha.as_ref(),
-            "--".as_ref(),
-        ],
-    )
-    .await?;
-    let mut diffs = Vec::new();
-    for name in bytes.split(|b| *b == 0).filter(|n| !n.is_empty()) {
-        let file = std::str::from_utf8(name)?.to_string();
-        let bytes = git(
-            directory,
-            &[
-                "show".as_ref(),
-                "--format=".as_ref(),
-                "--diff-merges=first-parent".as_ref(),
-                "--no-ext-diff".as_ref(),
-                "--no-textconv".as_ref(),
-                "--no-renames".as_ref(),
-                sha.as_ref(),
-                "--".as_ref(),
-                file.as_ref(),
-            ],
-        )
-        .await?;
-        let patch = String::from_utf8_lossy(&bytes).into_owned();
-        let additions = patch
-            .lines()
-            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-            .count() as u64;
-        let deletions = patch
-            .lines()
-            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
-            .count() as u64;
-        diffs.push(model::FileDiff {
-            file,
-            patch,
-            status: "committed".into(),
-            additions,
-            deletions,
-            more: false,
-        });
-    }
-    Ok(diffs)
-}
 pub fn patch_fingerprint(patch: &str) -> u64 {
     patch.bytes().fold(0xcbf29ce484222325, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
@@ -383,72 +249,5 @@ impl Api {
         ))
         .await?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod review_tests {
-    use super::*;
-    #[tokio::test]
-    async fn root_and_individual_commit_review_only_show_that_commits_changes() {
-        let directory =
-            std::env::temp_dir().join(format!("ocdesk-review-{:016x}", rand::random::<u64>()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&directory)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8(out.stdout).unwrap().trim().to_string()
-        };
-        git(&["init", "-q", "-b", "main"]);
-        std::fs::write(directory.join("space name.txt"), "first\n").unwrap();
-        git(&["add", "."]);
-        git(&[
-            "-c",
-            "user.name=QA",
-            "-c",
-            "user.email=qa@example.com",
-            "commit",
-            "-qm",
-            "root",
-        ]);
-        let root = git(&["rev-parse", "HEAD"]);
-        std::fs::write(directory.join("space name.txt"), "second\n").unwrap();
-        git(&["add", "."]);
-        git(&[
-            "-c",
-            "user.name=QA",
-            "-c",
-            "user.email=qa@example.com",
-            "commit",
-            "-qm",
-            "second",
-        ]);
-        let second = git(&["rev-parse", "HEAD"]);
-        std::fs::write(directory.join("space name.txt"), "uncommitted\n").unwrap();
-        let first = commit_diff(&directory, &root).await.unwrap();
-        assert_eq!(first.len(), 1);
-        assert!(first[0].patch.contains("+first"));
-        assert_eq!(first[0].deletions, 0);
-        let files = commit_diff(&directory, &second).await.unwrap();
-        assert_eq!(files[0].file, "space name.txt");
-        assert!(files[0].patch.contains("-first"));
-        assert!(files[0].patch.contains("+second"));
-        assert!(!files[0].patch.contains("uncommitted"));
-        assert!(commit_diff(&directory, "--output=/tmp/no").await.is_err());
-        assert_eq!(
-            std::fs::read_to_string(directory.join("space name.txt")).unwrap(),
-            "uncommitted\n"
-        );
-        assert_eq!(commits(&directory).await.unwrap().len(), 2);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }

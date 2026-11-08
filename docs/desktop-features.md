@@ -86,12 +86,9 @@ change the theme during the current run.
 
 ## Full diff review
 
-Changes includes Latest turn, Working tree (HEAD → working copy), Whole branch
-(base merge-base → working copy), Committed changes (base merge-base → HEAD), and
-individual recent commits. Branch/committed scopes accept an explicit comparison
-base, or use the repository default. Working/branch scopes include untracked
-files. Errors remain visible with Refresh available; old requests cannot replace
-newer scope results.
+Changes shows the working tree only: HEAD → working copy, untracked files
+included (`/api/vcs/diff?mode=working`). Errors remain visible with Refresh
+available; old requests cannot replace newer results.
 
 The server supplies VCS diffs. Individual-commit review uses read-only Git log
 and show commands; merge commits show the first-parent comparison, root commits
