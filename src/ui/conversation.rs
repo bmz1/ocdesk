@@ -74,6 +74,7 @@ pub struct ConversationView {
     files: Entity<super::editor_tabs::FileTabs>,
     explorer: Entity<super::explorer::FileExplorer>,
     agents: Entity<super::agents::AgentsPanel>,
+    mods: Entity<super::mods::ModsPanel>,
     pull_request: Entity<super::pull_request::PullRequestPanel>,
     transcript_focus: FocusHandle,
     density: crate::settings::Density,
@@ -132,6 +133,7 @@ impl ConversationView {
         });
         let agents =
             cx.new(|cx| super::agents::AgentsPanel::new(store.clone(), controller.clone(), cx));
+        let mods = cx.new(|cx| super::mods::ModsPanel::new(store.clone(), controller.clone(), cx));
         let pull_request = cx.new(|cx| {
             super::pull_request::PullRequestPanel::new(store.clone(), controller.clone(), cx)
         });
@@ -153,6 +155,7 @@ impl ConversationView {
             files,
             explorer,
             agents,
+            mods,
             pull_request,
             transcript_focus: cx.focus_handle(),
             density: prefs.density,
@@ -424,6 +427,9 @@ impl ConversationView {
         if tab == PanelTab::PullRequest && !self.store.read(cx).gh_available {
             return;
         }
+        if tab == PanelTab::Mods && !cfg!(feature = "mods") {
+            return;
+        }
         self.panel = if self.panel == Some(tab) {
             None
         } else {
@@ -444,6 +450,7 @@ impl ConversationView {
             Some(PanelTab::Files) => {}
             Some(PanelTab::Agents) => self.agents.update(cx, |a, cx| a.reload(cx)),
             Some(PanelTab::PullRequest) => self.pull_request.update(cx, |p, cx| p.refresh(cx)),
+            Some(PanelTab::Mods) => {}
             None => self.focus_main(window, cx),
         }
         let saved = self.panel;
@@ -1158,7 +1165,8 @@ impl Render for ConversationView {
         let panel_tab = self
             .panel
             .filter(|_| has_selection)
-            .filter(|t| gh || *t != PanelTab::PullRequest);
+            .filter(|t| gh || *t != PanelTab::PullRequest)
+            .filter(|t| cfg!(feature = "mods") || *t != PanelTab::Mods);
         let weak = cx.entity().downgrade();
         // Icon-only tab buttons: what the label used to say (diff size,
         // running tasks) is in the tooltip, and a dot marks activity.
@@ -1323,6 +1331,16 @@ impl Render for ConversationView {
                         &super::keys::ToggleTerminal,
                         false,
                     ))
+                    .when(cfg!(feature = "mods"), |el| {
+                        el.child(tab_button(
+                            "toggle-mods",
+                            PanelTab::Mods,
+                            "Mods: JavaScript panels (experimental)".into(),
+                            super::icons::plug(),
+                            &super::keys::ToggleMods,
+                            false,
+                        ))
+                    })
             });
 
         let panel = panel_tab.map(|tab| {
@@ -1351,6 +1369,11 @@ impl Render for ConversationView {
                     .into_any_element(),
                 PanelTab::Agents => self
                     .agents
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element(),
+                PanelTab::Mods => self
+                    .mods
                     .clone()
                     .cached(StyleRefinement::default().size_full())
                     .into_any_element(),

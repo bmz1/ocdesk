@@ -127,6 +127,11 @@ same desktop identity in `$XDG_DATA_HOME` (default `~/.local/share`); Wayland
 resolves application icons through that desktop entry. Pass `--data-dir` to
 verify registration in an isolated directory.
 
+## Mods (experimental)
+
+`cargo run --features mods` adds a **Mods** panel that runs JavaScript panels on
+gpui-kit's `gpui-shell` runtime. Off by default; see [mods.md](mods.md).
+
 ## Architecture
 
 See [State machines and transition ownership](state-machines.md) for the lifecycle

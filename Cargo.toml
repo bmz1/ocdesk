@@ -35,6 +35,15 @@ base64 = "0.22"
 # syntax set gpui-component's `syntect` feature already builds.
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
 two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
+# Experimental JavaScript mods (feature `mods`): gpui-kit's scripting runtime,
+# QuickJS behind it. Same release train as gpui-kit (gpui-pre =0.3.11); keep
+# the two pinned together. No webview, no gpui-fast, no component catalog.
+gpui-shell = { version = "=0.9.0", default-features = false, features = ["quickjs"], optional = true }
+
+[features]
+# Spike: a Mods right-panel tab that loads ~/.config/ocdesk/mods/*/main.js.
+# Off by default; see docs/mods.md.
+mods = ["dep:gpui-shell"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

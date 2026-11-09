@@ -17,6 +17,7 @@ mod lifecycle;
 pub mod lru;
 pub mod mention;
 pub mod message;
+pub mod mods;
 pub mod palette;
 pub mod permission;
 pub mod prose;

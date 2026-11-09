@@ -47,6 +47,7 @@ actions!(
         PreviousTab,
         ShowChat,
         TogglePullRequest,
+        ToggleMods,
     ]
 );
 

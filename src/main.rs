@@ -6,6 +6,8 @@ mod demo;
 mod domain;
 mod files;
 mod github;
+#[cfg(any(test, feature = "mods"))]
+mod mods;
 mod notifications;
 mod opencode_config;
 mod settings;

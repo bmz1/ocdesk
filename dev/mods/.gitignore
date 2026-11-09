@@ -1,0 +1,2 @@
+# Written by gpui-shell on every load (editor typings, includes the `ocdesk` module).
+gpui-kit.d.ts

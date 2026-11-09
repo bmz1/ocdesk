@@ -107,6 +107,8 @@ pub enum PanelTab {
     Files,
     Agents,
     PullRequest,
+    /// JavaScript mods (feature `mods`; hidden without it).
+    Mods,
 }
 
 impl Default for Settings {
