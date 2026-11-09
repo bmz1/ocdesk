@@ -66,6 +66,11 @@ pub struct Conversation {
     pub live: HashSet<String>,
     /// Events for a not-yet-loaded conversation, replayed after its snapshot.
     pub pending: Vec<Envelope>,
+    /// Prose blocks (message, kind, ordinal) whose start streamed before
+    /// this conversation was loaded. opencode's history has no text for a
+    /// block still streaming and deltas carry no offset, so only the tail is
+    /// known until `BlockEnded` brings the full text.
+    joined_mid_stream: HashSet<(String, BlockKind, u64)>,
     /// Bumped whenever `messages` change other than by streamed text, so
     /// views can memoize what they derive from tool calls and message
     /// structure (todos) instead of rescanning every frame.
@@ -85,6 +90,13 @@ impl Conversation {
 
     pub(crate) fn fetching(&self) -> bool {
         self.load.fetching()
+    }
+
+    /// Whether this prose block's beginning was missed (see
+    /// `joined_mid_stream`): its text is only a tail, not renderable markdown.
+    pub fn joined_mid_stream(&self, message_id: &str, kind: BlockKind, ordinal: u64) -> bool {
+        self.joined_mid_stream
+            .contains(&(message_id.to_string(), kind, ordinal))
     }
 
     fn cancel_load(&mut self) {

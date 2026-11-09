@@ -84,10 +84,25 @@ def check_archive_hides_sessions(h):
     print('PASS: archive hides succeeded and failed-first-turn sessions from archived=false; restore lists again')
 
 
+def check_streaming_block_has_no_history_text(h):
+    """ocdesk marks blocks joined mid-stream because history has no text for
+    a block that is still streaming. If this changes, revisit missed_starts."""
+    sid = h.new_session()
+    h.request(f'/api/session/{sid}/prompt', {'text': 'slow'})
+    h.wait_event('session.text.delta', sid)
+    running = [m for m in h.request(f'/api/session/{sid}/message')['data'] if m['type'] == 'assistant']
+    assert running and 'completed' not in running[0]['time'], running
+    texts = [c['text'] for c in running[0]['content'] if c['type'] == 'text']
+    assert texts == [''], f'a streaming text block has no history text: {texts}'
+    assert h.wait_event('terminal', sid, timeout=60)['type'] == 'session.execution.succeeded'
+    print('PASS: a streaming text block has empty history text until it ends')
+
+
 def main():
     binary=sys.argv[1] if len(sys.argv)>1 else os.environ.get('OCDESK_OPENCODE','opencode2')
     with Harness(binary,files={'file space.txt':'attachment probe\n'}) as h:
         check_archive_hides_sessions(h)
+        check_streaming_block_has_no_history_text(h)
         sid=h.new_session();root=f'/api/session/{sid}'
         supervised=[{'action':'*','resource':'*','effect':'ask'}]+[{'action':a,'resource':'*','effect':'allow'} for a in ['read','glob','grep']]
         auto=supervised+[{'action':'edit','resource':'*','effect':'allow'}]

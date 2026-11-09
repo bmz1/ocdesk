@@ -340,6 +340,8 @@ impl Store {
                 text: full,
                 ..
             } => {
+                conv.joined_mid_stream
+                    .remove(&(message_id.clone(), kind, ordinal));
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
                 let (text, done, time) = prose_mut(msg, kind, ordinal);
                 *text = full;
@@ -423,6 +425,7 @@ impl Store {
                 cost,
                 ..
             } => {
+                conv.joined_mid_stream.retain(|(m, _, _)| *m != message_id);
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
                 msg.completed = true;
                 msg.finish = Some(finish);
@@ -438,6 +441,7 @@ impl Store {
             Event::StepFailed {
                 message_id, error, ..
             } => {
+                conv.joined_mid_stream.retain(|(m, _, _)| *m != message_id);
                 let (index, inserted, msg) = conv.assistant_mut(&message_id);
                 msg.completed = true;
                 msg.meta.completed = Some(at);

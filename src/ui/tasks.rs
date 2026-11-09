@@ -19,7 +19,7 @@ use gpui_kit::*;
 
 use crate::api::model::{Block, BlockKind, Message, SessionInfo, ShellInfo, ToolCall};
 use crate::controller::Controller;
-use crate::store::{Store, StoreEvent};
+use crate::store::{Conversation, Store, StoreEvent};
 use crate::ui::icons;
 
 const POLL: Duration = Duration::from_secs(1);
@@ -35,6 +35,8 @@ pub enum TaskView {
 /// Something in the transcript that opens the drawer.
 pub type OpenTask = std::rc::Rc<dyn Fn(TaskView, &mut App)>;
 
+type MarkdownSlot = (String, String, Entity<TextViewState>);
+
 pub struct TasksDrawer {
     store: Entity<Store>,
     controller: Entity<Controller>,
@@ -43,8 +45,10 @@ pub struct TasksDrawer {
     /// Latest output per shell id.
     output: std::collections::HashMap<String, String>,
     poll: Option<Task<()>>,
-    /// Parsed markdown of the open subagent's result: (child id, text, state).
-    result_md: Option<(String, String, Entity<TextViewState>)>,
+    /// Parsed markdown of the open subagent's prompt and result:
+    /// (child id, text, state), reparsed only when the text changes.
+    prompt_md: Option<MarkdownSlot>,
+    result_md: Option<MarkdownSlot>,
     _subs: Vec<Subscription>,
 }
 
@@ -86,6 +90,7 @@ impl TasksDrawer {
             show_full_prompt: false,
             output: Default::default(),
             poll: None,
+            prompt_md: None,
             result_md: None,
             _subs: subs,
         }
@@ -311,16 +316,15 @@ impl TasksDrawer {
             .to_string();
         // The drawer only needs the latest tool activity and answer. Do not
         // copy the child transcript on every redraw.
-        let transcript = store
-            .conversations
-            .get(child)
-            .map(|c| c.messages.as_slice());
-        let summary = transcript.and_then(activity_summary);
-        let last_message_text = transcript.and_then(last_text);
+        let conversation = store.conversations.get(child);
+        let summary = conversation.and_then(|c| activity_summary(&c.messages));
+        // The answer so far; `true` when only its tail streamed in (opened
+        // mid-stream), which is not a markdown document yet.
+        let last_message_text = conversation.and_then(last_text);
         let result = last_message_text.or_else(|| {
             call.as_ref()
                 .filter(|t| !t.output.is_empty())
-                .map(|t| strip_subagent_wrapper(&t.output))
+                .map(|t| (strip_subagent_wrapper(&t.output), false))
         });
 
         let agent = info
@@ -331,14 +335,23 @@ impl TasksDrawer {
                     .and_then(|t| t.input.get("agent")?.as_str().map(str::to_string))
             })
             .unwrap_or_else(|| "subagent".into());
-        let result = result.map(|text| self.result_state(child, text, cx));
+        let result = result.map(|(text, tail)| {
+            if tail {
+                Err(text)
+            } else {
+                Ok(markdown_state(&mut self.result_md, child, text, cx))
+            }
+        });
+        let prompt_state = (!prompt.is_empty())
+            .then(|| markdown_state(&mut self.prompt_md, child, prompt.clone(), cx));
         let long_prompt = prompt.lines().count() > 4 || prompt.len() > 320;
         let show_full = self.show_full_prompt;
 
         v_flex()
             .p_3()
             .gap_3()
-            .when(!prompt.is_empty(), |el| {
+            .when_some(prompt_state, |el, state| {
+                let view = TextView::new(&state).w_full().selectable(true);
                 el.child(
                     v_flex()
                         .p_3()
@@ -346,12 +359,7 @@ impl TasksDrawer {
                         .rounded_xl()
                         .bg(theme.secondary.opacity(0.6))
                         .text_sm()
-                        .child(
-                            div()
-                                .when(!show_full, |d| d.line_clamp(4))
-                                .whitespace_normal()
-                                .child(prompt.clone()),
-                        )
+                        .child(if show_full { view } else { view.max_lines(4) })
                         .when(long_prompt, |el| {
                             el.child(
                                 div()
@@ -387,37 +395,15 @@ impl TasksDrawer {
             .when(running, |el| {
                 el.child(super::kit::spinner().small().color(theme.primary))
             })
-            .when_some(result, |el, state| {
-                el.child(
+            .when_some(result, |el, result| match result {
+                Ok(state) => el.child(
                     div()
                         .text_sm()
                         .child(TextView::new(&state).w_full().selectable(true)),
-                )
+                ),
+                Err(tail) => el.child(super::message::joined_mid_stream(&tail, cx)),
             })
             .into_any_element()
-    }
-
-    /// The markdown state for `child`'s result, reparsed only when it changes.
-    fn result_state(
-        &mut self,
-        child: &str,
-        text: String,
-        cx: &mut Context<Self>,
-    ) -> Entity<TextViewState> {
-        match &mut self.result_md {
-            Some((id, cur, state)) if id == child => {
-                if *cur != text {
-                    state.update(cx, |s, cx| s.set_text(&text, cx));
-                    *cur = text;
-                }
-                state.clone()
-            }
-            _ => {
-                let state = cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
-                self.result_md = Some((child.to_string(), text, state.clone()));
-                state
-            }
-        }
     }
 
     fn render_shell(&self, id: &str, cx: &mut Context<Self>) -> AnyElement {
@@ -611,23 +597,53 @@ pub fn activity_summary(messages: &[Message]) -> Option<String> {
     }))
 }
 
-/// The child's final answer: the last assistant text.
-fn last_text(messages: &[Message]) -> Option<String> {
-    messages.iter().rev().find_map(|m| match m {
+/// The markdown state in `slot` for `child`'s `text`, reparsed only when the
+/// text changes and recreated when the child does.
+fn markdown_state(
+    slot: &mut Option<MarkdownSlot>,
+    child: &str,
+    text: String,
+    cx: &mut App,
+) -> Entity<TextViewState> {
+    match slot {
+        Some((id, cur, state)) if id == child => {
+            if *cur != text {
+                state.update(cx, |s, cx| s.set_text(&text, cx));
+                *cur = text;
+            }
+            state.clone()
+        }
+        _ => {
+            let state = cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
+            *slot = Some((child.to_string(), text, state.clone()));
+            state
+        }
+    }
+}
+
+/// The child's latest answer: the last assistant text, and whether any of
+/// it is only the tail of a block joined mid-stream.
+fn last_text(conv: &Conversation) -> Option<(String, bool)> {
+    conv.messages.iter().rev().find_map(|m| match m {
         Message::Assistant(a) => {
+            let mut tail = false;
             let text: Vec<&str> = a
                 .blocks
                 .iter()
                 .filter_map(|b| match b {
                     Block::Prose {
                         kind: BlockKind::Text,
+                        ordinal,
                         text,
                         ..
-                    } if !text.trim().is_empty() => Some(text.as_str()),
+                    } if !text.trim().is_empty() => {
+                        tail |= conv.joined_mid_stream(&a.id, BlockKind::Text, *ordinal);
+                        Some(text.as_str())
+                    }
                     _ => None,
                 })
                 .collect();
-            (!text.is_empty()).then(|| text.join("\n\n"))
+            (!text.is_empty()).then(|| (text.join("\n\n"), tail))
         }
         _ => None,
     })

@@ -187,6 +187,7 @@ pub fn render_message(
         }
     };
 
+    let conv = row.store.read(cx).selected_conversation();
     let mut col = v_flex().w_full().gap_3();
     // Consecutive tool calls render together (folded into one row), and so
     // do consecutive reasoning blocks; prose that renders nothing doesn't
@@ -204,16 +205,26 @@ pub fn render_message(
         match block {
             Block::Prose {
                 kind,
+                ordinal,
                 text,
                 done,
                 time,
-                ..
             } => {
                 // `prose_blocks` yields one key per prose block, in order.
                 let Some((key, _)) = keys.next() else {
                     continue;
                 };
                 match kind {
+                    // Only the tail of this block streamed in: parsing it as
+                    // markdown would mis-render (e.g. start inside a fence).
+                    BlockKind::Text
+                        if conv.is_some_and(|c| c.joined_mid_stream(&a.id, *kind, *ordinal)) =>
+                    {
+                        col = col.children(super::tool_card::render_tools(&run, &a.id, tools, cx));
+                        run.clear();
+                        col = flush_thoughts(col, &mut thoughts);
+                        col = col.child(joined_mid_stream(text, cx));
+                    }
                     BlockKind::Text if !text.is_empty() => {
                         if let Some(s) = prose.state(&key) {
                             col = col
@@ -277,6 +288,30 @@ struct Thought {
     done: bool,
     time: Timing,
     last_line: String,
+}
+
+/// A prose block joined mid-stream: its start is not known until it ends,
+/// so show the latest line as plain text instead of half a document.
+pub fn joined_mid_stream(tail: &str, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .gap_1()
+        .text_sm()
+        .child(
+            div()
+                .text_color(theme.muted_foreground)
+                .child("Still writing. The full answer appears when this part finishes."),
+        )
+        .when(!tail.trim().is_empty(), |el| {
+            el.child(
+                div()
+                    .text_color(theme.muted_foreground)
+                    .italic()
+                    .line_clamp(1)
+                    .child(format!("… {}", last_line(tail))),
+            )
+        })
+        .into_any_element()
 }
 
 fn last_line(text: &str) -> String {
