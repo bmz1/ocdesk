@@ -98,7 +98,8 @@ impl Api {
         let mut cursor: Option<String> = None;
         loop {
             // `cursor` must not be combined with `order` (the API rejects it).
-            let mut q = vec![("limit", PAGE.to_string())];
+            // Without `archived=false` the list includes archived sessions.
+            let mut q = vec![("limit", PAGE.to_string()), ("archived", "false".into())];
             if let Some(c) = &cursor {
                 q.push(("cursor", c.clone()));
             } else {
@@ -111,6 +112,7 @@ impl Api {
             let n = page.len();
             out.extend(
                 page.iter()
+                    .filter(|s| s.pointer("/time/archived").is_none())
                     .filter_map(SessionInfo::from_json)
                     .filter(|s| s.parent_id.is_none()),
             );

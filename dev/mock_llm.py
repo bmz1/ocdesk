@@ -8,7 +8,8 @@ then run opencode with dev/mock-opencode.json (see README "Developing").
 Behaviour is keyed on the last user message:
     contains "tool:bash"  -> calls the shell tool ("bash" on old servers), then summarizes
     contains "tool:edit"  -> calls the write tool on mock_note.txt, then summarizes
-    contains "tool:task"  -> calls the subagent tool (spawns a "general" subagent), then summarizes
+    contains "tool:task"  -> calls the subagent tool (spawns a "general" subagent), then summarizes;
+                             with "rich" too, the subagent answers with the rich markdown
     contains "tool:sleep" -> runs `sleep 20` through the shell tool (a long-running command)
     contains "slow"       -> a reply streamed over ~10 s (for queue/steer testing)
     contains "long"       -> streams a long markdown answer with code blocks
@@ -195,7 +196,9 @@ class Handler(BaseHTTPRequestHandler):
                 name = pick("subagent", "task")
                 params = tools.get(name, {}).get("parameters", {})
                 sys.stderr.write(f"mock_llm: {name} schema: " + json.dumps(params) + "\n")
-                values = {"description": "Look around", "prompt": "Subagent: say hello",
+                # "rich" passes through so the child answers with full markdown.
+                child = "Subagent: rich" if "rich" in user else "Subagent: say hello"
+                values = {"description": "Look around", "prompt": child,
                           "subagent_type": "general", "agent": "general", "subagent": "general"}
                 props = params.get("properties", {})
                 args = {k: values.get(k, "general") for k in (params.get("required") or props)}

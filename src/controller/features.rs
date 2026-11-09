@@ -610,8 +610,9 @@ impl Controller {
         });
     }
 
-    /// Archive (`true`) or restore a session. The server removes an
-    /// archived session from the list; restoring re-reads the list.
+    /// Archive (`true`) or restore a session. An accepted archive removes
+    /// the row at once (`session.archived` repeats it harmlessly); restoring
+    /// re-reads the list.
     pub fn set_archived(&mut self, sid: String, archived: bool, cx: &mut Context<Self>) {
         let Some(api) = self.api(cx) else { return };
         if archived && self.store.read(cx).selected.as_deref() == Some(sid.as_str()) {
@@ -623,7 +624,12 @@ impl Controller {
             async move { api.set_archived(&id, archived).await },
             move |this, res, cx| match res {
                 Ok(()) if !archived => this.refresh_sessions(cx),
-                Ok(()) => {}
+                Ok(()) => this.store.update(cx, |s, cx| {
+                    s.apply(
+                        Envelope::bare(Event::SessionRemoved { session_id: sid }),
+                        cx,
+                    )
+                }),
                 Err(e) => this.notice(format!("Could not update {sid}: {e:#}"), cx),
             },
         );

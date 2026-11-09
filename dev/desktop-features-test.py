@@ -61,9 +61,33 @@ def check_saved_approvals_in_another_project(h, supervised):
     print('PASS: real Always allow saves project grants outside the sidecar directory; reuse and revoke')
 
 
+def check_archive_hides_sessions(h):
+    """Archive must hide a session from the list ocdesk reads, including one
+    whose first turn failed. The plain list keeps archived sessions."""
+    ok = h.new_session()
+    h.request(f'/api/session/{ok}/prompt', {'text': 'hi'})
+    assert h.wait_event('terminal', ok)['type'] == 'session.execution.succeeded'
+    failed = h.new_session()
+    h.request(f'/api/session/{failed}/model', {'model': {'providerID': 'mock', 'id': 'missing-model'}})
+    h.request(f'/api/session/{failed}/prompt', {'text': 'hi'})
+    assert h.wait_event('terminal', failed)['type'] == 'session.execution.failed'
+    def listed(query):
+        return {s['id'] for s in h.request('/api/session?limit=50&order=desc' + query)['data']}
+    for sid in (ok, failed):
+        assert h.request(f'/api/session/{sid}', {'archived': True}, 'PATCH') is None
+        h.wait_event('session.archived', sid)
+        assert h.request(f'/api/session/{sid}')['data']['time'].get('archived'), sid
+    assert {ok, failed} <= listed(''), 'the default list includes archived sessions'
+    assert not {ok, failed} & listed('&archived=false'), 'archived=false hides them'
+    h.request(f'/api/session/{failed}', {'archived': False}, 'PATCH')
+    assert failed in listed('&archived=false'), 'restoring lists it again'
+    print('PASS: archive hides succeeded and failed-first-turn sessions from archived=false; restore lists again')
+
+
 def main():
     binary=sys.argv[1] if len(sys.argv)>1 else os.environ.get('OCDESK_OPENCODE','opencode2')
     with Harness(binary,files={'file space.txt':'attachment probe\n'}) as h:
+        check_archive_hides_sessions(h)
         sid=h.new_session();root=f'/api/session/{sid}'
         supervised=[{'action':'*','resource':'*','effect':'ask'}]+[{'action':a,'resource':'*','effect':'allow'} for a in ['read','glob','grep']]
         auto=supervised+[{'action':'edit','resource':'*','effect':'allow'}]
