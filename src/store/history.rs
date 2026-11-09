@@ -126,6 +126,12 @@ impl Store {
                 newer.push(m);
             }
         }
+        conv.joined_mid_stream = missed_starts(
+            &history,
+            &local,
+            &conv.pending,
+            &std::mem::take(&mut conv.joined_mid_stream),
+        );
         let mut merged: Vec<Message> = history
             .into_iter()
             .map(|mut snap| {
@@ -207,6 +213,68 @@ pub(super) enum HistoryChange {
 /// Snapshot blocks win, except where local streamed text strictly extends
 /// the snapshot's (the server persists text slightly after streaming it),
 /// and local blocks the snapshot doesn't know yet are kept.
+/// Prose blocks of still-running snapshot messages whose beginning is lost:
+/// the snapshot has no text for them (opencode persists a block's text when
+/// it ends), no `BlockStarted` was buffered (it streamed before the fetch),
+/// and no local text covers the start (none, or itself only a tail).
+fn missed_starts(
+    history: &[Message],
+    local: &HashMap<String, Message>,
+    pending: &[Envelope],
+    was: &HashSet<(String, BlockKind, u64)>,
+) -> HashSet<(String, BlockKind, u64)> {
+    let started: HashSet<(&str, BlockKind, u64)> = pending
+        .iter()
+        .filter_map(|env| match &env.event {
+            Event::BlockStarted {
+                message_id,
+                kind,
+                ordinal,
+                ..
+            } => Some((message_id.as_str(), *kind, *ordinal)),
+            _ => None,
+        })
+        .collect();
+    let mut out = HashSet::new();
+    for m in history {
+        let Message::Assistant(a) = m else { continue };
+        if a.completed {
+            continue;
+        }
+        for b in &a.blocks {
+            let Block::Prose {
+                kind,
+                ordinal,
+                text,
+                ..
+            } = b
+            else {
+                continue;
+            };
+            if !text.is_empty() || started.contains(&(a.id.as_str(), *kind, *ordinal)) {
+                continue;
+            }
+            let key = (a.id.clone(), *kind, *ordinal);
+            let local_text = match local.get(&a.id) {
+                Some(Message::Assistant(l)) => l.blocks.iter().find_map(|lb| match lb {
+                    Block::Prose {
+                        kind: k,
+                        ordinal: o,
+                        text,
+                        ..
+                    } if k == kind && o == ordinal => Some(text.as_str()),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            if local_text.is_none_or(str::is_empty) || was.contains(&key) {
+                out.insert(key);
+            }
+        }
+    }
+    out
+}
+
 fn merge_blocks(snapshot: &mut Vec<Block>, local: Vec<Block>) {
     for lb in local {
         let found = snapshot.iter_mut().find(|sb| same_block(sb, &lb));

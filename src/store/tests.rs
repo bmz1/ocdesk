@@ -1082,3 +1082,110 @@ fn model_and_agent_choices_follow_events_and_precedence() {
     assert_eq!(s.effective_model(), Some(mref("chosen")));
     assert_eq!(s.session("ses_x").unwrap().title, "t");
 }
+
+/// opencode's history has no text for a block that is still streaming, and
+/// deltas carry no offset: a load that starts mid-block only sees its tail.
+fn mid_stream(sid: &str, kind: &str, extra: &str) -> Envelope {
+    wire(&format!(
+        r#"{{"type":"session.{kind}","data":{{"sessionID":"{sid}","assistantMessageID":"msg_a","ordinal":0{extra}}}}}"#
+    ))
+}
+
+fn running_snapshot(text: &str) -> Message {
+    Message::Assistant(AssistantMessage {
+        id: "msg_a".into(),
+        blocks: vec![Block::Prose {
+            kind: BlockKind::Text,
+            ordinal: 0,
+            text: text.into(),
+            done: true,
+            time: Default::default(),
+        }],
+        completed: false,
+        ..Default::default()
+    })
+}
+
+fn first_text(s: &Store, sid: &str) -> String {
+    let Message::Assistant(a) = &s.conversations[sid].messages[0] else {
+        panic!()
+    };
+    let Block::Prose { text, .. } = &a.blocks[0] else {
+        panic!()
+    };
+    text.clone()
+}
+
+#[test]
+fn a_load_that_misses_a_blocks_start_marks_it_until_the_full_text_arrives() {
+    let mut s = Store::default();
+    let sid = "ses_m";
+    s.begin_load(sid);
+    // Streamed before the fetch: "```rust\nfn a() {}\n" never reaches us.
+    s.apply_inner(mid_stream(sid, "text.delta", r#","delta":"```\n\nAfter""#));
+    s.reconcile_inner(sid, vec![running_snapshot("")]);
+    let conv = &s.conversations[sid];
+    assert_eq!(
+        first_text(&s, sid),
+        "```\n\nAfter",
+        "only the tail is known"
+    );
+    assert!(conv.joined_mid_stream("msg_a", BlockKind::Text, 0));
+
+    // More deltas keep it a tail; a refresh while it streams keeps the mark.
+    s.apply_inner(mid_stream(sid, "text.delta", r#","delta":" more""#));
+    assert!(s.conversations[sid].joined_mid_stream("msg_a", BlockKind::Text, 0));
+    s.begin_load(sid);
+    s.reconcile_inner(sid, vec![running_snapshot("")]);
+    assert!(s.conversations[sid].joined_mid_stream("msg_a", BlockKind::Text, 0));
+
+    let full = "```rust\nfn a() {}\n```\n\nAfter more";
+    s.apply_inner(mid_stream(
+        sid,
+        "text.ended",
+        &format!(r#","text":{}"#, serde_json::to_string(full).unwrap()),
+    ));
+    assert_eq!(first_text(&s, sid), full);
+    assert!(!s.conversations[sid].joined_mid_stream("msg_a", BlockKind::Text, 0));
+}
+
+#[test]
+fn a_block_whose_start_was_buffered_or_streamed_locally_is_whole() {
+    // BlockStarted arrived during the fetch: every delta is buffered.
+    let mut s = Store::default();
+    s.begin_load("ses_b");
+    s.apply_inner(mid_stream("ses_b", "text.started", ""));
+    s.apply_inner(mid_stream("ses_b", "text.delta", r#","delta":"Hello""#));
+    s.reconcile_inner("ses_b", vec![running_snapshot("")]);
+    assert_eq!(first_text(&s, "ses_b"), "Hello");
+    assert!(!s.conversations["ses_b"].joined_mid_stream("msg_a", BlockKind::Text, 0));
+
+    // Already loaded and streaming: a refresh snapshot without text keeps
+    // the locally streamed whole text and does not mark it.
+    s.begin_load("ses_b");
+    s.reconcile_inner("ses_b", vec![running_snapshot("")]);
+    assert_eq!(first_text(&s, "ses_b"), "Hello");
+    assert!(!s.conversations["ses_b"].joined_mid_stream("msg_a", BlockKind::Text, 0));
+
+    // A finished message's text is final even if empty.
+    let mut done = running_snapshot("");
+    if let Message::Assistant(a) = &mut done {
+        a.completed = true;
+    }
+    s.begin_load("ses_c");
+    s.reconcile_inner("ses_c", vec![done]);
+    assert!(!s.conversations["ses_c"].joined_mid_stream("msg_a", BlockKind::Text, 0));
+}
+
+#[test]
+fn a_step_that_fails_before_its_block_ends_drops_the_mark() {
+    let mut s = Store::default();
+    s.begin_load("ses_f");
+    s.apply_inner(mid_stream("ses_f", "text.delta", r#","delta":"tail""#));
+    s.reconcile_inner("ses_f", vec![running_snapshot("")]);
+    assert!(s.conversations["ses_f"].joined_mid_stream("msg_a", BlockKind::Text, 0));
+    s.apply_inner(wire(
+        r#"{"type":"session.step.failed","data":{"sessionID":"ses_f","assistantMessageID":"msg_a","error":{"message":"boom"}}}"#,
+    ));
+    assert!(!s.conversations["ses_f"].joined_mid_stream("msg_a", BlockKind::Text, 0));
+}

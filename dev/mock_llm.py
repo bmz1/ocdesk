@@ -8,10 +8,12 @@ then run opencode with dev/mock-opencode.json (see README "Developing").
 Behaviour is keyed on the last user message:
     contains "tool:bash"  -> calls the shell tool ("bash" on old servers), then summarizes
     contains "tool:edit"  -> calls the write tool on mock_note.txt, then summarizes
-    contains "tool:task"  -> calls the subagent tool (spawns a "general" subagent), then summarizes
+    contains "tool:task"  -> calls the subagent tool (spawns a "general" subagent), then summarizes;
+                             with "rich", "huge" or "long" too, the subagent answers with that markdown
     contains "tool:sleep" -> runs `sleep 20` through the shell tool (a long-running command)
     contains "slow"       -> a reply streamed over ~10 s (for queue/steer testing)
     contains "long"       -> streams a long markdown answer with code blocks
+    contains "huge"       -> the long answer four times (over 4 KiB)
     contains "rich"       -> long reasoning + every markdown construct (tables, quotes, lists, code)
     anything else         -> short reasoning + a short markdown answer
 """
@@ -195,7 +197,10 @@ class Handler(BaseHTTPRequestHandler):
                 name = pick("subagent", "task")
                 params = tools.get(name, {}).get("parameters", {})
                 sys.stderr.write(f"mock_llm: {name} schema: " + json.dumps(params) + "\n")
-                values = {"description": "Look around", "prompt": "Subagent: say hello",
+                # "rich"/"long" pass through so the child answers with that markdown.
+                kind = next((k for k in ("rich", "huge", "long") if k in user), "say hello")
+                child = f"Subagent: {kind}\n\n- **Goal:** answer in `{kind}` markdown\n- Keep it short"
+                values = {"description": "Look around", "prompt": child,
                           "subagent_type": "general", "agent": "general", "subagent": "general"}
                 props = params.get("properties", {})
                 args = {k: values.get(k, "general") for k in (params.get("required") or props)}
@@ -212,6 +217,11 @@ class Handler(BaseHTTPRequestHandler):
             elif "rich" in user:
                 stream_text(RICH_REASONING, "reasoning_content")
                 stream_text(RICH)
+                chunk({}, "stop")
+            elif "huge" in user:
+                # Over 4 KiB: a full markdown replacement parses in the background.
+                stream_text("Planning a huge answer.", "reasoning_content")
+                stream_text("\n\n".join([LONG] * 4))
                 chunk({}, "stop")
             elif "long" in user:
                 stream_text("Planning a long answer with many sections.", "reasoning_content")

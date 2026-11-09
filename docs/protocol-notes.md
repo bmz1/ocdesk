@@ -36,13 +36,13 @@ what `curl https://opencode.ai/install` installs) is rejected at startup.
 | Need | Route | Notes |
 |---|---|---|
 | Health/version | `GET /api/info` | |
-| List sessions (all folders) | `GET /api/session?limit=&order=desc&cursor=` | `{data: [Session.Info], cursor: {next, previous}}`; also `directory`, `project`, `archived`, `parentID`, `search` filters |
+| List sessions (all folders) | `GET /api/session?limit=&order=desc&cursor=` | `{data: [Session.Info], cursor: {next, previous}}`; also `directory`, `project`, `archived`, `parentID`, `search` filters. Archived sessions are listed unless `archived=false` |
 | Create | `POST /api/session` `{location: {directory}}` | → `{data: Session.Info}`; pinned to that directory |
 | Prompt | `POST /api/session/{id}/prompt` `{text}` | → `{data: Session.Inbox.User}`; also `files`, `agents`, `skills`, `delivery: steer\|queue`, `resume` |
 | History | `GET /api/session/{id}/message?order=asc&limit=&cursor=` | projection, see *Messages* |
 | Stop | `POST /api/session/{id}/interrupt` | → `{"interrupted": true}` |
 | Busy sessions | `GET /api/session/active` | `{data: {"ses_…": {type: "running"}}}` |
-| Rename | `PATCH /api/session/{id}` `{title}` | → 204, then `session.renamed`; also `archived`, `metadata`, `permissions` |
+| Rename | `PATCH /api/session/{id}` `{title}` | → 204, then `session.renamed`; also `archived` (→ `session.archived`, `time.archived`), `metadata`, `permissions` |
 | Delete | `DELETE /api/session/{id}` | → 204, then `session.deleted` |
 | Validate a folder | `GET /api/location?location[directory]=…` | `{directory, project: {id, directory, canonical}}` |
 | Events (all folders) | `GET /api/event` | one SSE stream; `?types=` filter exists |
@@ -180,6 +180,12 @@ checks the result equals this projection.
   with `200`, so a health check must hit an `/api/*` route.
 - The REST projection can briefly lag the stream right after a turn ends, so
   reconcile keeps local text that strictly extends the snapshot's.
+- A text/reasoning block that is still streaming has `"text": ""` in history
+  (it is persisted when it ends), and deltas carry no offset. A load that
+  starts mid-block (opening a running subagent or session) only sees the tail
+  until `session.*.ended` brings the full text, so the store marks such blocks
+  (`Conversation::joined_mid_stream`) and views show a placeholder, not
+  markdown parsed from half a document.
 - `session.created` has no title and no timestamps (use the envelope's
   `created`); the title arrives later via `session.renamed`.
 
