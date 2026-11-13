@@ -112,6 +112,8 @@ shortcut.
   back file changes), find in the conversation, and a context-usage ring with a
   one-click **Compact**.
 - **Usage and cost**: tokens, cost and duration per turn and per session.
+- **Updates**: ocdesk tells you when a new release is out; one click downloads,
+  verifies and installs it, and you restart when it suits you.
 - **Native desktop**: notifications, light, dark and system themes, and restored
   window and session state. It also follows your OS reduced-motion setting.
 
@@ -141,6 +143,28 @@ Grab a build from [**Releases**](https://github.com/bmz1/ocdesk/releases):
 | macOS 11+ (universal) | `ocdesk-<version>-macos-universal.dmg` | If the build is ad-hoc signed: right-click → **Open** on first launch, or `xattr -dr com.apple.quarantine /Applications/ocdesk.app` |
 | Linux x86_64 / aarch64 | `ocdesk-<version>-linux-<arch>.AppImage` | `chmod +x` and run |
 | Linux x86_64 / aarch64 | `ocdesk-<version>-linux-<arch>.tar.gz` | Unpack and run `./install.sh` (installs to `~/.local`, or set `PREFIX=/usr/local`) |
+
+### Updates
+
+ocdesk looks for a newer [release](https://github.com/bmz1/ocdesk/releases) shortly
+after start and every few hours, and shows it at the bottom of the sidebar.
+Nothing is downloaded until you choose **Update**: ocdesk then fetches the
+installer for your platform, checks it against the release's `SHA256SUMS.txt`,
+replaces the installed copy and offers **Restart now** (or the new version
+simply starts next time). **Skip** hides that one version.
+
+| Installed as | What Update replaces |
+|---|---|
+| macOS `ocdesk.app` | the app bundle, from the release `.zip` (move the app out of the disk image / Downloads first) |
+| Linux AppImage | the `.AppImage` file itself |
+| Linux tarball (`install.sh`) | `<prefix>/bin/ocdesk`, the desktop entry and icons |
+| Source build, system package, read-only location | nothing: **Download** opens the release page |
+
+The check is one anonymous HTTPS request to github.com for that checksum file
+(no account, no identifiers beyond an `ocdesk/<version>` user agent). Turn it
+off under **Settings → General → Check for updates automatically**, or set
+`OCDESK_NO_UPDATE_CHECK=1`; **Check now** there and **Check for updates…** in
+the command palette still work on request.
 
 ### Build from source
 

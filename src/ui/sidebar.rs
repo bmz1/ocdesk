@@ -168,6 +168,158 @@ impl Sidebar {
         );
     }
 
+    /// ocdesk's own update: offered, downloading, installed or failed.
+    /// Nothing is shown while there is nothing to decide or wait for.
+    fn render_update(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::api::update::release_page;
+        use crate::domain::update::Install;
+
+        let theme = cx.theme().clone();
+        let store = self.store.read(cx);
+        let install = store.updates.install().clone();
+        let offer = store.update_offer().cloned();
+        let manual_only = store.updates.manual_only().map(str::to_string);
+
+        let notes = |version| {
+            Button::new("update-notes")
+                .label("What's new")
+                .ghost()
+                .xsmall()
+                .on_click(move |_, _, cx| cx.open_url(&release_page(version)))
+        };
+        let (title, detail, actions): (String, Option<String>, Vec<AnyElement>) = match install {
+            Install::Downloading { version, .. } => (
+                match install.percent() {
+                    Some(percent) => format!("Downloading ocdesk {version}… {percent}%"),
+                    None => format!("Downloading ocdesk {version}…"),
+                },
+                None,
+                Vec::new(),
+            ),
+            Install::Installing { version } => {
+                (format!("Installing ocdesk {version}…"), None, Vec::new())
+            }
+            Install::Ready { version } => (
+                format!("ocdesk {version} is installed"),
+                Some("Restart to start using it.".into()),
+                vec![
+                    Button::new("update-restart")
+                        .label("Restart now")
+                        .primary()
+                        .xsmall()
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(super::keys::RestartToUpdate), cx)
+                        })
+                        .into_any_element(),
+                    notes(version).into_any_element(),
+                ],
+            ),
+            Install::Failed { version, error } => (
+                format!("Updating to ocdesk {version} failed"),
+                Some(error),
+                vec![
+                    Button::new("update-retry")
+                        .label("Retry")
+                        .primary()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.controller.update(cx, |c, cx| c.install_update(cx));
+                        }))
+                        .into_any_element(),
+                    Button::new("update-manual")
+                        .label("Download")
+                        .ghost()
+                        .xsmall()
+                        .tooltip("Open the release page")
+                        .on_click(move |_, _, cx| cx.open_url(&release_page(version)))
+                        .into_any_element(),
+                    Button::new("update-dismiss")
+                        .label("Dismiss")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.controller
+                                .update(cx, |c, cx| c.dismiss_update_failure(cx));
+                        }))
+                        .into_any_element(),
+                ],
+            ),
+            Install::Idle => {
+                let release = offer?;
+                let version = release.version;
+                // Only a release this install can be replaced with is
+                // downloaded here; otherwise the user gets the page.
+                let primary = if release.asset.is_some() && manual_only.is_none() {
+                    Button::new("update-install")
+                        .label("Update")
+                        .primary()
+                        .xsmall()
+                        .tooltip("Download and install; you choose when to restart")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.controller.update(cx, |c, cx| c.install_update(cx));
+                        }))
+                } else {
+                    Button::new("update-manual")
+                        .label("Download")
+                        .primary()
+                        .xsmall()
+                        .tooltip("Open the release page")
+                        .on_click(move |_, _, cx| cx.open_url(&release_page(version)))
+                };
+                (
+                    format!("ocdesk {version} is available"),
+                    manual_only.map(|why| format!("Can't update in place: {why}.")),
+                    vec![
+                        primary.into_any_element(),
+                        notes(version).into_any_element(),
+                        Button::new("update-skip")
+                            .label("Skip")
+                            .ghost()
+                            .xsmall()
+                            .tooltip("Don't offer this version again")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.controller.update(cx, |c, cx| c.skip_update(cx));
+                            }))
+                            .into_any_element(),
+                    ],
+                )
+            }
+        };
+        Some(
+            v_flex()
+                .id("update-card")
+                .mx_2()
+                .mb_1()
+                .p_2()
+                .gap_1p5()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.sidebar_border)
+                .bg(theme.sidebar_accent.opacity(0.4))
+                .text_xs()
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.sidebar_foreground)
+                        .child(title),
+                )
+                .when_some(detail, |el, detail| {
+                    el.child(
+                        div()
+                            .id("update-detail")
+                            .max_h(px(96.))
+                            .overflow_y_scroll()
+                            .text_color(theme.muted_foreground)
+                            .child(detail),
+                    )
+                })
+                .when(!actions.is_empty(), |el| {
+                    el.child(h_flex().flex_wrap().gap_1().children(actions))
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_connection(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let store = self.store.read(cx);
@@ -931,6 +1083,7 @@ impl Render for Sidebar {
                         )
                     }),
             )
+            .children(self.render_update(cx))
             .child(
                 v_flex().px_2().pb_1().child(
                     nav_row("open-settings", Icon::new(IconName::Settings), "Settings")

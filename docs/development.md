@@ -127,6 +127,31 @@ same desktop identity in `$XDG_DATA_HOME` (default `~/.local/share`); Wayland
 resolves application icons through that desktop entry. Pass `--data-dir` to
 verify registration in an isolated directory.
 
+**Updates.** The updater's contract with a release is its file names and
+`SHA256SUMS.txt` (both produced by `package.yml`): the app reads
+`releases/latest/download/SHA256SUMS.txt`, takes the version from the
+`ocdesk-<version>-<platform>` names, and downloads
+`releases/download/v<version>/<file>` for its install kind (`.AppImage`,
+`.tar.gz`, or the macOS `.zip`). Renaming an asset or dropping the checksum file
+breaks updating for every installed copy, so change them only together with
+`domain/update.rs`. A draft or pre-release is never "latest", so nobody is
+offered a release until it is published.
+
+Debug builds check only on request. To exercise the whole flow, serve a fake
+release from loopback (plain HTTP is accepted for loopback only) and point the
+app at it:
+
+```sh
+OCDESK_UPDATE_FEED=http://127.0.0.1:8000/releases cargo run
+# serves …/releases/latest/download/SHA256SUMS.txt
+#    and …/releases/download/v<version>/<file>
+```
+
+`OCDESK_NO_UPDATE_CHECK=1` disables the automatic check regardless of settings.
+A `cargo` build is never replaced (it is not a release install): it shows
+**Download**, which opens the release page. Set `APPIMAGE=/path/to/a/file` to
+have a dev build treat that file as its AppImage.
+
 ## Architecture
 
 See [State machines and transition ownership](state-machines.md) for the lifecycle
@@ -139,10 +164,13 @@ src/
   sidecar.rs         spawn / health-check / kill `opencode serve`
   settings.rs        app preferences, folders, theme, window/sidebar, last session (JSON)
   opencode_config.rs real JSONC discovery, syntax validation and conflict-checked saves
+  update.rs          how this copy is installed; replace it with a download; relaunch
   api/mod.rs         thin HTTP client + SSE reader (the only place that does HTTP)
   api/model.rs       our view of sessions/messages/blocks (lenient JSON parsing)
   api/events.rs      server events → our normalized Event enum
   api/pty.rs         session terminals: persistent PTYs over a WebSocket
+  api/update.rs      release feed (GitHub releases): checksum list, verified download
+  domain/update.rs   versions, release manifest → asset for this install, install lifecycle
   store.rs           Entity<Store>: state, StoreEvent, shared types; one central entity
   store/events.rs    folds normalized events into the store, emits row-level StoreEvents
   store/history.rs   history snapshot loads (tickets, buffered events) and reconciliation
@@ -150,6 +178,7 @@ src/
   store/workspace.rs folders, catalogs, draft choices, branches, worktrees, diffs
   store/tasks.rs     inboxes, subagent sessions, shells
   store/permissions.rs, store/forms.rs  approval and question-form aggregates
+  store/updates.rs   update check status, offered release, install progress
   store/tests.rs     store tests incl. captured-event replay
   controller.rs      Controller struct, request helpers (run, run_on), notices
   controller/lifecycle.rs  sidecar start/crash/auto-restart, SSE pump, resync
@@ -158,6 +187,7 @@ src/
   controller/approvals.rs  permission/form reads, replies and dismissals
   controller/{catalog,choices,folders,tasks,diffs,persistence}.rs  per-feature intents
   controller/{features,files,github,reads}.rs  desktop features, files, PRs, cancellable reads
+  controller/updates.rs    update check timer, approved download+install, restart
   ui/app_view.rs     root layout: sidebar | conversation; theme; window/sidebar persistence
   ui/keys.rs         app-wide shortcuts, menu bar and the shortcuts sheet
   ui/kit.rs          shared components (status slot, monogram, context ring, toast…)
@@ -217,6 +247,14 @@ packaging/                       icon, macOS bundle script + Info.plist, Linux A
   wins, except where locally streamed text strictly extends it (the server
   persists text slightly after streaming it) and except for messages newer
   than the snapshot. Other conversations are re-fetched when next selected.
+- **Updates:** the only traffic that is not to the local sidecar. A static
+  checksum file from the latest GitHub release says whether a newer version
+  exists (no API, no token, no rate limit). Download and install start only
+  from the user's click; the download must match the manifest's SHA-256, the
+  replacement is staged beside its destination and renamed into place, and a
+  detached `sh` waits for the process to exit before starting the new version.
+  Same shape as Zed's updater (poll, download, swap in place, "restart to
+  update") with Tauri's static-manifest idea; see `src/update.rs`.
 - **Crash recovery:** if the sidecar dies it is restarted automatically
   (up to 3 times a minute), then the UI reconnects and reconciles. A Restart
   button covers the rest.

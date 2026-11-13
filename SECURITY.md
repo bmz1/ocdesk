@@ -9,5 +9,7 @@ get a response within a week.
 
 Things that are in scope include the sidecar's local HTTP auth (random
 per-launch password, loopback only), file reads and writes through the editor
-tabs (path confinement to the folder), and the packaging scripts. Problems in
+tabs (path confinement to the folder), the updater (HTTPS-only download from
+this repository's releases, verified against the release's SHA-256 list before
+anything is replaced) and the packaging scripts. Problems in
 opencode itself should go to the [opencode project](https://opencode.ai).

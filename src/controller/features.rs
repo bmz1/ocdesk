@@ -67,7 +67,9 @@ impl Controller {
             s.keybindings = prefs.keybindings;
             s.editor = prefs.editor;
             s.notifications = prefs.notifications;
+            s.check_for_updates = prefs.check_for_updates;
         });
+        self.schedule_update_checks(cx);
     }
     pub(super) fn reset_draft_choices(&mut self, cx: &mut Context<Self>) {
         self.store.update(cx, |s, cx| {

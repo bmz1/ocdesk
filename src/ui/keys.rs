@@ -47,6 +47,8 @@ actions!(
         PreviousTab,
         ShowChat,
         TogglePullRequest,
+        CheckForUpdates,
+        RestartToUpdate,
     ]
 );
 
@@ -157,6 +159,8 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, &'static str)> {
             Box::new(TogglePullRequest),
             "Pull request: checks and review comments",
         ),
+        // Unbound by default; still in the palette, the menu and Settings.
+        ("", Box::new(CheckForUpdates), "Check for updates…"),
         ("secondary-/", Box::new(ShowShortcuts), "Keyboard shortcuts"),
         ("secondary-,", Box::new(OpenSettings), "Settings"),
         ("secondary-q", Box::new(Quit), "Quit"),
@@ -355,6 +359,7 @@ pub fn set_menus(cx: &mut App) {
     cx.set_menus([
         Menu::new("ocdesk").items([
             MenuItem::action("Settings…", OpenSettings),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
             MenuItem::action("Keyboard Shortcuts", ShowShortcuts),
             MenuItem::separator(),
             MenuItem::action("Quit ocdesk", Quit),

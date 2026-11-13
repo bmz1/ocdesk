@@ -81,6 +81,8 @@ changes are staged until **Save app settings**. Configuration files and saved
 approval revocations have their own explicit save/revoke actions.
 
 - Dark, light or system theme; theme changes apply immediately on save.
+- **Updates**: the running version and the last check's result, **Check now**,
+  and a switch for the automatic check (see the README's Updates section).
 - **OpenCode**: global/project JSONC editor for real `opencode.json` and
   `opencode.jsonc` files, including `.opencode/` files. Existing formats are
   listed separately; parent configuration is available read-only. New files are

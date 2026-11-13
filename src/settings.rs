@@ -63,6 +63,11 @@ pub struct Settings {
     pub panel_width: Option<f32>,
     /// Editor tabs open per folder (paths relative to it), in tab order.
     pub open_files: BTreeMap<PathBuf, Vec<String>>,
+    /// Look for a newer ocdesk release at start and every few hours.
+    /// Nothing is downloaded without the user's OK either way.
+    pub check_for_updates: bool,
+    /// A release version the user chose not to be offered again.
+    pub skipped_update: Option<String>,
 }
 
 /// Transcript density, cycled with Ctrl+O.
@@ -129,6 +134,8 @@ impl Default for Settings {
             panel: None,
             panel_width: None,
             open_files: BTreeMap::new(),
+            check_for_updates: true,
+            skipped_update: None,
         }
     }
 }
@@ -301,6 +308,8 @@ mod tests {
             serde_json::from_str(r#"{"folders":["/a"],"collapsed":[],"theme":null}"#).unwrap();
         assert_eq!(s.folders, vec![PathBuf::from("/a")]);
         assert!(s.window.is_none() && !s.sidebar_hidden);
+        // Added later: update checks default to on.
+        assert!(s.check_for_updates && s.skipped_update.is_none());
     }
 
     #[test]

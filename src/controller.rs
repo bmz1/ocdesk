@@ -20,8 +20,10 @@ mod prompts;
 mod reads;
 mod sessions;
 mod tasks;
+mod updates;
 
 use prompts::Submission;
+pub use updates::current_version;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -149,6 +151,18 @@ pub struct Controller {
     restore_session: Option<String>,
     /// Pending debounced settings save; replaced per change, dropped on flush.
     save_debounce: Option<Task<()>>,
+    /// How this copy is installed (what an update replaces), or why it can
+    /// only be updated by hand. Read once at start: the executable's path
+    /// can't be recovered after it was replaced.
+    installed: Result<crate::update::Installed, String>,
+    /// Client for the release feed, built on first use.
+    update_feed: Option<crate::api::update::UpdateFeed>,
+    /// Periodic update check; dropped when the preference is turned off.
+    update_poll: Option<Task<()>>,
+    /// The update check in flight; replacing it cancels its read.
+    update_check: Option<Task<()>>,
+    /// Forwards download progress to the store while an install runs.
+    update_progress: Option<Task<()>>,
 }
 
 impl Controller {
@@ -204,6 +218,11 @@ impl Controller {
             failed_submission: None,
             restore_session,
             save_debounce: None,
+            installed: crate::update::detect(),
+            update_feed: None,
+            update_poll: None,
+            update_check: None,
+            update_progress: None,
         };
         this.reset_draft_choices(cx);
         this.save_settings();
@@ -213,6 +232,7 @@ impl Controller {
             this.demo = true;
             crate::demo::start(&this.store, turns, cx);
         } else {
+            this.start_updates(cx);
             this.start_sidecar(cx);
             this.start_github(cx);
         }

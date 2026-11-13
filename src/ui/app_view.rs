@@ -7,7 +7,7 @@ use gpui_kit::*;
 
 use crate::controller::{self, Controller};
 use crate::settings::{Settings, WindowPlacement};
-use crate::store::Store;
+use crate::store::{Store, StoreEvent};
 use crate::ui::conversation::ConversationView;
 use crate::ui::frame_stats::FrameStats;
 use crate::ui::keys;
@@ -186,6 +186,26 @@ impl AppView {
             });
             false
         });
+        // A check the user asked for always gets an answer; an automatic
+        // one only shows up as the sidebar's offer.
+        subs.push(
+            cx.subscribe_in(&store, window, |_, store, event, window, cx| {
+                if let StoreEvent::UpdateChecked { manual: true } = event {
+                    let updates = &store.read(cx).updates;
+                    let message = match (updates.check().error(), updates.latest()) {
+                        (Some(error), _) => format!("Could not check for updates: {error}"),
+                        (None, Some(release)) => {
+                            format!("ocdesk {} is available", release.version)
+                        }
+                        (None, None) => format!(
+                            "ocdesk {} is up to date",
+                            crate::controller::current_version()
+                        ),
+                    };
+                    crate::ui::kit::toast(window, cx, message, None);
+                }
+            }),
+        );
         subs.push(cx.observe_window_appearance(window, |this, window, cx| {
             if this.controller.read(cx).preferences().theme.as_deref() == Some("system") {
                 Theme::sync_system_appearance(Some(window), cx);
@@ -227,6 +247,38 @@ impl AppView {
         cx.spawn_in(window, async move |_, cx| {
             if rx.await == Ok(0) {
                 let _ = cx.update(|window, cx| then(window, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Quit and start the installed update. Asks first when that would
+    /// drop unsaved drafts or stop running turns (the sidecar goes down
+    /// with the app).
+    fn restart_to_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let controller = self.controller.clone();
+        let restart = move |_: &mut Window, cx: &mut App| {
+            if controller.update(cx, |c, cx| c.restart_into_update(cx)) {
+                cx.quit();
+            }
+        };
+        let running = self.controller.read(cx).view_store().read(cx).busy.len();
+        if running == 0 {
+            self.confirm_discard(window, cx, restart);
+            return;
+        }
+        let rx = window.prompt(
+            PromptLevel::Warning,
+            &format!("Restart while {running} session(s) are still working?"),
+            Some("Restarting stops opencode, which interrupts their current turn."),
+            &["Restart", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if rx.await == Ok(0) {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.confirm_discard(window, cx, restart)
+                });
             }
         })
         .detach();
@@ -540,6 +592,14 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &keys::ShowChat, window, cx| {
                 this.conversation
                     .update(cx, |c, cx| c.show_chat(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &keys::CheckForUpdates, window, cx| {
+                this.controller
+                    .update(cx, |c, cx| c.check_for_updates(true, cx));
+                crate::ui::kit::toast(window, cx, "Checking for updates…", None);
+            }))
+            .on_action(cx.listener(|this, _: &keys::RestartToUpdate, window, cx| {
+                this.restart_to_update(window, cx);
             }))
             .on_action(cx.listener(|this, _: &keys::Quit, window, cx| {
                 this.confirm_discard(window, cx, |_, cx| cx.quit());
