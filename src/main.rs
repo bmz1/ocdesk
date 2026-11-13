@@ -13,6 +13,7 @@ mod shell_env;
 mod sidecar;
 mod store;
 mod ui;
+mod update;
 
 use std::sync::OnceLock;
 use std::time::Instant;

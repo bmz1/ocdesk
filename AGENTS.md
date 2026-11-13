@@ -48,6 +48,12 @@ docs/gpui-notes.md before changing orchestration or rendering.
   can still finish; cancellation is not a rollback or synchronous cleanup barrier.
 - Retain request/revision guards even for cancellable reads: cancellation and
   completion can race. Prefer typed HTTP errors over inspecting Display strings.
+- The updater (api/update.rs, update.rs, controller/updates.rs) is the only code
+  that contacts anything but the sidecar. It may check on a timer, but download,
+  install and restart happen only on the user's explicit request. A download is
+  used only after its SHA-256 matches the release manifest; replacements are
+  staged beside the destination and renamed. Release asset names and
+  SHA256SUMS.txt are its wire format: change them with domain/update.rs.
 - Log operation, session/ticket, generation and epoch where useful. Do not log
   credentials, prompt/file content or authorization headers.
 

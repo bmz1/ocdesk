@@ -227,7 +227,61 @@ impl SettingsView {
                 &theme,
                 true,
             ))
+            .child(row(
+                "Updates",
+                Some(&self.update_status(cx)),
+                Button::new("settings-check-updates")
+                    .label("Check now")
+                    .small()
+                    .outline()
+                    .disabled(self.store.read(cx).updates.check().is_loading())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.controller
+                            .update(cx, |c, cx| c.check_for_updates(true, cx));
+                    })),
+                &theme,
+                true,
+            ))
+            .child(row(
+                "Check for updates automatically",
+                Some(
+                    "Asks GitHub for the latest ocdesk release at start and every few hours. \
+                     Nothing is downloaded or installed until you choose Update.",
+                ),
+                Switch::new("settings-check-for-updates")
+                    .checked(self.prefs.check_for_updates)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.prefs.check_for_updates = *checked;
+                        cx.notify();
+                    })),
+                &theme,
+                true,
+            ))
             .into_any_element()
+    }
+
+    /// One line on the running version and what the last check found.
+    fn update_status(&self, cx: &App) -> String {
+        use crate::domain::update::Install;
+        let store = self.store.read(cx);
+        let updates = &store.updates;
+        let current = crate::controller::current_version();
+        let status = match updates.install() {
+            Install::Downloading { version, .. } => format!("downloading {version}…"),
+            Install::Installing { version } => format!("installing {version}…"),
+            Install::Ready { version } => format!("{version} is installed; restart to use it"),
+            Install::Failed { version, error } => format!("updating to {version} failed: {error}"),
+            Install::Idle => match (updates.check(), updates.latest()) {
+                (check, _) if check.is_loading() => "checking…".into(),
+                (_, Some(release)) => format!("{} is available", release.version),
+                (check, None) => match check.error() {
+                    Some(error) => format!("could not check: {error}"),
+                    None if updates.checked() => "up to date".into(),
+                    None => "not checked yet".into(),
+                },
+            },
+        };
+        format!("ocdesk {current} · {status}")
     }
 
     fn permissions_section(&self, cx: &mut Context<Self>) -> AnyElement {

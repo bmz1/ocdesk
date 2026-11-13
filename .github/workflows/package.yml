@@ -2,6 +2,11 @@ name: Package
 
 # Tag `vX.Y.Z` (matching Cargo.toml's version) to build installers and attach
 # them to a draft GitHub release. "Run workflow" builds them as artifacts only.
+#
+# Installed copies update themselves from these files once the draft is
+# published: they read SHA256SUMS.txt of the latest release and download the
+# asset named for their platform. Keep the asset names and the checksum file
+# in step with src/domain/update.rs.
 on:
   push:
     tags: ["v*"]

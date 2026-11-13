@@ -673,6 +673,8 @@ impl ConversationView {
             | StoreEvent::MessageChanged { .. } => return,
             // The header meter shows only the selected session's usage.
             StoreEvent::UsageChanged { session_id } if !is_selected(session_id) => return,
+            // Shown by the sidebar and Settings only.
+            StoreEvent::UpdateChanged | StoreEvent::UpdateChecked { .. } => return,
             _ => {}
         }
         cx.notify();

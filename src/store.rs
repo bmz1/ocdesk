@@ -27,6 +27,7 @@ mod history;
 mod permissions;
 mod sessions;
 mod tasks;
+mod updates;
 mod workspace;
 
 use events::{append_overlapping, prose_mut};
@@ -34,6 +35,7 @@ use events::{append_overlapping, prose_mut};
 use crate::domain::requests::Revisions;
 pub(crate) use forms::Forms;
 pub(crate) use permissions::Permissions;
+pub(crate) use updates::Updates;
 
 use serde_json::Value;
 
@@ -190,6 +192,13 @@ pub enum StoreEvent {
     /// A session's usage report, or its loading/error state, changed.
     UsageChanged {
         session_id: String,
+    },
+    /// The update check, the offered release or its install changed.
+    UpdateChanged,
+    /// An update check ended; `manual` when the user asked for it (the
+    /// result is then reported even when there is nothing new).
+    UpdateChecked {
+        manual: bool,
     },
 }
 
@@ -354,6 +363,8 @@ pub struct Store {
     /// the last choice sticks, like opencode's own TUI.
     pub draft_model: Option<ModelRef>,
     pub draft_agent: Option<String>,
+    /// ocdesk's own updates: latest release and the approved install.
+    pub(crate) updates: Updates,
 }
 
 impl EventEmitter<StoreEvent> for Store {}

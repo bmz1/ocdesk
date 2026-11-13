@@ -9,6 +9,7 @@ pub mod features;
 pub mod fs;
 pub mod model;
 pub mod pty;
+pub mod update;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
